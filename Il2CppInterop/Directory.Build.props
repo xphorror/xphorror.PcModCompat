@@ -1,0 +1,23 @@
+<Project>
+  <PropertyGroup>
+    <VersionPrefix>1.5.3</VersionPrefix>
+    <Authors>BepInEx</Authors>
+    <PackageOutputPath>../bin/NuGet</PackageOutputPath>
+    <OutputPath Condition="'$(Configuration)' == 'Release'">../bin/$(MSBuildProjectName)</OutputPath>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>Il2CppInterop</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <PackageLicenseExpression>LGPL-3.0-only</PackageLicenseExpression>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+    <DebugType>embedded</DebugType>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <!-- TODO: Remove once all public methods have been documented or hidden.  -->
+    <NoWarn>$(NoWarn);1591</NoWarn>
+  </PropertyGroup>
+</Project>

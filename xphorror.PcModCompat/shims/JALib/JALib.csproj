@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>JALib</AssemblyName>
+    <RootNamespace>JALib</RootNamespace>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <FileVersion>1.0.0.0</FileVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+    <ProjectReference Include="..\0Harmony\0Harmony.csproj" />
+    <ProjectReference Include="..\UnityModManager\UnityModManager.csproj" />
+    <ProjectReference Include="..\UnityEngine.CoreModule\UnityEngine.CoreModule.csproj" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,328 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root>
+    <xsd:schema id="root" xmlns="" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:msdata="urn:schemas-microsoft-com:xml-msdata"><xsd:element name="root" msdata:IsDataSet="true"></xsd:element></xsd:schema>
+    <resheader name="resmimetype"><value>text/microsoft-resx</value></resheader>
+    <resheader name="version"><value>1.3</value></resheader>
+    <resheader name="reader"><value>System.Resources.ResXResourceReader, System.Windows.Forms, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value></resheader>
+    <resheader name="writer"><value>System.Resources.ResXResourceWriter, System.Windows.Forms, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value></resheader>
+    <data name="MainWindow_Title" xml:space="preserve"><value>StArray ModManager</value></data>
+    <data name="Tab_ModList" xml:space="preserve"><value>Mod List</value></data>
+    <data name="Tab_Console" xml:space="preserve"><value>Console</value></data>
+    <data name="Tab_Log" xml:space="preserve"><value>Log</value></data>
+    <data name="Tab_Settings" xml:space="preserve"><value>Settings</value></data>
+    <data name="Btn_ScanMods" xml:space="preserve"><value>Scan Mods</value></data>
+    <data name="Btn_AddMod" xml:space="preserve"><value>Add Mod</value></data>
+    <data name="Btn_Clear" xml:space="preserve"><value>Clear</value></data>
+    <data name="Btn_Confirm" xml:space="preserve"><value>OK</value></data>
+    <data name="Btn_Cancel" xml:space="preserve"><value>Cancel</value></data>
+    <data name="Btn_LoadMod" xml:space="preserve"><value>Load</value></data>
+    <data name="Btn_CancelLoad" xml:space="preserve"><value>Cancel</value></data>
+    <data name="Btn_UnloadMod" xml:space="preserve"><value>Unload</value></data>
+    <data name="Btn_RetryLoad" xml:space="preserve"><value>Retry</value></data>
+    <data name="Col_State" xml:space="preserve"><value>State</value></data>
+    <data name="Col_Name" xml:space="preserve"><value>Name</value></data>
+    <data name="Col_Version" xml:space="preserve"><value>Version</value></data>
+    <data name="Col_Action" xml:space="preserve"><value>Action</value></data>
+    <data name="Col_Settings" xml:space="preserve"><value>Config</value></data>
+    <data name="Status_ModCount" xml:space="preserve"><value>{0} Mod(s) | Loaded: {1}</value></data>
+    <data name="Status_LogCount" xml:space="preserve"><value>{0} entries</value></data>
+    <data name="State_Loaded" xml:space="preserve"><value>Loaded</value></data>
+    <data name="State_Loading" xml:space="preserve"><value>Loading</value></data>
+    <data name="State_Error" xml:space="preserve"><value>Error</value></data>
+    <data name="State_NotLoaded" xml:space="preserve"><value>Not Loaded</value></data>
+    <data name="Settings_ModsDir" xml:space="preserve"><value>Mods Directory:</value></data>
+    <data name="Settings_UiScale" xml:space="preserve"><value>UI Scale:</value></data>
+    <data name="Settings_Language" xml:space="preserve"><value>Language:</value></data>
+    <data name="Language_Chinese" xml:space="preserve"><value>Simplified Chinese</value></data>
+    <data name="Language_English" xml:space="preserve"><value>English</value></data>
+    <data name="Settings_Shortcuts" xml:space="preserve"><value>Shortcuts:</value></data>
+    <data name="Settings_Shortcut_Scan" xml:space="preserve"><value>Ctrl+R - Scan Mods</value></data>
+    <data name="Settings_ImGuiVersion" xml:space="preserve"><value>ImGui Version:</value></data>
+    <data name="Settings_LoadedModCount" xml:space="preserve"><value>Loaded Mods:</value></data>
+    <data name="AddMod_Title" xml:space="preserve"><value>Add New Mod</value></data>
+    <data name="AddMod_Name" xml:space="preserve"><value>Name:</value></data>
+    <data name="AddMod_Author" xml:space="preserve"><value>Author:</value></data>
+    <data name="AddMod_Description" xml:space="preserve"><value>Description:</value></data>
+    <data name="AddMod_DefaultName" xml:space="preserve"><value>New Mod</value></data>
+    <data name="Mod.WindowTitle" xml:space="preserve"><value>{0} Settings</value></data>
+    <data name="Btn.Save" xml:space="preserve"><value>Save</value></data>
+    <data name="Toast.ModSaved" xml:space="preserve"><value>Saved: {0}</value></data>
+    <data name="Toast.SaveFailed" xml:space="preserve"><value>Save failed: {0}</value></data>
+    <data name="Btn_SaveSettings" xml:space="preserve"><value>Save Settings</value></data>
+    <data name="Btn_Close" xml:space="preserve"><value>Close</value></data>
+    <data name="Btn_CloseOverlay" xml:space="preserve"><value>Close Panel</value></data>
+    <data name="Btn_OpenOverlay" xml:space="preserve"><value>ModManager</value></data>
+    <data name="Settings_GrabSize" xml:space="preserve"><value>Grab Size:</value></data>
+    <data name="Settings_ScrollSize" xml:space="preserve"><value>Scrollbar Size:</value></data>
+    <data name="Toast_SettingsSaved" xml:space="preserve"><value>Settings saved</value></data>
+    <data name="AddMod_NotImplemented" xml:space="preserve"><value>Not implemented</value></data>
+    <data name="AddMod_NotImplDetail" xml:space="preserve"><value>This feature is not yet implemented.</value></data>
+    <data name="AddMod_ImportHint" xml:space="preserve"><value>Select a PC MOD ZIP. It will be copied into the app private directory and imported.</value></data>
+    <data name="AddMod_SelectZip" xml:space="preserve"><value>Select ZIP</value></data>
+    <data name="AddMod_Status" xml:space="preserve"><value>Status:</value></data>
+    <data name="AddMod_Status_Idle" xml:space="preserve"><value>Idle</value></data>
+    <data name="AddMod_Status_Selecting" xml:space="preserve"><value>Selecting</value></data>
+    <data name="AddMod_Status_Importing" xml:space="preserve"><value>Importing</value></data>
+    <data name="AddMod_Status_Imported" xml:space="preserve"><value>Imported</value></data>
+    <data name="AddMod_Status_Cancelled" xml:space="preserve"><value>Cancelled</value></data>
+    <data name="AddMod_Status_Error" xml:space="preserve"><value>Error</value></data>
+    <data name="AddMod_ImportedRescan" xml:space="preserve"><value>Import complete. Mods were rescanned.</value></data>
+    <data name="AddMod_ImportedLoading" xml:space="preserve"><value>Import complete. Mod loading has started.</value></data>
+    <data name="AddMod_ImportedReady" xml:space="preserve"><value>Import complete. Click Load in the Mod list.</value></data>
+    <data name="AddMod_ImportedNotFound" xml:space="preserve"><value>Import completed, but no valid Mod entry was found.</value></data>
+    <data name="AddMod_Unsupported" xml:space="preserve"><value>This platform does not support ZIP import from the UI.</value></data>
+    <data name="ModDetails_Title" xml:space="preserve"><value>Mod Details</value></data>
+    <data name="Detail_Id" xml:space="preserve"><value>ID:</value></data>
+    <data name="Detail_Name" xml:space="preserve"><value>Name:</value></data>
+    <data name="Detail_Version" xml:space="preserve"><value>Version:</value></data>
+    <data name="Detail_Author" xml:space="preserve"><value>Author:</value></data>
+    <data name="Detail_LoaderKind" xml:space="preserve"><value>Loader:</value></data>
+    <data name="Detail_State" xml:space="preserve"><value>State:</value></data>
+    <data name="Detail_EntryPoint" xml:space="preserve"><value>Entry:</value></data>
+    <data name="Detail_FolderPath" xml:space="preserve"><value>Folder:</value></data>
+    <data name="Detail_Description" xml:space="preserve"><value>Description:</value></data>
+    <data name="Detail_Dependencies" xml:space="preserve"><value>Dependencies:</value></data>
+    <data name="Detail_Error" xml:space="preserve"><value>Error:</value></data>
+    <data name="Detail_LoadStage" xml:space="preserve"><value>Load Stage:</value></data>
+    <data name="Detail_LoadProgress" xml:space="preserve"><value>Load Progress:</value></data>
+    <data name="Inspector_DeserializeNull" xml:space="preserve"><value>Deserialization failed: null result</value></data>
+    <data name="Inspector_JsonError" xml:space="preserve"><value>JSON error: {0}</value></data>
+    <data name="Log_DirCreated" xml:space="preserve"><value>Created Mods directory: {0}</value></data>
+    <data name="Log_ModFound" xml:space="preserve"><value>Found Mod: {0} ({1})</value></data>
+    <data name="Log_ModCount" xml:space="preserve"><value>Found {0} Mod(s)</value></data>
+    <data name="Log_ModAssemblyError" xml:space="preserve"><value>Cannot read Mod assembly {0}: {1}</value></data>
+    <data name="Log_ModAlreadyLoaded" xml:space="preserve"><value>{0} is already loaded</value></data>
+    <data name="Log_MissingDep" xml:space="preserve"><value>Missing dependency: {0}</value></data>
+    <data name="Log_ModAssemblyLoaded" xml:space="preserve"><value>{0} assembly loaded: {1}</value></data>
+    <data name="Log_ModEntryExecuted" xml:space="preserve"><value>{0} plugin entry executed</value></data>
+    <data name="Log_ModNoEntry" xml:space="preserve"><value>{0} loaded as data mod (no entry assembly)</value></data>
+    <data name="Log_ModLoadSuccess" xml:space="preserve"><value>{0} loaded successfully</value></data>
+    <data name="Log_ModLoadFailed" xml:space="preserve"><value>{0} load failed: {1}</value></data>
+    <data name="Log_ModUnloaded" xml:space="preserve"><value>{0} unloaded</value></data>
+    <data name="Log_PcCompatBackgroundStarted" xml:space="preserve"><value>{0} PcModCompat background translation started</value></data>
+    <data name="Log_PcCompatLoadSuccess" xml:space="preserve"><value>{0} PcModCompat loaded successfully</value></data>
+    <data name="Log_StaleCompletionIgnored" xml:space="preserve"><value>{0} changed state during asynchronous finalization; stale completion ignored: {1}</value></data>
+    <data name="Log_StaleRegistrationRollback" xml:space="preserve"><value>{0} completed background installation during unload; rolling back stale compatibility registrations</value></data>
+    <data name="Log_StaleRegistrationRollbackFailed" xml:space="preserve"><value>{0} failed to roll back stale registrations: {1}</value></data>
+    <data name="Log_ModAdded" xml:space="preserve"><value>Mod added: {0}</value></data>
+    <data name="Log_ModRemoved" xml:space="preserve"><value>Mod removed: {0}</value></data>
+    <data name="Log_AutoEnable" xml:space="preserve"><value>Auto-enabled: {0}</value></data>
+    <data name="Log_SaveSettings" xml:space="preserve"><value>SaveSettings: {0}</value></data>
+    <data name="Log_LoadSettings" xml:space="preserve"><value>LoadSettings: {0}</value></data>
+    <data name="PcCompat_ManagedTranslation" xml:space="preserve"><value>Managed Scan and Translation</value></data>
+    <data name="PcCompat_StaticPatches" xml:space="preserve"><value>Active/All Patches</value></data>
+    <data name="PcCompat_StaticIssues" xml:space="preserve"><value>Scan Issues</value></data>
+    <data name="PcCompat_Callbacks" xml:space="preserve"><value>Translated/All Callbacks</value></data>
+    <data name="PcCompat_Unsupported" xml:space="preserve"><value>Unsupported</value></data>
+    <data name="PcCompat_NotMapped" xml:space="preserve"><value>Not Mapped</value></data>
+    <data name="PcCompat_Skipped" xml:space="preserve"><value>Skipped</value></data>
+    <data name="PcCompat_RecipeRules" xml:space="preserve"><value>Recipe Rules</value></data>
+    <data name="PcCompat_RecipeUnsupported" xml:space="preserve"><value>Recipe Unsupported</value></data>
+    <data name="PcCompat_UnsupportedDetails" xml:space="preserve"><value>Unsupported/Not Mapped Callback Details</value></data>
+    <data name="PcCompat_NativeGlobal" xml:space="preserve"><value>Native Global Hook State</value></data>
+    <data name="PcCompat_Provider" xml:space="preserve"><value>Diagnostics Bridge</value></data>
+    <data name="PcCompat_Available" xml:space="preserve"><value>Available</value></data>
+    <data name="PcCompat_Capabilities" xml:space="preserve"><value>Approved Capabilities</value></data>
+    <data name="PcCompat_Bundles" xml:space="preserve"><value>Bundles</value></data>
+    <data name="PcCompat_Targets" xml:space="preserve"><value>Targets</value></data>
+    <data name="PcCompat_Rules" xml:space="preserve"><value>Rules</value></data>
+    <data name="PcCompat_LifecyclePrograms" xml:space="preserve"><value>UI Lifecycle</value></data>
+    <data name="PcCompat_VmInstructions" xml:space="preserve"><value>VM Instructions</value></data>
+    <data name="PcCompat_Slots" xml:space="preserve"><value>Merged Slots</value></data>
+    <data name="PcCompat_Pending" xml:space="preserve"><value>Pending</value></data>
+    <data name="PcCompat_Resolved" xml:space="preserve"><value>Resolved</value></data>
+    <data name="PcCompat_Failed" xml:space="preserve"><value>Failed</value></data>
+    <data name="PcCompat_Blocked" xml:space="preserve"><value>Install Blocked</value></data>
+    <data name="PcCompat_Installable" xml:space="preserve"><value>Installable</value></data>
+    <data name="PcCompat_Installed" xml:space="preserve"><value>Installed/Active</value></data>
+    <data name="PcCompat_DispatcherReady" xml:space="preserve"><value>Dispatcher Ready</value></data>
+    <data name="PcCompat_DispatcherBound" xml:space="preserve"><value>Dispatcher Bound</value></data>
+    <data name="PcCompat_SlotRules" xml:space="preserve"><value>Slot Rules</value></data>
+    <data name="PcCompat_RuleState" xml:space="preserve"><value>Rules Enabled/Disabled</value></data>
+    <data name="PcCompat_ProviderUnavailableText" xml:space="preserve"><value>The Android native diagnostics bridge is unavailable. Managed scan results are visible, but real hook state cannot be read or changed.</value></data>
+    <data name="PcCompat_Refresh" xml:space="preserve"><value>Refresh</value></data>
+    <data name="PcCompat_Resolve" xml:space="preserve"><value>Resolve</value></data>
+    <data name="PcCompat_Prepare" xml:space="preserve"><value>Prepare</value></data>
+    <data name="PcCompat_Install" xml:space="preserve"><value>Install</value></data>
+    <data name="PcCompat_Reload" xml:space="preserve"><value>Reload Active Rules</value></data>
+    <data name="PcCompat_ClearRules" xml:space="preserve"><value>Disable All Rules</value></data>
+    <data name="PcCompat_ClearTitle" xml:space="preserve"><value>Disable PcCompat Rules</value></data>
+    <data name="PcCompat_ClearWarning" xml:space="preserve"><value>This disables all PcCompat rules in the current process. It does not unhook or release bound dispatchers. Use Reload Active Rules to restore rules for enabled mods.</value></data>
+    <data name="PcCompat_ClearConfirm" xml:space="preserve"><value>Disable Rules</value></data>
+    <data name="PcCompat_LastOperation" xml:space="preserve"><value>Last operation:</value></data>
+    <data name="PcCompat_LastError" xml:space="preserve"><value>Native error:</value></data>
+    <data name="PcCompat_SlotDetails" xml:space="preserve"><value>Slot Details</value></data>
+    <data name="PcCompat_LoadProgress" xml:space="preserve"><value>PATCH Scan and Translation</value></data>
+    <data name="PcCompat_LoadStage_Queued" xml:space="preserve"><value>Queued</value></data>
+    <data name="PcCompat_LoadStage_Scanning" xml:space="preserve"><value>Scanning PATCH metadata</value></data>
+    <data name="PcCompat_LoadStage_Translating" xml:space="preserve"><value>Translating callbacks</value></data>
+    <data name="PcCompat_LoadStage_Compiling" xml:space="preserve"><value>Compiling native rules</value></data>
+    <data name="PcCompat_LoadStage_Finalizing" xml:space="preserve"><value>Waiting for main-thread install</value></data>
+    <data name="PcCompat_LoadStage_Installing" xml:space="preserve"><value>Installing managed runtime</value></data>
+    <data name="PcCompat_LoadStage_Ready" xml:space="preserve"><value>Ready</value></data>
+    <data name="PcCompat_LoadStage_Cancelled" xml:space="preserve"><value>Cancelled</value></data>
+    <data name="PcCompat_LoadStage_Failed" xml:space="preserve"><value>Failed</value></data>
+    <data name="PcCompat_ShowAllSlots" xml:space="preserve"><value>Show All Mods</value></data>
+    <data name="PcCompat_GlobalSlotHint" xml:space="preserve"><value>Showing slots from every mod in HookManager.</value></data>
+    <data name="PcCompat_ModSlotHint" xml:space="preserve"><value>Showing only slots introduced by {0}; shared targets still use one dispatcher.</value></data>
+    <data name="PcCompat_ExportDiagnostics" xml:space="preserve"><value>Export Diagnostics</value></data>
+    <data name="PcCompat_ExportSelecting" xml:space="preserve"><value>Waiting for a save location</value></data>
+    <data name="PcCompat_Tab_ModSettings" xml:space="preserve"><value>MOD Settings</value></data>
+    <data name="PcCompat_Tab_Diagnostics" xml:space="preserve"><value>Compatibility Diagnostics</value></data>
+    <data name="PcCompat_SettingsTitle" xml:space="preserve"><value>PC MOD Compatibility Settings</value></data>
+    <data name="PcCompat_SettingsFallbackTitle" xml:space="preserve"><value>Fallback</value></data>
+    <data name="PcCompat_SettingsFallbackReason" xml:space="preserve"><value>The MOD's original settings menu is unavailable: {0}</value></data>
+    <data name="Mod.OpenOriginalSettings" xml:space="preserve"><value>Open Original MOD Settings</value></data>
+    <data name="Mod.OriginalSettingsOpenFailed" xml:space="preserve"><value>Cannot open the original MOD settings: {0}</value></data>
+    <data name="Mod.OriginalSettingsUnavailable" xml:space="preserve"><value>the surface is unavailable</value></data>
+    <data name="PcCompat_NoMobileSettingsAdapter" xml:space="preserve"><value>This PC MOD does not have a mobile settings adapter yet. Compatibility diagnostics remain available.</value></data>
+    <data name="PcCompat_TranslatedOverlaySettings" xml:space="preserve"><value>Translated HUD Settings</value></data>
+    <data name="PcCompat_TranslatedOverlaySettingsHint" xml:space="preserve"><value>These options are driven by generic fixed-op rules and real game data, without relying on a specific MOD identity. Untranslated PC features are shown as unsupported.</value></data>
+    <data name="PcCompat_Setting_ShowHud" xml:space="preserve"><value>Show status HUD</value></data>
+    <data name="PcCompat_Setting_ShowAccuracy" xml:space="preserve"><value>Show accuracy</value></data>
+    <data name="PcCompat_Setting_ShowXAccuracy" xml:space="preserve"><value>Show X-accuracy</value></data>
+    <data name="PcCompat_Setting_ShowLastJudgement" xml:space="preserve"><value>Show last judgement</value></data>
+    <data name="PcCompat_Setting_ShowHitTiming" xml:space="preserve"><value>Show hit timing</value></data>
+    <data name="PcCompat_Setting_ShowPlayerCount" xml:space="preserve"><value>Show player count</value></data>
+    <data name="PcCompat_Setting_ShowTechnicalDiagnostics" xml:space="preserve"><value>Show technical diagnostics</value></data>
+    <data name="PcCompat_Setting_HudScale" xml:space="preserve"><value>HUD scale</value></data>
+    <data name="PcCompat_Setting_PositionX" xml:space="preserve"><value>Horizontal position</value></data>
+    <data name="PcCompat_Setting_PositionY" xml:space="preserve"><value>Vertical position</value></data>
+    <data name="PcCompat_Setting_BackgroundOpacity" xml:space="preserve"><value>Background opacity</value></data>
+    <data name="PcCompat_Setting_ResetDefaults" xml:space="preserve"><value>Reset defaults</value></data>
+    <data name="PcCompat_Setting_DefaultsRestored" xml:space="preserve"><value>Defaults restored. Save to persist them.</value></data>
+    <data name="PcCompat_Setting_Unsaved" xml:space="preserve"><value>Unsaved</value></data>
+    <data name="PcCompat_Setting_Saved" xml:space="preserve"><value>Mobile settings saved.</value></data>
+    <data name="PcCompat_Setting_SaveFailed" xml:space="preserve"><value>Save failed: {0}</value></data>
+    <data name="PcCompat_CurrentData" xml:space="preserve"><value>Current Data State</value></data>
+    <data name="PcCompat_CurrentDataUnavailable" xml:space="preserve"><value>The native data bridge is currently unavailable.</value></data>
+    <data name="PcCompat_Data_Overlay" xml:space="preserve"><value>Level HUD</value></data>
+    <data name="PcCompat_Data_Visible" xml:space="preserve"><value>Visible</value></data>
+    <data name="PcCompat_Data_Hidden" xml:space="preserve"><value>Hidden</value></data>
+    <data name="PcCompat_Data_Progress" xml:space="preserve"><value>Progress</value></data>
+    <data name="PcCompat_Data_Bpm" xml:space="preserve"><value>BPM / KPS</value></data>
+    <data name="PcCompat_Data_Combo" xml:space="preserve"><value>Combo</value></data>
+    <data name="PcCompat_Data_Attempt" xml:space="preserve"><value>Attempt count</value></data>
+    <data name="PcCompat_Data_Accuracy" xml:space="preserve"><value>Accuracy</value></data>
+    <data name="PcCompat_Data_XAccuracy" xml:space="preserve"><value>X-accuracy</value></data>
+    <data name="PcCompat_Data_LastJudgement" xml:space="preserve"><value>Last judgement</value></data>
+    <data name="PcCompat_Data_HitTiming" xml:space="preserve"><value>Hit timing</value></data>
+    <data name="PcCompat_Data_PlayerCount" xml:space="preserve"><value>Player count</value></data>
+    <data name="PcCompat_Data_MusicTime" xml:space="preserve"><value>Music time</value></data>
+    <data name="PcCompat_Data_MapTime" xml:space="preserve"><value>Map time</value></data>
+    <data name="PcCompat_Data_Checkpoint" xml:space="preserve"><value>Checkpoint</value></data>
+    <data name="PcCompat_Data_Best" xml:space="preserve"><value>Best</value></data>
+    <data name="PcCompat_Data_Input" xml:space="preserve"><value>Keys</value></data>
+    <data name="PcCompat_UnsupportedSettings" xml:space="preserve"><value>Settings Not Wired Yet</value></data>
+    <data name="PcCompat_UnsupportedSettingsHint" xml:space="preserve"><value>These options require game state or resource bridges that are not translated yet, so non-functional switches are not exposed.</value></data>
+    <data name="PcCompat_NotSupported" xml:space="preserve"><value>Not supported</value></data>
+    <data name="PcCompat_Setting_ShowProgress" xml:space="preserve"><value>Progress percentage</value></data>
+    <data name="PcCompat_Setting_ShowBpm" xml:space="preserve"><value>BPM</value></data>
+    <data name="PcCompat_Setting_ShowCombo" xml:space="preserve"><value>Combo</value></data>
+    <data name="PcCompat_Setting_ShowAttempt" xml:space="preserve"><value>Attempt count</value></data>
+    <data name="PcCompat_Setting_ShowProgressBar" xml:space="preserve"><value>Progress bar</value></data>
+    <data name="PcCompat_Setting_ShowMusicTime" xml:space="preserve"><value>Music time</value></data>
+    <data name="PcCompat_Setting_ShowMapTime" xml:space="preserve"><value>Map time</value></data>
+    <data name="PcCompat_Setting_ShowCheckpoint" xml:space="preserve"><value>Checkpoint</value></data>
+    <data name="PcCompat_Setting_ShowBest" xml:space="preserve"><value>Best record</value></data>
+    <data name="PcCompat_Setting_ShowMusicMapTime" xml:space="preserve"><value>Music/map time</value></data>
+    <data name="PcCompat_Setting_ShowCheckpointBest" xml:space="preserve"><value>Checkpoint/best</value></data>
+    <data name="PcCompat_Setting_ResourceChanger" xml:space="preserve"><value>Resource changer</value></data>
+    <data name="PcCompat_ResourceChangerHint" xml:space="preserve"><value>The native bridge applies the editor rabbit PNG, planet/tail colors, tile colors, and official color-function interception. The level-select logo clone remains pending.</value></data>
+    <data name="PcCompat_ResourceChangerNativeUnavailable" xml:space="preserve"><value>The native resource bridge is unavailable. Settings will be saved but will not apply immediately.</value></data>
+    <data name="PcCompat_Setting_ResourceChangerRabbit" xml:space="preserve"><value>Replace editor rabbit</value></data>
+    <data name="PcCompat_Setting_ResourceChangerBallColor" xml:space="preserve"><value>Replace planet color</value></data>
+    <data name="PcCompat_Setting_ResourceChangerTileColor" xml:space="preserve"><value>Replace tile color</value></data>
+    <data name="PcCompat_Setting_KeyViewer" xml:space="preserve"><value>Compatibility HUD key viewer</value></data>
+    <data name="PcCompat_Setting_TouchKeyCount" xml:space="preserve"><value>Touch key count</value></data>
+    <data name="PcCompat_VmFault" xml:space="preserve"><value>Rule VM fault</value></data>
+    <data name="PcCompat_ResourceLoad" xml:space="preserve"><value>Load</value></data>
+    <data name="PcCompat_ResourceEnableRuntimeLoad" xml:space="preserve"><value>Enable resource loading for this run</value></data>
+    <data name="PcCompat_ResourceRuntimeLoadEnabled" xml:space="preserve"><value>Resource loading is enabled for this run</value></data>
+    <data name="PcCompat_ResourceEnableRuntimeLoadFailed" xml:space="preserve"><value>Could not enable resource loading: {0}</value></data>
+    <data name="PcCompat_ResourceControlledTrial" xml:space="preserve"><value>Controlled trial</value></data>
+    <data name="PcCompat_ResourceForceTrial" xml:space="preserve"><value>Force trial</value></data>
+    <data name="PcCompat_ResourceConfirmTitle" xml:space="preserve"><value>Confirm resource bundle load</value></data>
+    <data name="PcCompat_ResourceControlledWarning" xml:space="preserve"><value>This is a desktop-platform bundle. The compatibility layer will perform one controlled load on UnityMain; failure only disables the affected resource group.</value></data>
+    <data name="PcCompat_ResourceForceWarning" xml:space="preserve"><value>This bundle did not pass the automatic version gate. Unity may reject it or produce invalid resources. Force it only for compatibility testing.</value></data>
+    <data name="PcCompat_ResourceConfirmLoad" xml:space="preserve"><value>Confirm load</value></data>
+    <data name="PcCompat_ResourceLoadQueued" xml:space="preserve"><value>Queued for UnityMain loading</value></data>
+    <data name="PcCompat_ResourceLoadSucceeded" xml:space="preserve"><value>Resource bundle loaded</value></data>
+    <data name="PcCompat_ResourceLoadFailed" xml:space="preserve"><value>Resource bundle load failed: {0}</value></data>
+    <data name="PcCompat_ResourceLoadMissingCandidate" xml:space="preserve"><value>The selected bundle is no longer valid. Refresh and try again.</value></data>
+    <data name="PcCompat_ManagedSelfRenderTitle" xml:space="preserve"><value>Managed self-render path</value></data>
+    <data name="PcCompat_ManagedSelfRenderStartTest" xml:space="preserve"><value>Start managed self-render test</value></data>
+    <data name="PcCompat_ManagedSelfRenderRequestFailed" xml:space="preserve"><value>Could not start managed self-render: {0}</value></data>
+    <data name="PcCompat_ManagedSelfRenderSessionUnavailable" xml:space="preserve"><value>The managed session has not been loaded.</value></data>
+    <data name="PcCompat_ManagedSelfRenderProviderUnavailable" xml:space="preserve"><value>The managed rewrite provider is not registered, so no session can be created.</value></data>
+    <data name="PcCompat_ManagedSelfRenderRewriteFailed" xml:space="preserve"><value>Managed assembly rewrite failed: {0}</value></data>
+    <data name="PcCompat_ManagedSelfRenderInstallFailed" xml:space="preserve"><value>Managed session installation failed: {0}</value></data>
+    <data name="PcCompat_ManagedSelfRenderRewriteUnavailable" xml:space="preserve"><value>This session is not using the rewritten MOD assembly.</value></data>
+    <data name="PcCompat_ManagedSelfRenderReady" xml:space="preserve"><value>Ready; recipe presentation is currently active.</value></data>
+    <data name="PcCompat_ManagedSelfRenderPending" xml:space="preserve"><value>Waiting to activate self-render: {0}</value></data>
+    <data name="PcCompat_ManagedSelfRenderActive" xml:space="preserve"><value>Managed MOD self-render is active.</value></data>
+    <data name="PcCompat_ManagedSelfRenderFailed" xml:space="preserve"><value>Managed self-render activation failed: {0}</value></data>
+    <data name="PcCompat_ManagedSelfRenderLifecycleUnavailable" xml:space="preserve"><value>Cannot activate from lifecycle state: {0}</value></data>
+    <data name="PcCompat_KeyViewerAdapterTitle" xml:space="preserve"><value>KeyViewer behavior detection</value></data>
+    <data name="PcCompat_KeyViewerSettingsTitle" xml:space="preserve"><value>MOD key viewer</value></data>
+    <data name="PcCompat_KeyViewerEnable" xml:space="preserve"><value>Enable KeyViewer input compatibility</value></data>
+    <data name="PcCompat_KeyViewerRecommendedReset" xml:space="preserve"><value>Restore recommended settings</value></data>
+    <data name="PcCompat_KeyViewerRecommendedApplied" xml:space="preserve"><value>Recommended KeyViewer settings were applied automatically.</value></data>
+    <data name="PcCompat_KeyViewerStatusDisabled" xml:space="preserve"><value>KeyViewer input compatibility is disabled.</value></data>
+    <data name="PcCompat_KeyViewerStatusNotApplied" xml:space="preserve"><value>the runtime input mapping has not been created</value></data>
+    <data name="PcCompat_KeyViewerStatusNeedsAdvanced" xml:space="preserve"><value>Automatic setup is incomplete: {0}</value></data>
+    <data name="PcCompat_KeyViewerStatusWaiting" xml:space="preserve"><value>Ready ({0}). Close ModManager and enter a level; input status will update automatically.</value></data>
+    <data name="PcCompat_KeyViewerStatusReceiving" xml:space="preserve"><value>Working ({0}): received {1} input events and {2} key transitions.</value></data>
+    <data name="PcCompat_KeyViewerFallbackFailed" xml:space="preserve"><value>Compatibility rendering stopped: {0}</value></data>
+    <data name="PcCompat_KeyViewerAdapterHint" xml:space="preserve"><value>This view shows import evidence and runtime consumer state. Unverified candidates cannot take over input; activation requires matching fingerprints, roles, and lowering.</value></data>
+    <data name="PcCompat_KeyViewerAdapterNone" xml:space="preserve"><value>No KeyViewer behavior candidate was found, or managed rewrite has not completed.</value></data>
+    <data name="PcCompat_KeyViewerAdapterCoreReady" xml:space="preserve"><value>The core behavior closure is verified.</value></data>
+    <data name="PcCompat_KeyViewerAdapterDiagnosticOnly" xml:space="preserve"><value>Diagnostic only: some capabilities remain unverified and will not auto-enable.</value></data>
+    <data name="PcCompat_KeyViewerAdapterCapability" xml:space="preserve"><value>Capability</value></data>
+    <data name="PcCompat_KeyViewerAdapterStatus" xml:space="preserve"><value>Status</value></data>
+    <data name="PcCompat_KeyViewerAdapterFirstBreak" xml:space="preserve"><value>First proof break / evidence</value></data>
+    <data name="PcCompat_KeyViewerInputOrigin" xml:space="preserve"><value>Current physical input source: {0}</value></data>
+    <data name="PcCompat_KeyViewerPreviewInactive" xml:space="preserve"><value>Input preview is not registered.</value></data>
+    <data name="PcCompat_KeyViewerPreviewActive" xml:space="preserve"><value>Input preview active: cursor={0}, events={1}</value></data>
+    <data name="PcCompat_KeyViewerPreviewFaulted" xml:space="preserve"><value>Input preview stopped: {0}</value></data>
+    <data name="PcCompat_KeyViewerConsumerActive" xml:space="preserve"><value>Formal Adapter consumer active: {0}, {1} mapped key identities.</value></data>
+    <data name="PcCompat_KeyViewerConsumerInactive" xml:space="preserve"><value>Formal Adapter consumer inactive: {0}</value></data>
+    <data name="PcCompat_KeyViewerManualTitle" xml:space="preserve"><value>Advanced role binding</value></data>
+    <data name="PcCompat_KeyViewerManualHint" xml:space="preserve"><value>Use only when automatic setup fails. Only scanned candidates can be selected, and runtime gates remain enforced.</value></data>
+    <data name="PcCompat_KeyViewerEnableTouchOverride" xml:space="preserve"><value>Enable mobile input override</value></data>
+    <data name="PcCompat_KeyViewerOverrideNotConfigured" xml:space="preserve"><value>No manual override has been created.</value></data>
+    <data name="PcCompat_KeyViewerInputMode" xml:space="preserve"><value>Input mode</value></data>
+    <data name="PcCompat_KeyViewerInputModeAuto" xml:space="preserve"><value>Auto</value></data>
+    <data name="PcCompat_KeyViewerInputModeTouch" xml:space="preserve"><value>Touch only</value></data>
+    <data name="PcCompat_KeyViewerInputModeExternal" xml:space="preserve"><value>External devices only</value></data>
+    <data name="PcCompat_KeyViewerInputModeHybrid" xml:space="preserve"><value>Touch + external devices</value></data>
+    <data name="PcCompat_KeyViewerTouchLaneCount" xml:space="preserve"><value>Touch lane count</value></data>
+    <data name="PcCompat_KeyViewerRoleCandidates" xml:space="preserve"><value>Confirm role candidates</value></data>
+    <data name="PcCompat_KeyViewerNoRoleCandidates" xml:space="preserve"><value>The scan result contains no role candidate that can be confirmed.</value></data>
+    <data name="PcCompat_KeyViewerRuntimePending" xml:space="preserve"><value>The binding is recorded; ordered-event preview is active, but MOD state is not written yet.</value></data>
+    <data name="PcCompat_KeyViewerOverrideSave" xml:space="preserve"><value>Save KeyViewer binding</value></data>
+    <data name="PcCompat_KeyViewerOverrideUnsaved" xml:space="preserve"><value>KeyViewer binding has unsaved changes</value></data>
+    <data name="PcCompat_KeyViewerOverrideSaved" xml:space="preserve"><value>KeyViewer binding saved.</value></data>
+    <data name="PcCompat_KeyViewerOverrideSaveFailed" xml:space="preserve"><value>Could not save KeyViewer binding: {0}</value></data>
+    <data name="PcCompat_KeyViewerOverrideStale" xml:space="preserve"><value>The saved binding is stale: {0}</value></data>
+    <data name="PcCompat_KeyViewerCompatibleFallback" xml:space="preserve"><value>Compatibility rendering (only if MOD rendering fails)</value></data>
+    <data name="PcCompat_KeyViewerCompatibleFallbackWarning" xml:space="preserve"><value>Fallback: uses generic touch lanes, session-local counts, and batched rain. It is not the MOD's original rendering, persistence, or counting policy.</value></data>
+  <data name="Settings_TouchKeyViewerMapping" xml:space="preserve"><value>Touch KeyViewer mapping</value></data>
+  <data name="Settings_TouchKeyViewerMappingRegions" xml:space="preserve"><value>Screen regions</value></data>
+  <data name="Settings_TouchKeyViewerMappingContacts" xml:space="preserve"><value>Touch contacts</value></data>
+  <data name="Settings_TouchKeyViewerMappingRegionsHint" xml:space="preserve"><value>Current behavior: divide the screen horizontally into T1...TN. Multiple contacts in one region are merged.</value></data>
+  <data name="Settings_TouchKeyViewerMappingContactsHint" xml:space="preserve"><value>Assign simultaneous touch contacts to T1...TN regardless of position. Contacts beyond the configured lane count are ignored instead of merged.</value></data>
+  <data name="Settings_TouchKeyViewerContactReuseDelay" xml:space="preserve"><value>Touch contact lane reuse delay</value></data>
+  <data name="Settings_TouchKeyViewerContactReuseDelayHint" xml:space="preserve"><value>After a T lane is released, new touches within this interval prefer another free lane. Set to 0 ms to disable delay detection.</value></data>
+  <data name="PcCompat_SettingsSchemaTitle" xml:space="preserve"><value>Original MOD settings (Schema Fallback)</value></data>
+  <data name="PcCompat_SettingsSchemaUnavailable" xml:space="preserve"><value>No verified MOD settings binding is available.</value></data>
+  <data name="PcCompat_SettingsSchemaApplying" xml:space="preserve"><value>Applying settings on UnityMain...</value></data>
+  <data name="PcCompat_SettingsSchemaUnsaved" xml:space="preserve"><value>The in-memory value changed, but the original save entry has not succeeded.</value></data>
+  <data name="PcCompat_SettingsSchemaRetrySave" xml:space="preserve"><value>Retry original save entry</value></data>
+  <data name="PcCompat_SettingsLinkedTitle" xml:space="preserve"><value>Original MOD settings (two-way sync)</value></data>
+  <data name="PcCompat_SettingsLinkedHint" xml:space="preserve"><value>These controls bind the same live values as the original MOD menu. Changes use the original setter and save entry.</value></data>
+  <data name="Inspector_HotkeyPress" xml:space="preserve"><value>Press a key... (Esc cancel, Backspace clear)</value></data>
+  <data name="Inspector_ListAdd" xml:space="preserve"><value>Add</value></data>
+  <data name="License_ModManagerRequired" xml:space="preserve"><value>The current license does not include ModManager</value></data>
+  <data name="License_PcCompatRequired" xml:space="preserve"><value>PC MOD compatibility license required</value></data>
+</root>

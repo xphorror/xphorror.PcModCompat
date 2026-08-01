@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\..\src\PcModManifest.cs" Link="PcModManifest.cs" />
+    <Compile Include="..\..\src\PcModManifestReader.cs" Link="PcModManifestReader.cs" />
+    <Compile Include="..\..\src\PcCompatPatchDescriptor.cs" Link="PcCompatPatchDescriptor.cs" />
+    <Compile Include="..\..\src\PcCompatStaticPatchScanner.cs" Link="PcCompatStaticPatchScanner.cs" />
+    <Compile Include="..\..\src\PcCompatHarmonyAttributeAggregator.cs" Link="PcCompatHarmonyAttributeAggregator.cs" />
+    <Compile Include="..\..\src\PcCompatDynamicAddPatchScanner.cs" Link="PcCompatDynamicAddPatchScanner.cs" />
+    <Compile Include="..\..\src\PcCompatRestrictedAddPatchInterpreter.cs" Link="PcCompatRestrictedAddPatchInterpreter.cs" />
+    <Compile Include="..\..\src\PcCompatCallbackTranslation.cs" Link="PcCompatCallbackTranslation.cs" />
+    <Compile Include="..\..\src\PcCompatCallbackTranslator.cs" Link="PcCompatCallbackTranslator.cs" />
+    <Compile Include="..\..\src\PcCompatFeatureRecipe.cs" Link="PcCompatFeatureRecipe.cs" />
+    <Compile Include="..\..\src\PcCompatResourceRecipe.cs" Link="PcCompatResourceRecipe.cs" />
+    <Compile Include="..\..\src\PcCompatUiGraphLowerer.cs" Link="PcCompatUiGraphLowerer.cs" />
+    <Compile Include="..\..\src\PcCompatRuntimeRuleBundle.cs" Link="PcCompatRuntimeRuleBundle.cs" />
+    <Compile Include="..\..\src\PcCompatRecipeCompiler.cs" Link="PcCompatRecipeCompiler.cs" />
+    <Compile Include="..\..\src\PcCompatRecipeReportJson.cs" Link="PcCompatRecipeReportJson.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- Isolated import-time resource compiler; not linked into Android runtime. -->
+    <ProjectReference Include="..\..\Resources\xphorror.PcModCompat.Resources.csproj" />
+  </ItemGroup>
+</Project>

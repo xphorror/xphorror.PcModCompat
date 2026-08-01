@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>Xphorror.PcModCompat.Resources.Tool</RootNamespace>
+    <AssemblyName>ResourceRecipeTool</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\Resources\xphorror.PcModCompat.Resources.csproj" />
+  </ItemGroup>
+</Project>

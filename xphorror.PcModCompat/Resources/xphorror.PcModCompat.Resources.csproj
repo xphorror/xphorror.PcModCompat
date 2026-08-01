@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>Xphorror.PcModCompat.Resources</RootNamespace>
+    <AssemblyName>xphorror.PcModCompat.Resources</AssemblyName>
+    <Description>Import-time Unity AssetBundle indexer for PcModCompat. Not linked into native HUD hot paths.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="AssetsTools.NET" Version="3.0.4" />
+  </ItemGroup>
+</Project>

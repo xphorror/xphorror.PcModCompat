@@ -1,0 +1,39 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <TargetFramework>net10.0</TargetFramework>
+        <LangVersion>latest</LangVersion>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <IsPackable>false</IsPackable>
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="coverlet.collector" Version="6.0.4"/>
+        <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.0"/>
+        <PackageReference Include="NUnit" Version="4.3.2"/>
+        <PackageReference Include="NUnit.Analyzers" Version="4.7.0"/>
+        <PackageReference Include="NUnit3TestAdapter" Version="5.0.0"/>
+    </ItemGroup>
+
+    <ItemGroup>
+        <Using Include="NUnit.Framework"/>
+    </ItemGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\StArray.ModManager\StArray.ModManager.csproj" />
+        <!-- Harmony aggregation fixtures annotate themselves with the real shim attributes, so the
+             reference is explicit instead of transitive through JALib. -->
+        <ProjectReference Include="..\xphorror.PcModCompat\shims\0Harmony\0Harmony.csproj" />
+        <ProjectReference Include="..\xphorror.PcModCompat\shims\JALib\JALib.csproj" />
+        <ProjectReference Include="..\xphorror.PcModCompat\shims\UnityEngine.CoreModule\UnityEngine.CoreModule.csproj" />
+        <ProjectReference Include="..\xphorror.PcModCompat\tools\ModAssemblyRewriter\ModAssemblyRewriter.csproj" />
+        <ProjectReference Include="..\xphorror.PcModCompat\tools\ProxySurfaceScanner\ProxySurfaceScanner.csproj" />
+        <ProjectReference Include="..\xphorror.PcModCompat\Resources\xphorror.PcModCompat.Resources.csproj" />
+        <ProjectReference Include="..\StArray.ModManager.SourceGenerator\StArray.ModManager.SourceGenerator.csproj"
+                          OutputItemType="Analyzer"
+                          ReferenceOutputAssembly="false" />
+    </ItemGroup>
+
+</Project>

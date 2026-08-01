@@ -1,0 +1,15 @@
+{
+    "schemaVersion": 1,
+    "capabilityVersion": "1",
+    "bundleName": "pccompat_capabilities_android",
+    "unityVersion": "6000.3.10f1",
+    "buildTarget": "Android",
+    "graphicsApis": [
+        "Vulkan",
+        "OpenGLES3"
+    ],
+    "bundleBytes": 481034,
+    "bundleSha256": "236ae7f7d4a478f957cfddb4fb1ef8658f96c31e95a7ae8947fe7dcaa2008ed3",
+    "whitelistSha256": "0d201f4ef59d0c610ac1195911579cdf261c796e4349bdd07431952ba0ca66d7",
+    "internalManifestSha256": "0ea9bce271d91cbd2a9eb6cc0783bee02bf53ee54bb5056064a2f32c1a05bd50"
+}

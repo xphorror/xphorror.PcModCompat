@@ -1,0 +1,331 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root>
+    <xsd:schema id="root" xmlns="" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:msdata="urn:schemas-microsoft-com:xml-msdata">
+        <xsd:element name="root" msdata:IsDataSet="true">
+        </xsd:element>
+    </xsd:schema>
+    <resheader name="resmimetype"><value>text/microsoft-resx</value></resheader>
+    <resheader name="version"><value>1.3</value></resheader>
+    <resheader name="reader"><value>System.Resources.ResXResourceReader, System.Windows.Forms, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value></resheader>
+    <resheader name="writer"><value>System.Resources.ResXResourceWriter, System.Windows.Forms, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value></resheader>
+    <data name="MainWindow_Title" xml:space="preserve"><value>StArray ModManager</value></data>
+    <data name="Tab_ModList" xml:space="preserve"><value>Mod 列表</value></data>
+    <data name="Tab_Console" xml:space="preserve"><value>控制台</value></data>
+    <data name="Tab_Log" xml:space="preserve"><value>日志</value></data>
+    <data name="Tab_Settings" xml:space="preserve"><value>设置</value></data>
+    <data name="Btn_ScanMods" xml:space="preserve"><value>扫描 Mods</value></data>
+    <data name="Btn_AddMod" xml:space="preserve"><value>添加 Mod</value></data>
+    <data name="Btn_Clear" xml:space="preserve"><value>清空</value></data>
+    <data name="Btn_Confirm" xml:space="preserve"><value>确定</value></data>
+    <data name="Btn_Cancel" xml:space="preserve"><value>取消</value></data>
+    <data name="Btn_LoadMod" xml:space="preserve"><value>加载</value></data>
+    <data name="Btn_CancelLoad" xml:space="preserve"><value>取消</value></data>
+    <data name="Btn_UnloadMod" xml:space="preserve"><value>卸载</value></data>
+    <data name="Btn_RetryLoad" xml:space="preserve"><value>重试</value></data>
+    <data name="Col_State" xml:space="preserve"><value>状态</value></data>
+    <data name="Col_Name" xml:space="preserve"><value>名称</value></data>
+    <data name="Col_Version" xml:space="preserve"><value>版本</value></data>
+    <data name="Col_Action" xml:space="preserve"><value>操作</value></data>
+    <data name="Col_Settings" xml:space="preserve"><value>设置</value></data>
+    <data name="Status_ModCount" xml:space="preserve"><value>共 {0} 个 Mod | 已加载: {1}</value></data>
+    <data name="Status_LogCount" xml:space="preserve"><value>共 {0} 条</value></data>
+    <data name="State_Loaded" xml:space="preserve"><value>已加载</value></data>
+    <data name="State_Loading" xml:space="preserve"><value>加载中</value></data>
+    <data name="State_Error" xml:space="preserve"><value>错误</value></data>
+    <data name="State_NotLoaded" xml:space="preserve"><value>未加载</value></data>
+    <data name="Settings_ModsDir" xml:space="preserve"><value>Mods 目录:</value></data>
+    <data name="Settings_UiScale" xml:space="preserve"><value>界面缩放:</value></data>
+    <data name="Settings_Language" xml:space="preserve"><value>界面语言:</value></data>
+    <data name="Language_Chinese" xml:space="preserve"><value>简体中文</value></data>
+    <data name="Language_English" xml:space="preserve"><value>英语</value></data>
+    <data name="Settings_Shortcuts" xml:space="preserve"><value>快捷键:</value></data>
+    <data name="Settings_Shortcut_Scan" xml:space="preserve"><value>Ctrl+R - 扫描 Mods</value></data>
+    <data name="Settings_ImGuiVersion" xml:space="preserve"><value>ImGui 版本:</value></data>
+    <data name="Settings_LoadedModCount" xml:space="preserve"><value>已加载 Mod 数:</value></data>
+    <data name="AddMod_Title" xml:space="preserve"><value>添加新 Mod</value></data>
+    <data name="AddMod_Name" xml:space="preserve"><value>名称:</value></data>
+    <data name="AddMod_Author" xml:space="preserve"><value>作者:</value></data>
+    <data name="AddMod_Description" xml:space="preserve"><value>描述:</value></data>
+    <data name="AddMod_DefaultName" xml:space="preserve"><value>新 Mod</value></data>
+    <data name="Mod.WindowTitle" xml:space="preserve"><value>{0} 设置</value></data>
+    <data name="Btn.Save" xml:space="preserve"><value>保存</value></data>
+    <data name="Toast.ModSaved" xml:space="preserve"><value>已保存: {0}</value></data>
+    <data name="Toast.SaveFailed" xml:space="preserve"><value>保存失败: {0}</value></data>
+    <data name="Btn_SaveSettings" xml:space="preserve"><value>保存设置</value></data>
+    <data name="Btn_Close" xml:space="preserve"><value>关闭</value></data>
+    <data name="Btn_CloseOverlay" xml:space="preserve"><value>关闭面板</value></data>
+    <data name="Btn_OpenOverlay" xml:space="preserve"><value>ModManager</value></data>
+    <data name="Settings_GrabSize" xml:space="preserve"><value>滑动条宽度:</value></data>
+    <data name="Settings_ScrollSize" xml:space="preserve"><value>滚动条宽度:</value></data>
+    <data name="Toast_SettingsSaved" xml:space="preserve"><value>设置已保存</value></data>
+    <data name="AddMod_NotImplemented" xml:space="preserve"><value>未实现</value></data>
+    <data name="AddMod_NotImplDetail" xml:space="preserve"><value>该功能尚未开发。</value></data>
+    <data name="AddMod_ImportHint" xml:space="preserve"><value>选择一个 PC MOD ZIP，复制到应用私有目录并导入。</value></data>
+    <data name="AddMod_SelectZip" xml:space="preserve"><value>选择 ZIP</value></data>
+    <data name="AddMod_Status" xml:space="preserve"><value>状态:</value></data>
+    <data name="AddMod_Status_Idle" xml:space="preserve"><value>空闲</value></data>
+    <data name="AddMod_Status_Selecting" xml:space="preserve"><value>等待选择</value></data>
+    <data name="AddMod_Status_Importing" xml:space="preserve"><value>导入中</value></data>
+    <data name="AddMod_Status_Imported" xml:space="preserve"><value>已导入</value></data>
+    <data name="AddMod_Status_Cancelled" xml:space="preserve"><value>已取消</value></data>
+    <data name="AddMod_Status_Error" xml:space="preserve"><value>错误</value></data>
+    <data name="AddMod_ImportedRescan" xml:space="preserve"><value>导入完成，已重新扫描 Mods。</value></data>
+    <data name="AddMod_ImportedLoading" xml:space="preserve"><value>导入完成，已开始加载 Mod。</value></data>
+    <data name="AddMod_ImportedReady" xml:space="preserve"><value>导入完成，请在列表中点击加载。</value></data>
+    <data name="AddMod_ImportedNotFound" xml:space="preserve"><value>导入完成，但未能识别 Mod 入口。</value></data>
+    <data name="AddMod_Unsupported" xml:space="preserve"><value>当前平台不支持从界面导入 ZIP。</value></data>
+    <data name="ModDetails_Title" xml:space="preserve"><value>Mod 详情</value></data>
+    <data name="Detail_Id" xml:space="preserve"><value>ID:</value></data>
+    <data name="Detail_Name" xml:space="preserve"><value>名称:</value></data>
+    <data name="Detail_Version" xml:space="preserve"><value>版本:</value></data>
+    <data name="Detail_Author" xml:space="preserve"><value>作者:</value></data>
+    <data name="Detail_LoaderKind" xml:space="preserve"><value>加载器:</value></data>
+    <data name="Detail_State" xml:space="preserve"><value>状态:</value></data>
+    <data name="Detail_EntryPoint" xml:space="preserve"><value>入口:</value></data>
+    <data name="Detail_FolderPath" xml:space="preserve"><value>目录:</value></data>
+    <data name="Detail_Description" xml:space="preserve"><value>描述:</value></data>
+    <data name="Detail_Dependencies" xml:space="preserve"><value>依赖:</value></data>
+    <data name="Detail_Error" xml:space="preserve"><value>错误:</value></data>
+    <data name="Detail_LoadStage" xml:space="preserve"><value>加载阶段:</value></data>
+    <data name="Detail_LoadProgress" xml:space="preserve"><value>加载进度:</value></data>
+    <data name="Inspector_DeserializeNull" xml:space="preserve"><value>反序列化失败：结果为 null</value></data>
+    <data name="Inspector_JsonError" xml:space="preserve"><value>JSON 错误: {0}</value></data>
+    <data name="Log_DirCreated" xml:space="preserve"><value>已创建 Mods 目录: {0}</value></data>
+    <data name="Log_ModFound" xml:space="preserve"><value>发现 Mod: {0} ({1})</value></data>
+    <data name="Log_ModCount" xml:space="preserve"><value>共发现 {0} 个 Mod</value></data>
+    <data name="Log_ModAssemblyError" xml:space="preserve"><value>无法读取 Mod 程序集 {0}: {1}</value></data>
+    <data name="Log_ModAlreadyLoaded" xml:space="preserve"><value>{0} 已经加载</value></data>
+    <data name="Log_MissingDep" xml:space="preserve"><value>缺少依赖: {0}</value></data>
+    <data name="Log_ModAssemblyLoaded" xml:space="preserve"><value>{0} 程序集已加载: {1}</value></data>
+    <data name="Log_ModEntryExecuted" xml:space="preserve"><value>{0} 插件入口已执行</value></data>
+    <data name="Log_ModNoEntry" xml:space="preserve"><value>{0} 无入口程序集，作为数据 Mod 加载</value></data>
+    <data name="Log_ModLoadSuccess" xml:space="preserve"><value>{0} 加载成功</value></data>
+    <data name="Log_ModLoadFailed" xml:space="preserve"><value>{0} 加载失败: {1}</value></data>
+    <data name="Log_ModUnloaded" xml:space="preserve"><value>{0} 已卸载</value></data>
+    <data name="Log_PcCompatBackgroundStarted" xml:space="preserve"><value>{0} PcModCompat 后台翻译已启动</value></data>
+    <data name="Log_PcCompatLoadSuccess" xml:space="preserve"><value>{0} PcModCompat 加载成功</value></data>
+    <data name="Log_StaleCompletionIgnored" xml:space="preserve"><value>{0} 异步加载收尾时状态已变化，忽略过期的完成回调: {1}</value></data>
+    <data name="Log_StaleRegistrationRollback" xml:space="preserve"><value>{0} 在卸载竞态中完成了后台安装，正在回滚残留的兼容层注册</value></data>
+    <data name="Log_StaleRegistrationRollbackFailed" xml:space="preserve"><value>{0} 回滚残留注册失败: {1}</value></data>
+    <data name="Log_ModAdded" xml:space="preserve"><value>已添加 Mod: {0}</value></data>
+    <data name="Log_ModRemoved" xml:space="preserve"><value>已移除 Mod: {0}</value></data>
+    <data name="Log_AutoEnable" xml:space="preserve"><value>自动启用: {0}</value></data>
+    <data name="Log_SaveSettings" xml:space="preserve"><value>SaveSettings: {0}</value></data>
+    <data name="Log_LoadSettings" xml:space="preserve"><value>LoadSettings: {0}</value></data>
+    <data name="PcCompat_ManagedTranslation" xml:space="preserve"><value>托管扫描与翻译</value></data>
+    <data name="PcCompat_StaticPatches" xml:space="preserve"><value>活动/全部 PATCH</value></data>
+    <data name="PcCompat_StaticIssues" xml:space="preserve"><value>扫描问题</value></data>
+    <data name="PcCompat_Callbacks" xml:space="preserve"><value>已翻译/全部回调</value></data>
+    <data name="PcCompat_Unsupported" xml:space="preserve"><value>不支持</value></data>
+    <data name="PcCompat_NotMapped" xml:space="preserve"><value>未映射</value></data>
+    <data name="PcCompat_Skipped" xml:space="preserve"><value>已跳过</value></data>
+    <data name="PcCompat_RecipeRules" xml:space="preserve"><value>Recipe 规则</value></data>
+    <data name="PcCompat_RecipeUnsupported" xml:space="preserve"><value>Recipe 未支持</value></data>
+    <data name="PcCompat_UnsupportedDetails" xml:space="preserve"><value>未支持/未映射回调明细</value></data>
+    <data name="PcCompat_NativeGlobal" xml:space="preserve"><value>Native 全局 Hook 状态</value></data>
+    <data name="PcCompat_Provider" xml:space="preserve"><value>诊断桥</value></data>
+    <data name="PcCompat_Available" xml:space="preserve"><value>可用</value></data>
+    <data name="PcCompat_Capabilities" xml:space="preserve"><value>授权能力</value></data>
+    <data name="PcCompat_Bundles" xml:space="preserve"><value>Bundles</value></data>
+    <data name="PcCompat_Targets" xml:space="preserve"><value>Targets</value></data>
+    <data name="PcCompat_Rules" xml:space="preserve"><value>Rules</value></data>
+    <data name="PcCompat_LifecyclePrograms" xml:space="preserve"><value>UI 生命周期</value></data>
+    <data name="PcCompat_VmInstructions" xml:space="preserve"><value>VM 指令</value></data>
+    <data name="PcCompat_Slots" xml:space="preserve"><value>合并 Slots</value></data>
+    <data name="PcCompat_Pending" xml:space="preserve"><value>待解析</value></data>
+    <data name="PcCompat_Resolved" xml:space="preserve"><value>已解析</value></data>
+    <data name="PcCompat_Failed" xml:space="preserve"><value>失败</value></data>
+    <data name="PcCompat_Blocked" xml:space="preserve"><value>安装阻塞</value></data>
+    <data name="PcCompat_Installable" xml:space="preserve"><value>可安装</value></data>
+    <data name="PcCompat_Installed" xml:space="preserve"><value>已安装/活动</value></data>
+    <data name="PcCompat_DispatcherReady" xml:space="preserve"><value>Dispatcher 就绪</value></data>
+    <data name="PcCompat_DispatcherBound" xml:space="preserve"><value>Dispatcher 已绑定</value></data>
+    <data name="PcCompat_SlotRules" xml:space="preserve"><value>Slot 规则</value></data>
+    <data name="PcCompat_RuleState" xml:space="preserve"><value>规则 启用/停用</value></data>
+    <data name="PcCompat_ProviderUnavailableText" xml:space="preserve"><value>Android Native 诊断桥不可用。当前只能查看托管扫描结果，不能读取或操作真实 Hook 状态。</value></data>
+    <data name="PcCompat_Refresh" xml:space="preserve"><value>刷新</value></data>
+    <data name="PcCompat_Resolve" xml:space="preserve"><value>解析</value></data>
+    <data name="PcCompat_Prepare" xml:space="preserve"><value>生成计划</value></data>
+    <data name="PcCompat_Install" xml:space="preserve"><value>安装</value></data>
+    <data name="PcCompat_Reload" xml:space="preserve"><value>重载活动规则</value></data>
+    <data name="PcCompat_ClearRules" xml:space="preserve"><value>停用全部规则</value></data>
+    <data name="PcCompat_ClearTitle" xml:space="preserve"><value>停用 PcCompat 规则</value></data>
+    <data name="PcCompat_ClearWarning" xml:space="preserve"><value>这会停用当前进程中的全部 PcCompat 规则，但不会 unhook，也不会释放已绑定的 Dispatcher。可用重载活动规则恢复当前已启用 MOD 的规则。</value></data>
+    <data name="PcCompat_ClearConfirm" xml:space="preserve"><value>确认停用</value></data>
+    <data name="PcCompat_LastOperation" xml:space="preserve"><value>最近操作:</value></data>
+    <data name="PcCompat_LastError" xml:space="preserve"><value>Native 错误:</value></data>
+    <data name="PcCompat_SlotDetails" xml:space="preserve"><value>Slot 明细</value></data>
+    <data name="PcCompat_LoadProgress" xml:space="preserve"><value>PATCH 扫描与翻译</value></data>
+    <data name="PcCompat_LoadStage_Queued" xml:space="preserve"><value>等待后台任务</value></data>
+    <data name="PcCompat_LoadStage_Scanning" xml:space="preserve"><value>扫描 PATCH 元数据</value></data>
+    <data name="PcCompat_LoadStage_Translating" xml:space="preserve"><value>翻译回调</value></data>
+    <data name="PcCompat_LoadStage_Compiling" xml:space="preserve"><value>编译 Native 规则</value></data>
+    <data name="PcCompat_LoadStage_Finalizing" xml:space="preserve"><value>等待主线程安装</value></data>
+    <data name="PcCompat_LoadStage_Installing" xml:space="preserve"><value>安装托管运行时</value></data>
+    <data name="PcCompat_LoadStage_Ready" xml:space="preserve"><value>完成</value></data>
+    <data name="PcCompat_LoadStage_Cancelled" xml:space="preserve"><value>已取消</value></data>
+    <data name="PcCompat_LoadStage_Failed" xml:space="preserve"><value>失败</value></data>
+    <data name="PcCompat_ShowAllSlots" xml:space="preserve"><value>显示全部 MOD</value></data>
+    <data name="PcCompat_GlobalSlotHint" xml:space="preserve"><value>正在显示 HookManager 中全部 MOD 的 slot。</value></data>
+    <data name="PcCompat_ModSlotHint" xml:space="preserve"><value>只显示由 {0} 引入的 slot；共享 target 仍只占一个 dispatcher。</value></data>
+    <data name="PcCompat_ExportDiagnostics" xml:space="preserve"><value>导出诊断报告</value></data>
+    <data name="PcCompat_ExportSelecting" xml:space="preserve"><value>等待选择保存位置</value></data>
+    <data name="PcCompat_Tab_ModSettings" xml:space="preserve"><value>MOD 设置</value></data>
+    <data name="PcCompat_Tab_Diagnostics" xml:space="preserve"><value>兼容诊断</value></data>
+    <data name="PcCompat_SettingsTitle" xml:space="preserve"><value>PC MOD 兼容设置</value></data>
+    <data name="PcCompat_SettingsFallbackTitle" xml:space="preserve"><value>Fallback</value></data>
+    <data name="PcCompat_SettingsFallbackReason" xml:space="preserve"><value>MOD 原设置菜单不可用：{0}</value></data>
+    <data name="Mod.OpenOriginalSettings" xml:space="preserve"><value>打开 MOD 原设置</value></data>
+    <data name="Mod.OriginalSettingsOpenFailed" xml:space="preserve"><value>无法打开 MOD 原设置：{0}</value></data>
+    <data name="Mod.OriginalSettingsUnavailable" xml:space="preserve"><value>设置界面不可用</value></data>
+    <data name="PcCompat_NoMobileSettingsAdapter" xml:space="preserve"><value>当前 PC MOD 还没有移动端设置适配；兼容诊断仍可使用。</value></data>
+    <data name="PcCompat_TranslatedOverlaySettings" xml:space="preserve"><value>已翻译 HUD 设置</value></data>
+    <data name="PcCompat_TranslatedOverlaySettingsHint" xml:space="preserve"><value>这些选项由通用 fixed-op 规则和真实游戏数据驱动，不依赖特定 MOD 名称。尚未翻译的 PC 功能会明确显示为不支持。</value></data>
+    <data name="PcCompat_Setting_ShowHud" xml:space="preserve"><value>显示状态 HUD</value></data>
+    <data name="PcCompat_Setting_ShowAccuracy" xml:space="preserve"><value>显示准确率</value></data>
+    <data name="PcCompat_Setting_ShowXAccuracy" xml:space="preserve"><value>显示 X-准确率</value></data>
+    <data name="PcCompat_Setting_ShowLastJudgement" xml:space="preserve"><value>显示最近判定</value></data>
+    <data name="PcCompat_Setting_ShowHitTiming" xml:space="preserve"><value>显示击打偏移</value></data>
+    <data name="PcCompat_Setting_ShowPlayerCount" xml:space="preserve"><value>显示玩家数量</value></data>
+    <data name="PcCompat_Setting_ShowTechnicalDiagnostics" xml:space="preserve"><value>显示技术诊断信息</value></data>
+    <data name="PcCompat_Setting_HudScale" xml:space="preserve"><value>HUD 缩放</value></data>
+    <data name="PcCompat_Setting_PositionX" xml:space="preserve"><value>横向位置</value></data>
+    <data name="PcCompat_Setting_PositionY" xml:space="preserve"><value>纵向位置</value></data>
+    <data name="PcCompat_Setting_BackgroundOpacity" xml:space="preserve"><value>背景透明度</value></data>
+    <data name="PcCompat_Setting_ResetDefaults" xml:space="preserve"><value>恢复默认</value></data>
+    <data name="PcCompat_Setting_DefaultsRestored" xml:space="preserve"><value>已恢复默认值，保存后生效。</value></data>
+    <data name="PcCompat_Setting_Unsaved" xml:space="preserve"><value>未保存</value></data>
+    <data name="PcCompat_Setting_Saved" xml:space="preserve"><value>移动端设置已保存。</value></data>
+    <data name="PcCompat_Setting_SaveFailed" xml:space="preserve"><value>保存失败：{0}</value></data>
+    <data name="PcCompat_CurrentData" xml:space="preserve"><value>当前数据状态</value></data>
+    <data name="PcCompat_CurrentDataUnavailable" xml:space="preserve"><value>Native 数据桥当前不可用。</value></data>
+    <data name="PcCompat_Data_Overlay" xml:space="preserve"><value>关卡 HUD</value></data>
+    <data name="PcCompat_Data_Visible" xml:space="preserve"><value>显示中</value></data>
+    <data name="PcCompat_Data_Hidden" xml:space="preserve"><value>未显示</value></data>
+    <data name="PcCompat_Data_Progress" xml:space="preserve"><value>进度</value></data>
+    <data name="PcCompat_Data_Bpm" xml:space="preserve"><value>BPM / KPS</value></data>
+    <data name="PcCompat_Data_Combo" xml:space="preserve"><value>Combo</value></data>
+    <data name="PcCompat_Data_Attempt" xml:space="preserve"><value>尝试次数</value></data>
+    <data name="PcCompat_Data_Accuracy" xml:space="preserve"><value>准确率</value></data>
+    <data name="PcCompat_Data_XAccuracy" xml:space="preserve"><value>X-准确率</value></data>
+    <data name="PcCompat_Data_LastJudgement" xml:space="preserve"><value>最近判定</value></data>
+    <data name="PcCompat_Data_HitTiming" xml:space="preserve"><value>击打偏移</value></data>
+    <data name="PcCompat_Data_PlayerCount" xml:space="preserve"><value>玩家数量</value></data>
+    <data name="PcCompat_Data_MusicTime" xml:space="preserve"><value>音乐时间</value></data>
+    <data name="PcCompat_Data_MapTime" xml:space="preserve"><value>谱面时间</value></data>
+    <data name="PcCompat_Data_Checkpoint" xml:space="preserve"><value>检查点</value></data>
+    <data name="PcCompat_Data_Best" xml:space="preserve"><value>最佳记录</value></data>
+    <data name="PcCompat_Data_Input" xml:space="preserve"><value>按键</value></data>
+    <data name="PcCompat_UnsupportedSettings" xml:space="preserve"><value>尚未接通的设置</value></data>
+    <data name="PcCompat_UnsupportedSettingsHint" xml:space="preserve"><value>这些选项依赖尚未翻译的游戏状态或资源接口，目前不会提供无效开关。</value></data>
+    <data name="PcCompat_NotSupported" xml:space="preserve"><value>暂不支持</value></data>
+    <data name="PcCompat_Setting_ShowProgress" xml:space="preserve"><value>进度百分比</value></data>
+    <data name="PcCompat_Setting_ShowBpm" xml:space="preserve"><value>BPM</value></data>
+    <data name="PcCompat_Setting_ShowCombo" xml:space="preserve"><value>Combo</value></data>
+    <data name="PcCompat_Setting_ShowAttempt" xml:space="preserve"><value>尝试次数</value></data>
+    <data name="PcCompat_Setting_ShowProgressBar" xml:space="preserve"><value>进度条</value></data>
+    <data name="PcCompat_Setting_ShowMusicTime" xml:space="preserve"><value>音乐时间</value></data>
+    <data name="PcCompat_Setting_ShowMapTime" xml:space="preserve"><value>谱面时间</value></data>
+    <data name="PcCompat_Setting_ShowCheckpoint" xml:space="preserve"><value>检查点</value></data>
+    <data name="PcCompat_Setting_ShowBest" xml:space="preserve"><value>最佳记录</value></data>
+    <data name="PcCompat_Setting_ShowMusicMapTime" xml:space="preserve"><value>音乐/谱面时间</value></data>
+    <data name="PcCompat_Setting_ShowCheckpointBest" xml:space="preserve"><value>检查点/最佳记录</value></data>
+    <data name="PcCompat_Setting_ResourceChanger" xml:space="preserve"><value>资源替换</value></data>
+    <data name="PcCompat_ResourceChangerHint" xml:space="preserve"><value>Native 资源桥会替换编辑器兔子 PNG、星球/尾迹颜色、轨道颜色，并拦截官方改色入口；选关 Logo 克隆仍待接入。</value></data>
+    <data name="PcCompat_ResourceChangerNativeUnavailable" xml:space="preserve"><value>Native 资源替换桥当前不可用，设置会保存但不会立即生效。</value></data>
+    <data name="PcCompat_Setting_ResourceChangerRabbit" xml:space="preserve"><value>替换编辑器兔子图</value></data>
+    <data name="PcCompat_Setting_ResourceChangerBallColor" xml:space="preserve"><value>替换星球颜色</value></data>
+    <data name="PcCompat_Setting_ResourceChangerTileColor" xml:space="preserve"><value>替换轨道颜色</value></data>
+    <data name="PcCompat_Setting_KeyViewer" xml:space="preserve"><value>兼容 HUD 按键显示</value></data>
+    <data name="PcCompat_Setting_TouchKeyCount" xml:space="preserve"><value>触摸键数量</value></data>
+    <data name="PcCompat_VmFault" xml:space="preserve"><value>规则 VM 异常</value></data>
+    <data name="PcCompat_ResourceLoad" xml:space="preserve"><value>加载</value></data>
+    <data name="PcCompat_ResourceEnableRuntimeLoad" xml:space="preserve"><value>本次运行启用资源加载</value></data>
+    <data name="PcCompat_ResourceRuntimeLoadEnabled" xml:space="preserve"><value>本次运行已启用资源加载</value></data>
+    <data name="PcCompat_ResourceEnableRuntimeLoadFailed" xml:space="preserve"><value>启用资源加载失败：{0}</value></data>
+    <data name="PcCompat_ResourceControlledTrial" xml:space="preserve"><value>受控试加载</value></data>
+    <data name="PcCompat_ResourceForceTrial" xml:space="preserve"><value>强制试加载</value></data>
+    <data name="PcCompat_ResourceConfirmTitle" xml:space="preserve"><value>确认加载资源包</value></data>
+    <data name="PcCompat_ResourceControlledWarning" xml:space="preserve"><value>这是桌面平台资源包。兼容层会在 Unity 主线程进行一次受控加载；加载失败只影响该资源组。</value></data>
+    <data name="PcCompat_ResourceForceWarning" xml:space="preserve"><value>该资源包未通过自动版本门禁。强制加载可能被 Unity 拒绝或产生错误资源，请仅用于兼容性测试。</value></data>
+    <data name="PcCompat_ResourceConfirmLoad" xml:space="preserve"><value>确认加载</value></data>
+    <data name="PcCompat_ResourceLoadQueued" xml:space="preserve"><value>已排入 Unity 主线程加载队列</value></data>
+    <data name="PcCompat_ResourceLoadSucceeded" xml:space="preserve"><value>资源包已加载</value></data>
+    <data name="PcCompat_ResourceLoadFailed" xml:space="preserve"><value>资源包加载失败：{0}</value></data>
+    <data name="PcCompat_ResourceLoadMissingCandidate" xml:space="preserve"><value>待加载资源包已经失效，请刷新后重试。</value></data>
+    <data name="PcCompat_ManagedSelfRenderTitle" xml:space="preserve"><value>托管自绘链路</value></data>
+    <data name="PcCompat_ManagedSelfRenderStartTest" xml:space="preserve"><value>启动托管自绘测试</value></data>
+    <data name="PcCompat_ManagedSelfRenderRequestFailed" xml:space="preserve"><value>无法启动托管自绘：{0}</value></data>
+    <data name="PcCompat_ManagedSelfRenderSessionUnavailable" xml:space="preserve"><value>托管会话尚未加载。</value></data>
+    <data name="PcCompat_ManagedSelfRenderProviderUnavailable" xml:space="preserve"><value>托管重写器未注册，无法建立会话。</value></data>
+    <data name="PcCompat_ManagedSelfRenderRewriteFailed" xml:space="preserve"><value>托管程序集重写失败：{0}</value></data>
+    <data name="PcCompat_ManagedSelfRenderInstallFailed" xml:space="preserve"><value>托管会话安装失败：{0}</value></data>
+    <data name="PcCompat_ManagedSelfRenderRewriteUnavailable" xml:space="preserve"><value>当前会话没有使用重写后的 MOD 程序集。</value></data>
+    <data name="PcCompat_ManagedSelfRenderReady" xml:space="preserve"><value>已就绪，当前使用兼容绘制。</value></data>
+    <data name="PcCompat_ManagedSelfRenderPending" xml:space="preserve"><value>正在等待自绘启动：{0}</value></data>
+    <data name="PcCompat_ManagedSelfRenderActive" xml:space="preserve"><value>MOD 托管自绘已启用。</value></data>
+    <data name="PcCompat_ManagedSelfRenderFailed" xml:space="preserve"><value>托管自绘启动失败：{0}</value></data>
+    <data name="PcCompat_ManagedSelfRenderLifecycleUnavailable" xml:space="preserve"><value>当前生命周期状态不可启动：{0}</value></data>
+    <data name="PcCompat_KeyViewerAdapterTitle" xml:space="preserve"><value>KeyViewer 行为识别</value></data>
+    <data name="PcCompat_KeyViewerSettingsTitle" xml:space="preserve"><value>MOD 按键显示</value></data>
+    <data name="PcCompat_KeyViewerEnable" xml:space="preserve"><value>启用 KeyViewer 输入兼容</value></data>
+    <data name="PcCompat_KeyViewerRecommendedReset" xml:space="preserve"><value>恢复推荐配置</value></data>
+    <data name="PcCompat_KeyViewerRecommendedApplied" xml:space="preserve"><value>已自动应用推荐的 KeyViewer 配置。</value></data>
+    <data name="PcCompat_KeyViewerStatusDisabled" xml:space="preserve"><value>KeyViewer 输入兼容未启用。</value></data>
+    <data name="PcCompat_KeyViewerStatusNotApplied" xml:space="preserve"><value>运行期输入映射尚未建立</value></data>
+    <data name="PcCompat_KeyViewerStatusNeedsAdvanced" xml:space="preserve"><value>自动配置未完成：{0}</value></data>
+    <data name="PcCompat_KeyViewerStatusWaiting" xml:space="preserve"><value>已就绪（{0}）。关闭 ModManager 后进入关卡输入，状态会自动更新。</value></data>
+    <data name="PcCompat_KeyViewerStatusReceiving" xml:space="preserve"><value>运行正常（{0}）：已接收 {1} 个输入事件，产生 {2} 次按键变化。</value></data>
+    <data name="PcCompat_KeyViewerFallbackFailed" xml:space="preserve"><value>兼容代绘已停止：{0}</value></data>
+    <data name="PcCompat_KeyViewerAdapterHint" xml:space="preserve"><value>这里展示导入期证据和运行时 consumer 状态。未验证的候选不会接管输入；只有指纹、角色和 lowering 全部通过后才会启用。</value></data>
+    <data name="PcCompat_KeyViewerAdapterNone" xml:space="preserve"><value>没有发现 KeyViewer 行为候选，或托管重写尚未完成。</value></data>
+    <data name="PcCompat_KeyViewerAdapterCoreReady" xml:space="preserve"><value>核心行为闭包已验证。</value></data>
+    <data name="PcCompat_KeyViewerAdapterDiagnosticOnly" xml:space="preserve"><value>仅诊断：仍有能力未验证，不会自动启用。</value></data>
+    <data name="PcCompat_KeyViewerAdapterCapability" xml:space="preserve"><value>能力</value></data>
+    <data name="PcCompat_KeyViewerAdapterStatus" xml:space="preserve"><value>状态</value></data>
+    <data name="PcCompat_KeyViewerAdapterFirstBreak" xml:space="preserve"><value>首个证明断点 / 证据</value></data>
+    <data name="PcCompat_KeyViewerInputOrigin" xml:space="preserve"><value>当前物理输入来源：{0}</value></data>
+    <data name="PcCompat_KeyViewerPreviewInactive" xml:space="preserve"><value>输入预览未注册。</value></data>
+    <data name="PcCompat_KeyViewerPreviewActive" xml:space="preserve"><value>输入预览运行中：cursor={0}，events={1}</value></data>
+    <data name="PcCompat_KeyViewerPreviewFaulted" xml:space="preserve"><value>输入预览已停止：{0}</value></data>
+    <data name="PcCompat_KeyViewerConsumerActive" xml:space="preserve"><value>正式 Adapter consumer 已启用：{0}，映射 {1} 个键位身份。</value></data>
+    <data name="PcCompat_KeyViewerConsumerInactive" xml:space="preserve"><value>正式 Adapter consumer 未启用：{0}</value></data>
+    <data name="PcCompat_KeyViewerManualTitle" xml:space="preserve"><value>高级角色绑定</value></data>
+    <data name="PcCompat_KeyViewerManualHint" xml:space="preserve"><value>仅在自动配置失败时使用。这里只能选择扫描结果中已有的候选，不会绕过运行时门禁。</value></data>
+    <data name="PcCompat_KeyViewerEnableTouchOverride" xml:space="preserve"><value>启用移动端输入覆盖</value></data>
+    <data name="PcCompat_KeyViewerOverrideNotConfigured" xml:space="preserve"><value>尚未创建手动覆盖配置。</value></data>
+    <data name="PcCompat_KeyViewerInputMode" xml:space="preserve"><value>输入模式</value></data>
+    <data name="PcCompat_KeyViewerInputModeAuto" xml:space="preserve"><value>自动</value></data>
+    <data name="PcCompat_KeyViewerInputModeTouch" xml:space="preserve"><value>仅触摸</value></data>
+    <data name="PcCompat_KeyViewerInputModeExternal" xml:space="preserve"><value>仅外接设备</value></data>
+    <data name="PcCompat_KeyViewerInputModeHybrid" xml:space="preserve"><value>触摸 + 外接设备</value></data>
+    <data name="PcCompat_KeyViewerTouchLaneCount" xml:space="preserve"><value>触摸槽位数量</value></data>
+    <data name="PcCompat_KeyViewerRoleCandidates" xml:space="preserve"><value>确认角色候选</value></data>
+    <data name="PcCompat_KeyViewerNoRoleCandidates" xml:space="preserve"><value>扫描结果中没有可确认的角色候选。</value></data>
+    <data name="PcCompat_KeyViewerRuntimePending" xml:space="preserve"><value>配置已记录；当前仅启用有序事件预览，尚未写入 MOD 状态。</value></data>
+    <data name="PcCompat_KeyViewerOverrideSave" xml:space="preserve"><value>保存 KeyViewer 绑定</value></data>
+    <data name="PcCompat_KeyViewerOverrideUnsaved" xml:space="preserve"><value>有未保存的绑定修改</value></data>
+    <data name="PcCompat_KeyViewerOverrideSaved" xml:space="preserve"><value>KeyViewer 绑定已保存。</value></data>
+    <data name="PcCompat_KeyViewerOverrideSaveFailed" xml:space="preserve"><value>KeyViewer 绑定保存失败：{0}</value></data>
+    <data name="PcCompat_KeyViewerOverrideStale" xml:space="preserve"><value>已有绑定已失效：{0}</value></data>
+    <data name="PcCompat_KeyViewerCompatibleFallback" xml:space="preserve"><value>兼容层代绘（仅 MOD 自绘异常时）</value></data>
+    <data name="PcCompat_KeyViewerCompatibleFallbackWarning" xml:space="preserve"><value>Fallback：使用通用触摸槽位、会话内计数和批量 rain，不等同于 MOD 原绘制、持久化或计数规则。</value></data>
+  <data name="Settings_TouchKeyViewerMapping" xml:space="preserve"><value>触摸 KeyViewer 分配方式</value></data>
+  <data name="Settings_TouchKeyViewerMappingRegions" xml:space="preserve"><value>屏幕区域</value></data>
+  <data name="Settings_TouchKeyViewerMappingContacts" xml:space="preserve"><value>触摸点</value></data>
+  <data name="Settings_TouchKeyViewerMappingRegionsHint" xml:space="preserve"><value>保持当前行为：按横坐标把屏幕等分为 T1...TN，同一区域的多指会合并。</value></data>
+  <data name="Settings_TouchKeyViewerMappingContactsHint" xml:space="preserve"><value>不同的同时触摸点依次占用 T1...TN，不按屏幕位置分区；超过槽位数量的触点不会合并。</value></data>
+  <data name="Settings_TouchKeyViewerContactReuseDelay" xml:space="preserve"><value>触摸点换键间隔</value></data>
+  <data name="Settings_TouchKeyViewerContactReuseDelayHint" xml:space="preserve"><value>某个 T 槽抬起后，在此时间内的新触摸会优先分配到其他空闲槽。设为 0 ms 可关闭延迟检测。</value></data>
+  <data name="PcCompat_SettingsSchemaTitle" xml:space="preserve"><value>MOD 原设置（Schema Fallback）</value></data>
+  <data name="PcCompat_SettingsSchemaUnavailable" xml:space="preserve"><value>没有可验证的 MOD 设置绑定。</value></data>
+  <data name="PcCompat_SettingsSchemaApplying" xml:space="preserve"><value>正在 UnityMain 应用设置...</value></data>
+  <data name="PcCompat_SettingsSchemaUnsaved" xml:space="preserve"><value>设置已写入内存，但原保存入口尚未成功。</value></data>
+  <data name="PcCompat_SettingsSchemaRetrySave" xml:space="preserve"><value>重试原保存入口</value></data>
+  <data name="PcCompat_SettingsLinkedTitle" xml:space="preserve"><value>MOD 原设置（双向同步）</value></data>
+  <data name="PcCompat_SettingsLinkedHint" xml:space="preserve"><value>这里与 MOD 原菜单绑定同一组实时值；修改会调用原 setter 并通过原保存入口持久化。</value></data>
+  <data name="Inspector_HotkeyPress" xml:space="preserve"><value>请按键... (Esc 取消, Backspace 解绑)</value></data>
+  <data name="Inspector_ListAdd" xml:space="preserve"><value>添加</value></data>
+  <data name="License_ModManagerRequired" xml:space="preserve"><value>当前授权不包含 ModManager</value></data>
+  <data name="License_PcCompatRequired" xml:space="preserve"><value>需要 PC MOD 兼容授权</value></data>
+</root>

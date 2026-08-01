@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>Module to allow using Harmony with Il2CppInterop assemblies</Description>
+    <TargetFramework>net6.0</TargetFramework>
+    <RootNamespace>Il2CppInterop.HarmonySupport</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="HarmonyX" Version="2.10.0"/>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Il2CppInterop.Runtime\Il2CppInterop.Runtime.csproj"/>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="Il2Cppmscorlib">
+      <Private>false</Private>
+      <HintPath>..\Il2CppInterop.Runtime\Libs\Il2Cppmscorlib.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+</Project>

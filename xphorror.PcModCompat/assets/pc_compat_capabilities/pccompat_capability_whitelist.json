@@ -1,0 +1,523 @@
+{
+    "schemaVersion": 1,
+    "capabilityVersion": "1",
+    "bundleName": "pccompat_capabilities_android",
+    "assets": [
+        {
+            "id": "shader.tmp.mobile.sdf",
+            "address": "shader.tmp.mobile.sdf",
+            "path": "Assets/TextMesh Pro/Shaders/TMP_SDF-Mobile.shader",
+            "type": "UnityEngine.Shader",
+            "required": true,
+            "compatibility": "exact",
+            "tags": [
+                "shader",
+                "tmp",
+                "sdf",
+                "mobile"
+            ]
+        },
+        {
+            "id": "shader.tmp.mobile.overlay",
+            "address": "shader.tmp.mobile.overlay",
+            "path": "Assets/TextMesh Pro/Shaders/TMP_SDF-Mobile Overlay.shader",
+            "type": "UnityEngine.Shader",
+            "required": true,
+            "compatibility": "exact",
+            "tags": [
+                "shader",
+                "tmp",
+                "sdf",
+                "overlay"
+            ]
+        },
+        {
+            "id": "shader.tmp.mobile.masking",
+            "address": "shader.tmp.mobile.masking",
+            "path": "Assets/TextMesh Pro/Shaders/TMP_SDF-Mobile Masking.shader",
+            "type": "UnityEngine.Shader",
+            "required": true,
+            "compatibility": "exact",
+            "tags": [
+                "shader",
+                "tmp",
+                "sdf",
+                "mask"
+            ]
+        },
+        {
+            "id": "shader.tmp.mobile.ssd",
+            "address": "shader.tmp.mobile.ssd",
+            "path": "Assets/TextMesh Pro/Shaders/TMP_SDF-Mobile SSD.shader",
+            "type": "UnityEngine.Shader",
+            "required": true,
+            "compatibility": "exact",
+            "tags": [
+                "shader",
+                "tmp",
+                "sdf",
+                "ssd"
+            ]
+        },
+        {
+            "id": "shader.tmp.mobile.two_pass_legacy",
+            "address": "shader.tmp.mobile.two_pass_legacy",
+            "path": "Assets/Shader/TextMeshPro_Mobile_Distance Field - 2 Pass.shader",
+            "type": "UnityEngine.Shader",
+            "required": true,
+            "compatibility": "compatible",
+            "tags": [
+                "shader",
+                "tmp",
+                "sdf",
+                "two-pass",
+                "legacy",
+                "asset-ripper-placeholder"
+            ]
+        },
+        {
+            "id": "shader.tmp.sprite",
+            "address": "shader.tmp.sprite",
+            "path": "Assets/TextMesh Pro/Shaders/TMP_Sprite.shader",
+            "type": "UnityEngine.Shader",
+            "required": true,
+            "compatibility": "exact",
+            "tags": [
+                "shader",
+                "tmp",
+                "sprite"
+            ]
+        },
+        {
+            "id": "shader.tmp.bitmap.mobile",
+            "address": "shader.tmp.bitmap.mobile",
+            "path": "Assets/TextMesh Pro/Shaders/TMP_Bitmap-Mobile.shader",
+            "type": "UnityEngine.Shader",
+            "required": true,
+            "compatibility": "exact",
+            "tags": [
+                "shader",
+                "tmp",
+                "bitmap",
+                "mobile"
+            ]
+        },
+        {
+            "id": "shader.adofai.overlay",
+            "address": "shader.adofai.overlay",
+            "path": "Assets/Shader/ADOFAI_Overlay.shader",
+            "type": "UnityEngine.Shader",
+            "required": true,
+            "compatibility": "compatible",
+            "tags": [
+                "shader",
+                "adofai",
+                "overlay",
+                "asset-ripper-placeholder"
+            ]
+        },
+        {
+            "id": "shader.adofai.masked_sprite",
+            "address": "shader.adofai.masked_sprite",
+            "path": "Assets/Shader/ADOFAI_MaskedSprite.shader",
+            "type": "UnityEngine.Shader",
+            "required": true,
+            "compatibility": "compatible",
+            "tags": [
+                "shader",
+                "adofai",
+                "sprite",
+                "mask",
+                "asset-ripper-placeholder"
+            ]
+        },
+        {
+            "id": "shader.adofai.sprite_alpha_mask",
+            "address": "shader.adofai.sprite_alpha_mask",
+            "path": "Assets/Shader/ADOFAI_SpriteAlphaMask.shader",
+            "type": "UnityEngine.Shader",
+            "required": true,
+            "compatibility": "compatible",
+            "tags": [
+                "shader",
+                "adofai",
+                "sprite",
+                "alpha-mask",
+                "asset-ripper-placeholder"
+            ]
+        },
+        {
+            "id": "shader.adofai.sprites_and_mask",
+            "address": "shader.adofai.sprites_and_mask",
+            "path": "Assets/Shader/ADOFAI_Sprites and Mask.shader",
+            "type": "UnityEngine.Shader",
+            "required": true,
+            "compatibility": "compatible",
+            "tags": [
+                "shader",
+                "adofai",
+                "sprite",
+                "mask",
+                "asset-ripper-placeholder"
+            ]
+        },
+        {
+            "id": "shader.adofai.sprites_and_mask_cls",
+            "address": "shader.adofai.sprites_and_mask_cls",
+            "path": "Assets/Shader/ADOFAI_Sprites and Mask CLS.shader",
+            "type": "UnityEngine.Shader",
+            "required": true,
+            "compatibility": "compatible",
+            "tags": [
+                "shader",
+                "adofai",
+                "sprite",
+                "mask",
+                "asset-ripper-placeholder"
+            ]
+        },
+        {
+            "id": "shader.compat.grayscale",
+            "address": "shader.compat.grayscale",
+            "path": "Assets/Shader/Hidden_Grayscale Effect.shader",
+            "type": "UnityEngine.Shader",
+            "required": true,
+            "compatibility": "compatible",
+            "tags": [
+                "shader",
+                "grayscale",
+                "asset-ripper-placeholder"
+            ]
+        },
+        {
+            "id": "shader.compat.unlit_back",
+            "address": "shader.compat.unlit_back",
+            "path": "Assets/Shader/Unlit_Back.shader",
+            "type": "UnityEngine.Shader",
+            "required": true,
+            "compatibility": "compatible",
+            "tags": [
+                "shader",
+                "unlit",
+                "sprite",
+                "asset-ripper-placeholder"
+            ]
+        },
+        {
+            "id": "shader.compat.sprite_silhouette",
+            "address": "shader.compat.sprite_silhouette",
+            "path": "Assets/Shader/Sprites_Silhouette.shader",
+            "type": "UnityEngine.Shader",
+            "required": true,
+            "compatibility": "compatible",
+            "tags": [
+                "shader",
+                "sprite",
+                "silhouette",
+                "asset-ripper-placeholder"
+            ]
+        },
+        {
+            "id": "shader.compat.ui_flash_color",
+            "address": "shader.compat.ui_flash_color",
+            "path": "Assets/Shader/Custom_UIFlashColor.shader",
+            "type": "UnityEngine.Shader",
+            "required": true,
+            "compatibility": "compatible",
+            "tags": [
+                "shader",
+                "ui",
+                "color",
+                "asset-ripper-placeholder"
+            ]
+        },
+        {
+            "id": "font.tmp.liberation_sans",
+            "address": "font.tmp.liberation_sans",
+            "path": "Assets/PcCompatGenerated/Fonts/pccompat_liberation_sans.asset",
+            "type": "TMPro.TMP_FontAsset",
+            "required": true,
+            "compatibility": "exact",
+            "tags": [
+                "font",
+                "tmp",
+                "latin",
+                "fallback"
+            ]
+        },
+        {
+            "id": "font.adofai.inter_semibold",
+            "address": "font.adofai.inter_semibold",
+            "path": "Assets/PcCompatGenerated/Fonts/pccompat_inter_semibold.asset",
+            "type": "TMPro.TMP_FontAsset",
+            "required": true,
+            "compatibility": "exact",
+            "tags": [
+                "font",
+                "tmp",
+                "latin",
+                "adofai"
+            ]
+        },
+        {
+            "id": "font.adofai.inter_bold",
+            "address": "font.adofai.inter_bold",
+            "path": "Assets/PcCompatGenerated/Fonts/pccompat_inter_bold.asset",
+            "type": "TMPro.TMP_FontAsset",
+            "required": true,
+            "compatibility": "exact",
+            "tags": [
+                "font",
+                "tmp",
+                "latin",
+                "adofai"
+            ]
+        },
+        {
+            "id": "font.adofai.cjk",
+            "address": "font.adofai.cjk",
+            "path": "Assets/PcCompatGenerated/Fonts/pccompat_cjk.asset",
+            "type": "TMPro.TMP_FontAsset",
+            "required": true,
+            "compatibility": "exact",
+            "tags": [
+                "font",
+                "tmp",
+                "cjk",
+                "adofai"
+            ]
+        },
+        {
+            "id": "font.adofai.japanese",
+            "address": "font.adofai.japanese",
+            "path": "Assets/PcCompatGenerated/Fonts/pccompat_japanese.asset",
+            "type": "TMPro.TMP_FontAsset",
+            "required": true,
+            "compatibility": "exact",
+            "tags": [
+                "font",
+                "tmp",
+                "japanese",
+                "adofai"
+            ]
+        },
+        {
+            "id": "font.adofai.korean",
+            "address": "font.adofai.korean",
+            "path": "Assets/PcCompatGenerated/Fonts/pccompat_korean.asset",
+            "type": "TMPro.TMP_FontAsset",
+            "required": true,
+            "compatibility": "exact",
+            "tags": [
+                "font",
+                "tmp",
+                "korean",
+                "adofai"
+            ]
+        },
+        {
+            "id": "material.font.liberation_sans",
+            "address": "material.font.liberation_sans",
+            "path": "Assets/PcCompatGenerated/Fonts/pccompat_liberation_sans.mat",
+            "type": "UnityEngine.Material",
+            "required": true,
+            "compatibility": "exact",
+            "tags": [
+                "material",
+                "font",
+                "tmp",
+                "latin"
+            ]
+        },
+        {
+            "id": "material.font.inter_semibold",
+            "address": "material.font.inter_semibold",
+            "path": "Assets/PcCompatGenerated/Fonts/pccompat_inter_semibold.mat",
+            "type": "UnityEngine.Material",
+            "required": true,
+            "compatibility": "exact",
+            "tags": [
+                "material",
+                "font",
+                "tmp",
+                "latin"
+            ]
+        },
+        {
+            "id": "material.font.inter_bold",
+            "address": "material.font.inter_bold",
+            "path": "Assets/PcCompatGenerated/Fonts/pccompat_inter_bold.mat",
+            "type": "UnityEngine.Material",
+            "required": true,
+            "compatibility": "exact",
+            "tags": [
+                "material",
+                "font",
+                "tmp",
+                "latin"
+            ]
+        },
+        {
+            "id": "material.font.cjk",
+            "address": "material.font.cjk",
+            "path": "Assets/PcCompatGenerated/Fonts/pccompat_cjk.mat",
+            "type": "UnityEngine.Material",
+            "required": true,
+            "compatibility": "exact",
+            "tags": [
+                "material",
+                "font",
+                "tmp",
+                "cjk"
+            ]
+        },
+        {
+            "id": "material.font.japanese",
+            "address": "material.font.japanese",
+            "path": "Assets/PcCompatGenerated/Fonts/pccompat_japanese.mat",
+            "type": "UnityEngine.Material",
+            "required": true,
+            "compatibility": "exact",
+            "tags": [
+                "material",
+                "font",
+                "tmp",
+                "japanese"
+            ]
+        },
+        {
+            "id": "material.font.korean",
+            "address": "material.font.korean",
+            "path": "Assets/PcCompatGenerated/Fonts/pccompat_korean.mat",
+            "type": "UnityEngine.Material",
+            "required": true,
+            "compatibility": "exact",
+            "tags": [
+                "material",
+                "font",
+                "tmp",
+                "korean"
+            ]
+        },
+        {
+            "id": "texture.compat.white",
+            "address": "texture.compat.white",
+            "path": "Assets/PcCompatGenerated/pccompat_white_texture.png",
+            "type": "UnityEngine.Texture2D",
+            "required": true,
+            "compatibility": "exact",
+            "tags": [
+                "texture",
+                "white",
+                "ui"
+            ]
+        },
+        {
+            "id": "sprite.compat.white",
+            "address": "sprite.compat.white",
+            "path": "Assets/PcCompatGenerated/pccompat_white_sprite.asset",
+            "type": "UnityEngine.Sprite",
+            "required": true,
+            "compatibility": "exact",
+            "tags": [
+                "sprite",
+                "white",
+                "ui"
+            ]
+        },
+        {
+            "id": "sprite.compat.transparent",
+            "address": "sprite.compat.transparent",
+            "path": "Assets/PcCompatGenerated/pccompat_transparent_sprite.asset",
+            "type": "UnityEngine.Sprite",
+            "required": true,
+            "compatibility": "exact",
+            "tags": [
+                "sprite",
+                "transparent",
+                "ui"
+            ]
+        },
+        {
+            "id": "material.compat.ui_default",
+            "address": "material.compat.ui_default",
+            "path": "Assets/PcCompatGenerated/pccompat_ui_default.mat",
+            "type": "UnityEngine.Material",
+            "required": true,
+            "compatibility": "exact",
+            "tags": [
+                "material",
+                "ui",
+                "alpha",
+                "stencil"
+            ]
+        },
+        {
+            "id": "material.compat.sprite_default",
+            "address": "material.compat.sprite_default",
+            "path": "Assets/PcCompatGenerated/pccompat_sprite_default.mat",
+            "type": "UnityEngine.Material",
+            "required": true,
+            "compatibility": "exact",
+            "tags": [
+                "material",
+                "sprite",
+                "alpha"
+            ]
+        },
+        {
+            "id": "material.compat.tmp_mobile",
+            "address": "material.compat.tmp_mobile",
+            "path": "Assets/PcCompatGenerated/pccompat_tmp_mobile.mat",
+            "type": "UnityEngine.Material",
+            "required": true,
+            "compatibility": "exact",
+            "tags": [
+                "material",
+                "tmp",
+                "sdf"
+            ]
+        },
+        {
+            "id": "prefab.compat.overlay",
+            "address": "prefab.compat.overlay",
+            "path": "Assets/PcCompatGenerated/pccompat_overlay_template.prefab",
+            "type": "UnityEngine.GameObject",
+            "required": true,
+            "compatibility": "exact",
+            "tags": [
+                "prefab",
+                "ui",
+                "canvas",
+                "tmp"
+            ]
+        },
+        {
+            "id": "prefab.compat.progress_bar",
+            "address": "prefab.compat.progress_bar",
+            "path": "Assets/PcCompatGenerated/pccompat_progress_bar.prefab",
+            "type": "UnityEngine.GameObject",
+            "required": true,
+            "compatibility": "compatible",
+            "tags": [
+                "prefab",
+                "ui",
+                "progress-bar",
+                "image"
+            ]
+        },
+        {
+            "id": "pccompat.shader_variants",
+            "address": "pccompat.shader_variants",
+            "path": "Assets/PcCompatGenerated/pccompat_shader_variants.shadervariants",
+            "type": "UnityEngine.Object",
+            "required": true,
+            "compatibility": "exact",
+            "tags": [
+                "shader",
+                "variants",
+                "android"
+            ]
+        }
+    ]
+}

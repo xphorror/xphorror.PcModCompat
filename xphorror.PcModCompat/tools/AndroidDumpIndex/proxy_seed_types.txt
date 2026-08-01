@@ -1,0 +1,17 @@
+# Assembly-CSharp
+Assembly-CSharp|HitMargin
+scrMarginTracker
+scrController
+scrPlayer
+scrPlanet
+
+# Unity Core/UI/TMP
+UnityEngine.Object
+UnityEngine.GameObject
+UnityEngine.Component
+UnityEngine.TextAsset
+UnityEngine.Font
+UnityEngine.Texture2D
+UnityEngine.Sprite
+UnityEngine.UI.CanvasScaler
+TMPro.TextMeshProUGUI

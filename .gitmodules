@@ -1,0 +1,3 @@
+[submodule "external/AsyncInput"]
+	path = external/AsyncInput
+	url = https://github.com/xphorror/AsyncInput_for_ADOFAI_Mobile.git

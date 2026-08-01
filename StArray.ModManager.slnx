@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="StArray.ModManager/StArray.ModManager.csproj" />
+  <Project Path="StArray.ModManager.Android/StArray.ModManager.Android.csproj" />
+  <Project Path="StArray.ModManager.SourceGenerator/StArray.ModManager.SourceGenerator.csproj" />
+  <Project Path="StArray.ModManager.Tests/StArray.ModManager.Tests.csproj" />
+</Solution>
