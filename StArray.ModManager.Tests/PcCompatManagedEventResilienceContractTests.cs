@@ -88,7 +88,7 @@ public sealed class PcCompatManagedEventResilienceContractTests
         {
             Assert.That(bridge, Does.Contain("hitMirror[attempts="));
             Assert.That(bridge, Does.Contain("lastSuccessAgeMs="));
-            Assert.That(bridge, Does.Contain("RefreshHitMarginsCountThrottled();"));
+            Assert.That(bridge, Does.Contain("RefreshHitMarginsCountThrottled(state);"));
             Assert.That(bridge, Does.Contain("HitMarginsFallbackRefreshIntervalMilliseconds = 100"));
             Assert.That(bridge, Does.Contain("throttled={Interlocked.Read(ref s_hitMarginsRefreshThrottled)}"));
             Assert.That(frameBridge, Does.Contain("avgWorkUs="));
@@ -100,25 +100,46 @@ public sealed class PcCompatManagedEventResilienceContractTests
     }
 
     [Test]
-    public void ManagedFrameSteadyStateUsesCachedSessionSnapshot()
+    public void ManagedDispatchAndGetterUseOneAtomicSessionSnapshot()
     {
         var source = File.ReadAllText(Path.Combine(
             FindModManagerRoot(),
             "xphorror.PcModCompat",
             "src",
             "PcCompatRuntime.cs"));
-        var dispatchStart = source.IndexOf("public static void DispatchManagedFrame", StringComparison.Ordinal);
-        var dispatchEnd = source.IndexOf("public static void DispatchManagedOnGUI", dispatchStart, StringComparison.Ordinal);
+        var dispatchStart = source.IndexOf(
+            "public static void DispatchManagedFrame",
+            StringComparison.Ordinal);
+        var dispatchEnd = source.IndexOf(
+            "public static void DispatchManagedOnGUI",
+            dispatchStart,
+            StringComparison.Ordinal);
         var dispatch = source.Substring(dispatchStart, dispatchEnd - dispatchStart);
+        var onGuiStart = dispatchEnd;
+        var onGuiEnd = source.IndexOf(
+            "private static string ManagedErrorSummary",
+            onGuiStart,
+            StringComparison.Ordinal);
+        var onGui = source.Substring(onGuiStart, onGuiEnd - onGuiStart);
 
         Assert.Multiple(() =>
         {
-            Assert.That(source, Does.Contain("s_managedFrameSessions"));
-            Assert.That(dispatch, Does.Contain("Volatile.Read(ref s_managedFrameSessions)"));
+            Assert.That(source, Does.Contain("ManagedDispatchSnapshot"));
+            Assert.That(source, Does.Contain("s_managedDispatchSnapshot"));
+            Assert.That(dispatch, Does.Contain(
+                "Volatile.Read(ref s_managedDispatchSnapshot).FrameSessions"));
+            Assert.That(onGui, Does.Contain(
+                "Volatile.Read(ref s_managedDispatchSnapshot).OnGuiSessions"));
+            Assert.That(source, Does.Contain(
+                "Volatile.Read(ref s_managedDispatchSnapshot).PrefixSessions"));
+            Assert.That(source, Does.Contain("ref s_managedDispatchSnapshot"));
             Assert.That(dispatch, Does.Contain("if (frameGateChanged)"));
             Assert.That(dispatch, Does.Not.Contain("Sessions.Values.Where"));
             Assert.That(dispatch, Does.Not.Contain(
                 "Volatile.Write(ref s_managedFrameDispatchActive, 0);\n            UpdateManagedFrameGate();"));
+            Assert.That(source, Does.Not.Contain("s_managedPrefixSessions"));
+            Assert.That(source, Does.Not.Contain("s_managedFrameSessions"));
+            Assert.That(source, Does.Not.Contain("s_managedOnGUISessions"));
         });
     }
 
@@ -167,7 +188,7 @@ public sealed class PcCompatManagedEventResilienceContractTests
     }
 
     [Test]
-    public void ManagedOnGuiUsesIndependentSessionSnapshotAndNativeGate()
+    public void ManagedOnGuiUsesDispatchSnapshotAndNativeGate()
     {
         var root = FindModManagerRoot();
         var runtime = File.ReadAllText(Path.Combine(
@@ -199,16 +220,16 @@ public sealed class PcCompatManagedEventResilienceContractTests
 
         Assert.Multiple(() =>
         {
-            Assert.That(runtime, Does.Contain("s_managedOnGUISessions"));
             Assert.That(runtime, Does.Contain("s_managedOnGUIGateSink"));
             Assert.That(runtime, Does.Contain("RegisterManagedOnGUIGateSink"));
-            Assert.That(dispatch, Does.Contain("Volatile.Read(ref s_managedOnGUISessions)"));
-            Assert.That(dispatch, Does.Not.Contain("Volatile.Read(ref s_managedFrameSessions)"));
+            Assert.That(dispatch, Does.Contain(
+                "Volatile.Read(ref s_managedDispatchSnapshot).OnGuiSessions"));
+            Assert.That(dispatch, Does.Not.Contain("FrameSessions"));
             Assert.That(dispatch, Does.Contain("requiredOnGUIBefore"));
             Assert.That(dispatch, Does.Contain(
                 "requiredOnGUIBefore != session.RequiresOnGUIDispatch"));
             Assert.That(gate, Does.Contain("session.RequiresOnGUIDispatch"));
-            Assert.That(gate, Does.Contain("Volatile.Write(ref s_managedOnGUISessions"));
+            Assert.That(gate, Does.Contain("ref s_managedDispatchSnapshot"));
             Assert.That(bridge, Does.Contain(
                 "modmanager_pccompat_set_managed_ongui_enabled"));
             Assert.That(bridge, Does.Contain(
@@ -388,6 +409,51 @@ public sealed class PcCompatManagedEventResilienceContractTests
     }
 
     [Test]
+    public void ManagedEventCollectorRetainsOneLeasePerSessionInsteadOfOnePerRecord()
+    {
+        var root = FindModManagerRoot();
+        var session = File.ReadAllText(Path.Combine(
+            root,
+            "xphorror.PcModCompat",
+            "src",
+            "PcCompatManagedModSession.cs"));
+        var dispatcher = File.ReadAllText(Path.Combine(
+            root,
+            "xphorror.PcModCompat",
+            "src",
+            "PcCompatManagedCallbackDispatch.cs"));
+        var collectStart = session.IndexOf(
+            "internal bool TryCollectManagedCallbacks",
+            StringComparison.Ordinal);
+        var collectEnd = session.IndexOf(
+            "private bool TryDispatchManagedCallbacksCore",
+            collectStart,
+            StringComparison.Ordinal);
+        var collect = session.Substring(collectStart, collectEnd - collectStart);
+        var recordStart = session.IndexOf(
+            "internal bool DispatchCollectedManagedCallbackUnderLease",
+            StringComparison.Ordinal);
+        var record = recordStart < 0
+            ? string.Empty
+            : session.Substring(
+                recordStart,
+                session.IndexOf(
+                    "private bool DispatchCollectedManagedCallbackCore",
+                    recordStart,
+                    StringComparison.Ordinal) - recordStart);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(collect, Does.Contain("collector.RetainSessionLease(this, callbackLease)"));
+            Assert.That(dispatcher, Does.Contain("private readonly List<IDisposable> _sessionLeases"));
+            Assert.That(dispatcher, Does.Contain("ReleaseSessionLeases();"));
+            Assert.That(dispatcher, Does.Contain("finally"));
+            Assert.That(dispatcher, Does.Contain("DispatchCollectedManagedCallbackUnderLease("));
+            Assert.That(record, Does.Not.Contain("TryEnterRuntimeCallback"));
+        });
+    }
+
+    [Test]
     public void ManagedPostfixEventsRestoreCrossModHookOrderBeforeUpdate()
     {
         var root = FindModManagerRoot();
@@ -526,7 +592,7 @@ public sealed class PcCompatManagedEventResilienceContractTests
             "public static bool TryRequestManagedSelfRender",
             StringComparison.Ordinal);
         var end = source.IndexOf(
-            "public static void RegisterManagedFrameGateSink",
+            "internal static void RegisterManagedFrameGateSink",
             start,
             StringComparison.Ordinal);
         var method = source.Substring(start, end - start);
@@ -541,6 +607,30 @@ public sealed class PcCompatManagedEventResilienceContractTests
                     StringComparison.Ordinal)));
             Assert.That(method, Does.Not.Contain("RegistryChanged?.Invoke();"));
         });
+    }
+
+    [Test]
+    public void ManagedComponentDemandRefreshesTheUnifiedFrameGate()
+    {
+        var source = File.ReadAllText(Path.Combine(
+            FindModManagerRoot(),
+            "xphorror.PcModCompat",
+            "src",
+            "PcCompatRuntime.cs"));
+        var start = source.IndexOf(
+            "internal static void RegisterManagedFrameGateSink",
+            StringComparison.Ordinal);
+        var end = source.IndexOf(
+            "internal static void RegisterManagedOnGUIGateSink",
+            start,
+            StringComparison.Ordinal);
+        var method = source.Substring(start, end - start);
+
+        Assert.That(
+            method,
+            Does.Contain(
+                "PcCompatManagedComponentBridge.RegisterDemandChangedSink(\n" +
+                "            sink == null ? null : UpdateManagedFrameGate);"));
     }
 
     [Test]

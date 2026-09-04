@@ -16,7 +16,7 @@ public class PcCompatStaticPatchScannerTests
 
         var report = PcCompatStaticPatchScanner.Scan(manifest, targetGameRevision: 143);
 
-        Assert.That(report.FormatVersion, Is.EqualTo("static-patch-scan-v2"));
+        Assert.That(report.FormatVersion, Is.EqualTo("static-patch-scan-v4-render-components"));
         Assert.That(report.AssembliesScanned, Has.Count.EqualTo(2));
         Assert.That(report.Patches.Count(patch => patch.Source == "static_attribute"), Is.EqualTo(40));
         Assert.That(report.Patches.Count(patch => patch.Source == "dynamic_addpatch"), Is.EqualTo(34));
@@ -149,7 +149,7 @@ public class PcCompatStaticPatchScannerTests
     {
         var repoRoot = FindRepoRoot();
         var modDir = Path.Combine(repoRoot, "JipperResourcePack_release");
-        var shimDir = Path.Combine(repoRoot, "xphorror.PcModCompat", "out", "shims");
+        var shimDir = Path.Combine(repoRoot, "xphorror.PcModCompat", "out", "legacy_shims");
         Assume.That(Directory.Exists(modDir), Is.True, $"missing sample mod dir: {modDir}");
         Assume.That(Directory.Exists(shimDir), Is.True, $"missing shim dir: {shimDir}");
 
@@ -188,7 +188,7 @@ public class PcCompatStaticPatchScannerTests
     {
         var repoRoot = FindRepoRoot();
         var modDir = Path.Combine(repoRoot, "JipperResourcePack_release");
-        var shimDir = Path.Combine(repoRoot, "xphorror.PcModCompat", "out", "shims");
+        var shimDir = Path.Combine(repoRoot, "xphorror.PcModCompat", "out", "legacy_shims");
         Assume.That(Directory.Exists(modDir), Is.True, $"missing sample mod dir: {modDir}");
         Assume.That(Directory.Exists(shimDir), Is.True, $"missing shim dir: {shimDir}");
 
@@ -281,7 +281,9 @@ public class PcCompatStaticPatchScannerTests
             Assert.That(report, Is.Not.Null);
             Assert.That(report!.Issues.Select(issue => issue.Code), Does.Contain("AssemblyNotFound"));
             Assert.That(File.Exists(reportPath), Is.True);
-            Assert.That(File.ReadAllText(reportPath), Does.Contain("\"formatVersion\": \"static-patch-scan-v2\""));
+            Assert.That(
+                File.ReadAllText(reportPath, System.Text.Encoding.UTF8),
+                Does.Contain("\"formatVersion\": \"static-patch-scan-v4-render-components\""));
         }
         finally
         {

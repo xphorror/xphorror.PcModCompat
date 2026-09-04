@@ -219,6 +219,7 @@ public partial class ModManagerUI
                 mod.Name,
                 mod.Author,
                 mod.Description,
+                mod.Version,
                 mod.LoaderKind,
                 mod.EntryPoint,
                 mod.FolderPath,
@@ -255,6 +256,12 @@ public partial class ModManagerUI
             _platform.BeginOverlayInputFrame();
         try
         {
+            RegisterModGlyphText();
+            L10n.RegisterDynamicGlyphText(
+                _config.ModsDirectory,
+                _toastMessage,
+                _lastImportStatus.Message,
+                _lastImportStatus.Path);
             RenderBackgroundLayer();
 
             if (managerVisible)
@@ -416,7 +423,20 @@ public partial class ModManagerUI
 
             try
             {
-                mod.PluginInstance!.OnBackgroundGUI(bgDrawList);
+                if (!mod.TryEnterRuntimeCallback(out var callbackLease))
+                    continue;
+                using (callbackLease)
+                using (HookHelper.EnterOwnerScope(
+                           mod.RuntimeOwnerId,
+                           mod.RuntimeSession,
+                           mod.RuntimeKey))
+                {
+                    UiOwnerScope.TryDraw(
+                        mod.RuntimeOwnerId,
+                        mod.RuntimeKey.Generation,
+                        "OnBackgroundGUI",
+                        () => mod.PluginInstance!.OnBackgroundGUI(bgDrawList));
+                }
             }
             catch (Exception ex)
             {
@@ -449,7 +469,20 @@ public partial class ModManagerUI
 
             try
             {
-                mod.PluginInstance!.OnForegroundGUI(fgDrawList);
+                if (!mod.TryEnterRuntimeCallback(out var callbackLease))
+                    continue;
+                using (callbackLease)
+                using (HookHelper.EnterOwnerScope(
+                           mod.RuntimeOwnerId,
+                           mod.RuntimeSession,
+                           mod.RuntimeKey))
+                {
+                    UiOwnerScope.TryDraw(
+                        mod.RuntimeOwnerId,
+                        mod.RuntimeKey.Generation,
+                        "OnForegroundGUI",
+                        () => mod.PluginInstance!.OnForegroundGUI(fgDrawList));
+                }
             }
             catch (Exception ex)
             {

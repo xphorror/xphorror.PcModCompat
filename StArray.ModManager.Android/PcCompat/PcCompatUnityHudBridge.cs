@@ -1,6 +1,7 @@
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using StArray.ModManager.Manager;
+using StArray.ModManager.Runtime;
 using Xphorror.PcModCompat;
 
 namespace StArray.ModManager.Android.PcCompat;
@@ -8,45 +9,12 @@ namespace StArray.ModManager.Android.PcCompat;
 public static unsafe class PcCompatUnityHudBridge
 {
     private const string LogTag = "PcCompatUnityHud";
+    private static readonly Dictionary<string, HudSurface> Surfaces =
+        new(StringComparer.OrdinalIgnoreCase);
     private static bool s_installed;
     private static bool s_failed;
     private static int s_callbackActive;
-    private static PcCompatGeneratedUnityHudApi? s_api;
-    private static nint s_root;
-    private static nint s_rootTransform;
-    private static nint s_panel;
-    private static nint s_panelRect;
-    private static nint s_progressBarBackgroundObject;
-    private static nint s_progressBarBackgroundRect;
-    private static nint s_progressBarFillObject;
-    private static nint s_progressBarFillRect;
-    private static nint s_mainText;
-    private static nint s_mainRect;
-    private static nint s_gameFont;
-    private static nint s_font;
-    private static nint s_resourceFontObject;
-    private static PcCompatResolvedResourceBinding? s_resourceFontBinding;
-    private static PcCompatResolvedResourceBinding? s_resourceProgressBinding;
-    private static nint s_resourceProgressObject;
-    private static nint s_resourceProgressRect;
-    private static nint s_resourceProgressLineRect;
-    private static string s_resourceProgressFailureKey = string.Empty;
-    private static bool s_visible;
-    private static string s_richText = string.Empty;
-    private static int s_styleGeneration = int.MinValue;
-    private static float s_layoutWidth = float.NaN;
-    private static float s_layoutHeight = float.NaN;
-    private static float s_layoutScale = float.NaN;
-    private static float s_layoutX = float.NaN;
-    private static float s_layoutY = float.NaN;
-    private static float s_backgroundOpacity = float.NaN;
-    private static bool s_progressBarVisible;
-    private static float s_progressBarValue = float.NaN;
     private static int s_sourceRefreshQueued;
-    private static readonly object?[] GcRoots = new object?[16];
-    private static int s_gcHandleCount;
-    private static readonly object?[] ResourceGcRoots = new object?[8];
-    private static int s_resourceGcHandleCount;
 
     public static void Install()
     {
@@ -60,7 +28,7 @@ public static unsafe class PcCompatUnityHudBridge
             PcCompatUnityHudRuntime.RegisterRenderer();
             s_installed = true;
             PcCompatUnityHudRuntime.RegisterSourcesChangedSink(OnSourcesChanged);
-            Logger.Info(LogTag, "Unity Canvas HUD callback registered");
+            Logger.Info(LogTag, "owner-scoped Unity Canvas HUD callback registered");
         }
         catch (Exception ex)
         {
@@ -76,24 +44,11 @@ public static unsafe class PcCompatUnityHudBridge
 
         try
         {
-            if (!PcCompatUnityHudRuntime.TryGetFrame(out var frame))
-            {
-                SetVisible(false);
-                return;
-            }
-
-            if (!frame.Visible)
-            {
-                SetVisible(false);
-                return;
-            }
-
-            EnsureCreated();
-            ApplyFrame(frame);
+            ApplySourceSnapshot(forceResourceRefresh: false);
         }
         catch (Exception ex)
         {
-            FailRenderer($"Unity HUD update failed at generation {generation}", ex);
+            FailRenderer($"Unity HUD registry update failed at generation {generation}", ex);
         }
         finally
         {
@@ -108,19 +63,11 @@ public static unsafe class PcCompatUnityHudBridge
 
         try
         {
-            s_styleGeneration = int.MinValue;
-            s_progressBarValue = float.NaN;
-            if (!PcCompatUnityHudRuntime.TryGetFrame(out var frame) || !frame.Visible)
-            {
-                SetVisible(false);
-                return;
-            }
-            EnsureCreated();
-            ApplyFrame(frame);
+            ApplySourceSnapshot(forceResourceRefresh: true);
         }
         catch (Exception ex)
         {
-            FailRenderer("Unity HUD resource refresh failed", ex);
+            FailRenderer("Unity HUD resource registry refresh failed", ex);
         }
         finally
         {
@@ -142,8 +89,7 @@ public static unsafe class PcCompatUnityHudBridge
             return;
         }
 
-        if (PcCompatResourceBundleLoader.TryScheduleUnityMainWork(
-                RefreshSourcesOnUnityMain))
+        if (PcCompatResourceBundleLoader.TryScheduleUnityMainWork(RefreshSourcesOnUnityMain))
             return;
 
         Volatile.Write(ref s_sourceRefreshQueued, 0);
@@ -156,458 +102,723 @@ public static unsafe class PcCompatUnityHudBridge
         RefreshResourcesOnUnityMain();
     }
 
+    private static void ApplySourceSnapshot(bool forceResourceRefresh)
+    {
+        var snapshots = PcCompatUnityHudRuntime.SnapshotSources()
+            .OrderBy(snapshot => snapshot.OwnerId, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        var registeredOwners = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var occupiedSlots = new Dictionary<(int X, int Y), int>();
+
+        foreach (var snapshot in snapshots)
+        {
+            if (!registeredOwners.Add(snapshot.OwnerId))
+            {
+                FailSource(
+                    snapshot.OwnerId,
+                    new InvalidOperationException("duplicate HUD owner in source snapshot"));
+                continue;
+            }
+
+            if (snapshot.Error != null)
+            {
+                FailSource(snapshot.OwnerId, snapshot.Error);
+                continue;
+            }
+
+            var frame = snapshot.Frame;
+            if (frame == null || !frame.Visible)
+            {
+                if (Surfaces.TryGetValue(snapshot.OwnerId, out var hidden))
+                {
+                    try
+                    {
+                        hidden.SetVisible(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        hidden.Fail(ex);
+                    }
+                }
+                continue;
+            }
+
+            if (!string.IsNullOrWhiteSpace(frame.ModId) &&
+                !frame.ModId.Equals(snapshot.OwnerId, StringComparison.OrdinalIgnoreCase))
+            {
+                FailSource(
+                    snapshot.OwnerId,
+                    new InvalidOperationException(
+                        $"HUD frame owner mismatch: registered={snapshot.OwnerId}, frame={frame.ModId}"));
+                continue;
+            }
+
+            Surfaces.TryGetValue(snapshot.OwnerId, out var surface);
+            if (surface != null &&
+                surface.SessionGeneration != 0 &&
+                snapshot.SessionGeneration != 0 &&
+                surface.SessionGeneration != snapshot.SessionGeneration)
+            {
+                try
+                {
+                    surface.Destroy();
+                }
+                catch (Exception ex)
+                {
+                    Logger.Warn(
+                        LogTag,
+                        $"HUD session root destroy failed owner={snapshot.OwnerId}: {ex.Message}");
+                }
+                Surfaces.Remove(snapshot.OwnerId);
+                surface = null;
+            }
+            if (surface?.Failed == true &&
+                !PcCompatUnityHudRuntime.RendererAvailableFor(snapshot.OwnerId))
+                continue;
+
+            var slot = (
+                BitConverter.SingleToInt32Bits(frame.PositionX),
+                BitConverter.SingleToInt32Bits(frame.PositionY));
+            occupiedSlots.TryGetValue(slot, out var stackIndex);
+            occupiedSlots[slot] = stackIndex + 1;
+            var scale = Math.Clamp(frame.Scale, 0.5f, 2.5f);
+            var effectiveY = frame.PositionY + stackIndex * (frame.Height * scale + 8f);
+
+            try
+            {
+                if (surface?.Failed == true)
+                {
+                    surface.Destroy();
+                    Surfaces.Remove(snapshot.OwnerId);
+                    surface = null;
+                }
+                if (surface == null)
+                {
+                    surface = new HudSurface(snapshot.OwnerId, snapshot.SessionGeneration);
+                    Surfaces.Add(snapshot.OwnerId, surface);
+                }
+                if (forceResourceRefresh)
+                    surface.InvalidateResources();
+                surface.ApplyFrame(frame, effectiveY);
+                PcCompatUnityHudRuntime.ClearSourceRendererFailure(snapshot.OwnerId);
+            }
+            catch (Exception ex)
+            {
+                if (surface != null)
+                    surface.Fail(ex);
+                else
+                    FailSource(snapshot.OwnerId, ex);
+            }
+        }
+
+        foreach (var owner in Surfaces.Keys
+                     .Where(owner => !registeredOwners.Contains(owner))
+                     .ToArray())
+        {
+            try
+            {
+                Surfaces[owner].Destroy();
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn(LogTag, $"HUD surface destroy failed owner={owner}: {ex.Message}");
+            }
+            Surfaces.Remove(owner);
+        }
+    }
+
+    private static void FailSource(string ownerId, Exception exception)
+    {
+        PcCompatUnityHudRuntime.MarkSourceRendererFailed(ownerId);
+        if (Surfaces.TryGetValue(ownerId, out var surface))
+        {
+            surface.Fail(exception);
+            return;
+        }
+        Logger.Error(LogTag, $"HUD source quarantined owner={ownerId}: {exception}");
+    }
+
     internal static void ReleaseResourcesOnUnityMain(
         string modId,
         string candidateSha256Hex,
         long sessionGeneration)
     {
-        if (s_root == nint.Zero || s_api == null)
+        if (!Surfaces.TryGetValue(modId, out var surface))
             return;
-
-        try
-        {
-            if (BindingMatches(
-                    s_resourceFontBinding,
-                    modId,
-                    candidateSha256Hex,
-                    sessionGeneration))
-                RestoreGameFont(s_api);
-            if (BindingMatches(
-                    s_resourceProgressBinding,
-                    modId,
-                    candidateSha256Hex,
-                    sessionGeneration))
-                ReleaseResourceProgressBar(s_api, destroyObject: true);
-        }
-        catch (Exception ex)
-        {
-            Logger.Warn(
-                LogTag,
-                $"resource visual release failed mod={modId} generation={sessionGeneration}: {ex.Message}");
-        }
+        surface.ReleaseResources(candidateSha256Hex, sessionGeneration);
     }
 
-    private static void EnsureCreated()
+    private static void FailRenderer(string message, Exception ex)
     {
-        if (s_root != nint.Zero)
+        if (s_failed)
             return;
 
-        var api = new PcCompatGeneratedUnityHudApi();
-        var root = api.CreateGameObject("xphorror.PcModCompat HUD");
-        api.SetActive(root, false);
-
-        var canvas = api.AddComponent(root, api.CanvasType);
-        var scaler = api.AddComponent(root, api.CanvasScalerType);
-        if (canvas == nint.Zero || scaler == nint.Zero)
-            throw new InvalidOperationException("Canvas or CanvasScaler creation failed");
-
-        api.SetCanvasRenderMode(canvas, 0);
-        api.SetCanvasSortingOrder(canvas, 0);
-        api.SetCanvasScaleMode(scaler, 1);
-        api.SetCanvasReferenceResolution(scaler, 1920f, 1080f);
-        api.SetCanvasMatch(scaler, 0.5f);
-
-        var rootTransform = RequireObject(api.GetTransform(root), "root RectTransform");
-        RootObject(rootTransform);
-        var panelObject = api.CreateGameObject("Background");
-        var panel = RequireObject(api.AddComponent(panelObject, api.ImageType), "background Image");
-        RootObject(panel);
-        var panelRect = RequireObject(api.GetTransform(panelObject), "background RectTransform");
-        RootObject(panelRect);
-        api.SetParent(panelRect, rootTransform);
-        api.SetRaycastTarget(panel, false);
-
-        var mainObject = api.CreateGameObject("Text");
-        var mainText = RequireObject(api.AddComponent(mainObject, api.TextMeshProType), "main TextMeshProUGUI");
-        RootObject(mainText);
-        var mainRect = RequireObject(api.GetRectTransform(mainText, mainObject), "main RectTransform");
-        RootObject(mainRect);
-        api.SetParent(mainRect, rootTransform);
-        api.ConfigureText(mainText, richText: true);
-
-        var progressBackgroundObject = api.CreateGameObject("ProgressBar.Background");
-        var progressBackground = RequireObject(api.AddComponent(progressBackgroundObject, api.ImageType), "progress background Image");
-        RootObject(progressBackground);
-        var progressBackgroundRect = RequireObject(api.GetTransform(progressBackgroundObject), "progress background RectTransform");
-        RootObject(progressBackgroundRect);
-        api.SetParent(progressBackgroundRect, rootTransform);
-        api.SetRaycastTarget(progressBackground, false);
-
-        var progressFillObject = api.CreateGameObject("ProgressBar.Fill");
-        var progressFill = RequireObject(api.AddComponent(progressFillObject, api.ImageType), "progress fill Image");
-        RootObject(progressFill);
-        var progressFillRect = RequireObject(api.GetTransform(progressFillObject), "progress fill RectTransform");
-        RootObject(progressFillRect);
-        api.SetParent(progressFillRect, rootTransform);
-        api.SetRaycastTarget(progressFill, false);
-
-        var font = api.ApplyLocalizedFont(mainText);
-        if (font == nint.Zero)
-            font = api.GetFont(mainText);
-        s_gameFont = font;
-        s_font = font;
-
-        api.SetGraphicColor(panel, 0.125f, 0.125f, 0.125f, 0f);
-        api.SetGraphicColor(progressBackground, 0.18f, 0.18f, 0.18f, 0.42f);
-        api.SetGraphicColor(progressFill, 0.88f, 0.77f, 1f, 1f);
-        api.SetGraphicColor(mainText, 1f, 1f, 1f, 1f);
-        api.SetActive(progressBackgroundObject, false);
-        api.SetActive(progressFillObject, false);
-        api.DontDestroyOnLoad(root);
-
-        s_api = api;
-        s_root = root;
-        s_rootTransform = rootTransform;
-        s_panel = panel;
-        s_panelRect = panelRect;
-        s_progressBarBackgroundObject = progressBackgroundObject;
-        s_progressBarBackgroundRect = progressBackgroundRect;
-        s_progressBarFillObject = progressFillObject;
-        s_progressBarFillRect = progressFillRect;
-        s_mainText = mainText;
-        s_mainRect = mainRect;
-        Logger.Info(LogTag, $"Unity Canvas HUD created root=0x{root.ToInt64():X} font=0x{font.ToInt64():X}");
+        s_failed = true;
+        PcCompatUnityHudRuntime.MarkRendererFailed();
+        try { PcCompatNativeHookRules.SetOverlayChangedCallback(nint.Zero); } catch { }
+        foreach (var surface in Surfaces.Values)
+            surface.Destroy();
+        Surfaces.Clear();
+        Logger.Error(LogTag, $"{message}; falling back to per-MOD ImGui HUD: {ex}");
     }
 
-    private static void ApplyFrame(PcCompatUnityHudFrame frame)
+    private sealed class HudSurface
     {
-        var api = s_api!;
-        ReleaseForeignResourceVisuals(api, frame.ModId);
-        if (s_styleGeneration != frame.StyleGeneration ||
-            s_layoutWidth != frame.Width ||
-            s_layoutHeight != frame.Height ||
-            s_layoutScale != frame.Scale ||
-            s_layoutX != frame.PositionX ||
-            s_layoutY != frame.PositionY ||
-            s_backgroundOpacity != frame.BackgroundOpacity ||
-            s_progressBarVisible != frame.ProgressBarVisible)
+        private readonly string _ownerId;
+        private readonly string _ownershipIdentity;
+        public long SessionGeneration { get; }
+        private readonly PcCompatGeneratedUnityHudApi _api = new();
+        private readonly List<object> _gcRoots = new(16);
+        private readonly List<object> _resourceGcRoots = new(8);
+        private nint _root;
+        private nint _rootTransform;
+        private nint _panel;
+        private nint _panelRect;
+        private nint _progressBarBackgroundObject;
+        private nint _progressBarBackgroundRect;
+        private nint _progressBarFillObject;
+        private nint _progressBarFillRect;
+        private nint _mainText;
+        private nint _mainRect;
+        private nint _gameFont;
+        private nint _font;
+        private nint _resourceFontObject;
+        private PcCompatResolvedResourceBinding? _resourceFontBinding;
+        private PcCompatResolvedResourceBinding? _resourceProgressBinding;
+        private nint _resourceProgressObject;
+        private nint _resourceProgressRect;
+        private nint _resourceProgressLineRect;
+        private string _resourceProgressFailureKey = string.Empty;
+        private bool _visible;
+        private string _richText = string.Empty;
+        private int _styleGeneration = int.MinValue;
+        private float _layoutWidth = float.NaN;
+        private float _layoutHeight = float.NaN;
+        private float _layoutScale = float.NaN;
+        private float _layoutX = float.NaN;
+        private float _layoutY = float.NaN;
+        private float _backgroundOpacity = float.NaN;
+        private bool _progressBarVisible;
+        private float _progressBarValue = float.NaN;
+
+        public HudSurface(string ownerId, long sessionGeneration)
         {
-            var scale = Math.Clamp(frame.Scale, 0.5f, 2.5f);
-            var x = frame.PositionX;
-            var y = frame.PositionY;
-            var width = frame.Width * scale;
-            var height = frame.Height * scale;
-            var paddingX = 14f * scale;
-            var paddingY = 8f * scale;
-            if (s_resourceFontBinding == null)
+            _ownerId = ownerId;
+            SessionGeneration = sessionGeneration;
+            _ownershipIdentity = "unity-hud-surface;";
+            if (!PcCompatRuntime.TryRegisterOwnedResource(
+                    ownerId,
+                    sessionGeneration,
+                    ModOwnedResourceKind.UnityObject,
+                    _ownershipIdentity))
             {
-                var gameFont = api.ApplyLocalizedFont(s_mainText);
-                if (gameFont != nint.Zero)
-                {
-                    s_gameFont = gameFont;
-                    s_font = gameFont;
-                }
+                throw new InvalidOperationException(
+                    $"Unity HUD surface ownership registration failed owner={ownerId} " +
+                    $"generation={sessionGeneration}.");
             }
-
-            api.SetTopLeftRect(s_panelRect, x, y, width, height);
-            api.SetTopLeftRect(
-                s_mainRect,
-                x + paddingX,
-                y + paddingY,
-                Math.Max(1f, width - paddingX * 2f),
-                Math.Max(1f, height - paddingY * 2f));
-            api.SetFontSize(s_mainText, 25f * scale);
-            api.SetGraphicColor(
-                s_panel,
-                0.125f,
-                0.125f,
-                0.125f,
-                Math.Clamp(frame.BackgroundOpacity, 0f, 1f));
-            ApplyProgressBarFrame(api, frame, x, y, width, height, scale);
-            s_styleGeneration = frame.StyleGeneration;
-            s_layoutWidth = frame.Width;
-            s_layoutHeight = frame.Height;
-            s_layoutScale = frame.Scale;
-            s_layoutX = frame.PositionX;
-            s_layoutY = frame.PositionY;
-            s_backgroundOpacity = frame.BackgroundOpacity;
-        }
-        else if (s_progressBarVisible != frame.ProgressBarVisible ||
-                 s_progressBarValue != frame.ProgressBarValue)
-        {
-            var scale = Math.Clamp(frame.Scale, 0.5f, 2.5f);
-            ApplyProgressBarFrame(
-                api,
-                frame,
-                frame.PositionX,
-                frame.PositionY,
-                frame.Width * scale,
-                frame.Height * scale,
-                scale);
-        }
-
-        ApplyResourceFont(api, frame);
-
-        if (!string.Equals(s_richText, frame.RichText, StringComparison.Ordinal))
-        {
-            api.SetText(s_mainText, frame.RichText);
-            s_richText = frame.RichText;
-        }
-
-        SetVisible(true);
-    }
-
-    private static void SetVisible(bool visible)
-    {
-        if (s_root == nint.Zero || s_visible == visible)
-            return;
-
-        s_api!.SetActive(s_root, visible);
-        s_visible = visible;
-    }
-
-    private static void ApplyProgressBarFrame(
-        PcCompatGeneratedUnityHudApi api,
-        PcCompatUnityHudFrame frame,
-        float x,
-        float y,
-        float width,
-        float height,
-        float scale)
-    {
-        s_progressBarVisible = frame.ProgressBarVisible;
-        s_progressBarValue = frame.ProgressBarValue;
-
-        var visible = frame.ProgressBarVisible;
-        if (!visible)
-        {
-            api.SetActive(s_progressBarBackgroundObject, false);
-            api.SetActive(s_progressBarFillObject, false);
-            if (s_resourceProgressObject != nint.Zero)
-                api.SetActive(s_resourceProgressObject, false);
-            return;
-        }
-
-        var barX = x + 14f * scale;
-        var barWidth = Math.Max(1f, width - 28f * scale);
-        var resourceBarHeight = Math.Max(2f, 18f * scale);
-        var resourceBarY = y + height - 18f * scale;
-        if (TryApplyResourceProgressBar(api, frame, barX, resourceBarY, barWidth, resourceBarHeight, scale))
-        {
-            api.SetActive(s_progressBarBackgroundObject, false);
-            api.SetActive(s_progressBarFillObject, false);
-            return;
-        }
-
-        if (s_resourceProgressObject != nint.Zero)
-            api.SetActive(s_resourceProgressObject, false);
-        if (s_progressBarBackgroundRect == nint.Zero || s_progressBarFillRect == nint.Zero)
-            return;
-
-        api.SetActive(s_progressBarBackgroundObject, visible);
-        api.SetActive(s_progressBarFillObject, visible);
-        var barHeight = Math.Max(2f, 6f * scale);
-        var barY = y + height - 12f * scale;
-        var fillWidth = Math.Max(1f, barWidth * Math.Clamp(frame.ProgressBarValue, 0f, 1f));
-
-        api.SetTopLeftRect(s_progressBarBackgroundRect, barX, barY, barWidth, barHeight);
-        api.SetTopLeftRect(s_progressBarFillRect, barX, barY, fillWidth, barHeight);
-    }
-
-    private static void ApplyResourceFont(PcCompatGeneratedUnityHudApi api, PcCompatUnityHudFrame frame)
-    {
-        if (string.IsNullOrWhiteSpace(frame.ModId))
-        {
-            RestoreGameFont(api);
-            return;
-        }
-        if (frame.PlainText.Any(character => character > 0x7f))
-        {
-            // The imported font may not carry the game's CJK fallback table.
-            // Keep localized HUD text readable until generic TMP fallback-list
-            // mutation is part of the resource binding contract.
-            RestoreGameFont(api);
-            return;
-        }
-
-        var status = PcCompatResourceBundleLoader.TryGetOrRequestAsset(
-            frame.ModId,
-            "overlay.font",
-            "TMP_FontAsset",
-            out var font,
-            out var binding);
-        if (status == PcCompatResourceAssetStatus.Ready && font != nint.Zero)
-        {
-            if (s_resourceFontObject != nint.Zero && s_resourceFontObject != font)
-                api.Forget(s_resourceFontObject);
-            if (font != s_font)
-            {
-                api.SetFont(s_mainText, font);
-                s_font = font;
-            }
-            s_resourceFontObject = font;
-            s_resourceFontBinding = binding;
-            return;
-        }
-
-        if (s_resourceFontBinding != null &&
-            (!PcCompatResourceRecipeRuntime.TryResolveLoadedBinding(
-                 frame.ModId,
-                 "overlay.font",
-                 "TMP_FontAsset",
-                 out var currentBinding) ||
-             !SameBinding(s_resourceFontBinding, currentBinding)))
-            RestoreGameFont(api);
-    }
-
-    private static bool TryApplyResourceProgressBar(
-        PcCompatGeneratedUnityHudApi api,
-        PcCompatUnityHudFrame frame,
-        float x,
-        float y,
-        float width,
-        float height,
-        float scale)
-    {
-        if (string.IsNullOrWhiteSpace(frame.ModId))
-            return false;
-
-        var status = PcCompatResourceBundleLoader.TryGetOrRequestAsset(
-            frame.ModId,
-            "overlay.progress_bar",
-            "GameObject",
-            out var prefab,
-            out var binding);
-        if (status != PcCompatResourceAssetStatus.Ready || prefab == nint.Zero)
-        {
-            if (s_resourceProgressBinding != null &&
-                (!PcCompatResourceRecipeRuntime.TryResolveLoadedBinding(
-                     frame.ModId,
-                     "overlay.progress_bar",
-                     "GameObject",
-                     out var currentBinding) ||
-                 !SameBinding(s_resourceProgressBinding, currentBinding)))
-                ReleaseResourceProgressBar(api, destroyObject: true);
-            return false;
-        }
-
-        var bindingKey = BindingKey(binding);
-        if (s_resourceProgressObject == nint.Zero ||
-            s_resourceProgressBinding == null ||
-            !SameBinding(s_resourceProgressBinding, binding))
-        {
-            if (s_resourceProgressFailureKey.Equals(bindingKey, StringComparison.Ordinal))
-                return false;
             try
             {
-                CreateResourceProgressBar(api, prefab, binding);
+                EnsureCreated();
+            }
+            catch
+            {
+                RetireOwnership();
+                throw;
+            }
+        }
+
+        public bool Failed { get; private set; }
+
+        public void InvalidateResources()
+        {
+            _styleGeneration = int.MinValue;
+            _progressBarValue = float.NaN;
+        }
+
+        public void ApplyFrame(PcCompatUnityHudFrame frame, float effectiveY)
+        {
+            if (Failed)
+                return;
+            EnsureCreated();
+
+            var styleChanged = _styleGeneration != frame.StyleGeneration ||
+                               _layoutWidth != frame.Width ||
+                               _layoutHeight != frame.Height ||
+                               _layoutScale != frame.Scale ||
+                               _layoutX != frame.PositionX ||
+                               _layoutY != effectiveY ||
+                               _backgroundOpacity != frame.BackgroundOpacity ||
+                               _progressBarVisible != frame.ProgressBarVisible;
+            if (styleChanged)
+            {
+                var scale = Math.Clamp(frame.Scale, 0.5f, 2.5f);
+                var x = frame.PositionX;
+                var width = frame.Width * scale;
+                var height = frame.Height * scale;
+                var paddingX = 14f * scale;
+                var paddingY = 8f * scale;
+                if (_resourceFontBinding == null)
+                {
+                    var gameFont = _api.ApplyLocalizedFont(_mainText);
+                    if (gameFont != nint.Zero)
+                    {
+                        _gameFont = gameFont;
+                        _font = gameFont;
+                    }
+                }
+
+                _api.SetTopLeftRect(_panelRect, x, effectiveY, width, height);
+                _api.SetTopLeftRect(
+                    _mainRect,
+                    x + paddingX,
+                    effectiveY + paddingY,
+                    Math.Max(1f, width - paddingX * 2f),
+                    Math.Max(1f, height - paddingY * 2f));
+                _api.SetFontSize(_mainText, 25f * scale);
+                _api.SetGraphicColor(
+                    _panel,
+                    0.125f,
+                    0.125f,
+                    0.125f,
+                    Math.Clamp(frame.BackgroundOpacity, 0f, 1f));
+                ApplyProgressBarFrame(frame, x, effectiveY, width, height, scale);
+                _styleGeneration = frame.StyleGeneration;
+                _layoutWidth = frame.Width;
+                _layoutHeight = frame.Height;
+                _layoutScale = frame.Scale;
+                _layoutX = frame.PositionX;
+                _layoutY = effectiveY;
+                _backgroundOpacity = frame.BackgroundOpacity;
+            }
+            else if (_progressBarVisible != frame.ProgressBarVisible ||
+                     _progressBarValue != frame.ProgressBarValue)
+            {
+                var scale = Math.Clamp(frame.Scale, 0.5f, 2.5f);
+                ApplyProgressBarFrame(
+                    frame,
+                    frame.PositionX,
+                    effectiveY,
+                    frame.Width * scale,
+                    frame.Height * scale,
+                    scale);
+            }
+
+            ApplyResourceFont(frame);
+            if (!string.Equals(_richText, frame.RichText, StringComparison.Ordinal))
+            {
+                _api.SetText(_mainText, frame.RichText);
+                _richText = frame.RichText;
+            }
+            SetVisible(true);
+        }
+
+        public void SetVisible(bool visible)
+        {
+            if (_root == nint.Zero || _visible == visible)
+                return;
+            _api.SetActive(_root, visible);
+            _visible = visible;
+        }
+
+        public void ReleaseResources(string candidateSha256Hex, long sessionGeneration)
+        {
+            try
+            {
+                if (SessionGeneration != 0 &&
+                    sessionGeneration != 0 &&
+                    SessionGeneration != sessionGeneration)
+                {
+                    Logger.Info(
+                        LogTag,
+                        $"ignored stale HUD resource release owner={_ownerId} " +
+                        $"surfaceGeneration={SessionGeneration} releaseGeneration={sessionGeneration}");
+                    return;
+                }
+                if (BindingMatches(
+                        _resourceFontBinding,
+                        _ownerId,
+                        candidateSha256Hex,
+                        sessionGeneration))
+                    RestoreGameFont();
+                if (BindingMatches(
+                        _resourceProgressBinding,
+                        _ownerId,
+                        candidateSha256Hex,
+                        sessionGeneration))
+                    ReleaseResourceProgressBar(destroyObject: true);
             }
             catch (Exception ex)
             {
-                s_resourceProgressFailureKey = bindingKey;
-                ReleaseResourceProgressBar(api, destroyObject: true);
                 Logger.Warn(
                     LogTag,
-                    $"progress prefab adapter rejected mod={binding.ModId} asset={binding.AssetName}: {ex.Message}");
+                    $"resource visual release failed mod={_ownerId} generation={sessionGeneration}: {ex.Message}");
+            }
+        }
+
+        public void Fail(Exception exception)
+        {
+            if (Failed)
+                return;
+            Failed = true;
+            PcCompatUnityHudRuntime.MarkSourceRendererFailed(_ownerId);
+            try { SetVisible(false); } catch { }
+            Logger.Error(LogTag, $"HUD surface quarantined owner={_ownerId}: {exception}");
+        }
+
+        public void Destroy()
+        {
+            try
+            {
+                try { SetVisible(false); } catch { }
+                try { ReleaseResourceProgressBar(destroyObject: true); } catch { }
+                if (_root != nint.Zero)
+                {
+                    try { _api.Destroy(_root); } catch { }
+                }
+                _root = nint.Zero;
+                _gcRoots.Clear();
+                _resourceGcRoots.Clear();
+                _api.Clear();
+            }
+            finally
+            {
+                RetireOwnership();
+            }
+        }
+
+        private void RetireOwnership()
+            => PcCompatRuntime.RetireOwnedResource(
+                _ownerId,
+                SessionGeneration,
+                ModOwnedResourceKind.UnityObject,
+                _ownershipIdentity);
+
+        private void EnsureCreated()
+        {
+            if (_root != nint.Zero)
+                return;
+
+            var root = _api.CreateGameObject($"xphorror.PcModCompat HUD [{_ownerId}]");
+            _api.SetActive(root, false);
+            var canvas = _api.AddComponent(root, _api.CanvasType);
+            var scaler = _api.AddComponent(root, _api.CanvasScalerType);
+            if (canvas == nint.Zero || scaler == nint.Zero)
+                throw new InvalidOperationException("Canvas or CanvasScaler creation failed");
+
+            _api.SetCanvasRenderMode(canvas, 0);
+            _api.SetCanvasSortingOrder(canvas, 0);
+            _api.SetCanvasScaleMode(scaler, 1);
+            _api.SetCanvasReferenceResolution(scaler, 1920f, 1080f);
+            _api.SetCanvasMatch(scaler, 0.5f);
+
+            var rootTransform = RequireObject(_api.GetTransform(root), "root RectTransform");
+            RootObject(rootTransform);
+            var panelObject = _api.CreateGameObject("Background");
+            var panel = RequireObject(_api.AddComponent(panelObject, _api.ImageType), "background Image");
+            RootObject(panel);
+            var panelRect = RequireObject(_api.GetTransform(panelObject), "background RectTransform");
+            RootObject(panelRect);
+            _api.SetParent(panelRect, rootTransform);
+            _api.SetRaycastTarget(panel, false);
+
+            var mainObject = _api.CreateGameObject("Text");
+            var mainText = RequireObject(_api.AddComponent(mainObject, _api.TextMeshProType), "main TextMeshProUGUI");
+            RootObject(mainText);
+            var mainRect = RequireObject(_api.GetRectTransform(mainText, mainObject), "main RectTransform");
+            RootObject(mainRect);
+            _api.SetParent(mainRect, rootTransform);
+            _api.ConfigureText(mainText, richText: true);
+
+            var progressBackgroundObject = _api.CreateGameObject("ProgressBar.Background");
+            var progressBackground = RequireObject(
+                _api.AddComponent(progressBackgroundObject, _api.ImageType),
+                "progress background Image");
+            RootObject(progressBackground);
+            var progressBackgroundRect = RequireObject(
+                _api.GetTransform(progressBackgroundObject),
+                "progress background RectTransform");
+            RootObject(progressBackgroundRect);
+            _api.SetParent(progressBackgroundRect, rootTransform);
+            _api.SetRaycastTarget(progressBackground, false);
+
+            var progressFillObject = _api.CreateGameObject("ProgressBar.Fill");
+            var progressFill = RequireObject(
+                _api.AddComponent(progressFillObject, _api.ImageType),
+                "progress fill Image");
+            RootObject(progressFill);
+            var progressFillRect = RequireObject(
+                _api.GetTransform(progressFillObject),
+                "progress fill RectTransform");
+            RootObject(progressFillRect);
+            _api.SetParent(progressFillRect, rootTransform);
+            _api.SetRaycastTarget(progressFill, false);
+
+            var font = _api.ApplyLocalizedFont(mainText);
+            if (font == nint.Zero)
+                font = _api.GetFont(mainText);
+            _gameFont = font;
+            _font = font;
+
+            _api.SetGraphicColor(panel, 0.125f, 0.125f, 0.125f, 0f);
+            _api.SetGraphicColor(progressBackground, 0.18f, 0.18f, 0.18f, 0.42f);
+            _api.SetGraphicColor(progressFill, 0.88f, 0.77f, 1f, 1f);
+            _api.SetGraphicColor(mainText, 1f, 1f, 1f, 1f);
+            _api.SetActive(progressBackgroundObject, false);
+            _api.SetActive(progressFillObject, false);
+            _api.DontDestroyOnLoad(root);
+
+            _root = root;
+            _rootTransform = rootTransform;
+            _panel = panel;
+            _panelRect = panelRect;
+            _progressBarBackgroundObject = progressBackgroundObject;
+            _progressBarBackgroundRect = progressBackgroundRect;
+            _progressBarFillObject = progressFillObject;
+            _progressBarFillRect = progressFillRect;
+            _mainText = mainText;
+            _mainRect = mainRect;
+            Logger.Info(
+                LogTag,
+                $"Unity Canvas HUD created owner={_ownerId} root=0x{root.ToInt64():X} font=0x{font.ToInt64():X}");
+        }
+
+        private void ApplyProgressBarFrame(
+            PcCompatUnityHudFrame frame,
+            float x,
+            float y,
+            float width,
+            float height,
+            float scale)
+        {
+            _progressBarVisible = frame.ProgressBarVisible;
+            _progressBarValue = frame.ProgressBarValue;
+            if (!frame.ProgressBarVisible)
+            {
+                _api.SetActive(_progressBarBackgroundObject, false);
+                _api.SetActive(_progressBarFillObject, false);
+                if (_resourceProgressObject != nint.Zero)
+                    _api.SetActive(_resourceProgressObject, false);
+                return;
+            }
+
+            var barX = x + 14f * scale;
+            var barWidth = Math.Max(1f, width - 28f * scale);
+            var resourceBarHeight = Math.Max(2f, 18f * scale);
+            var resourceBarY = y + height - 18f * scale;
+            if (TryApplyResourceProgressBar(
+                    frame,
+                    barX,
+                    resourceBarY,
+                    barWidth,
+                    resourceBarHeight,
+                    scale))
+            {
+                _api.SetActive(_progressBarBackgroundObject, false);
+                _api.SetActive(_progressBarFillObject, false);
+                return;
+            }
+
+            if (_resourceProgressObject != nint.Zero)
+                _api.SetActive(_resourceProgressObject, false);
+            var barHeight = Math.Max(2f, 6f * scale);
+            var barY = y + height - 12f * scale;
+            var fillWidth = Math.Max(1f, barWidth * Math.Clamp(frame.ProgressBarValue, 0f, 1f));
+            _api.SetActive(_progressBarBackgroundObject, true);
+            _api.SetActive(_progressBarFillObject, true);
+            _api.SetTopLeftRect(_progressBarBackgroundRect, barX, barY, barWidth, barHeight);
+            _api.SetTopLeftRect(_progressBarFillRect, barX, barY, fillWidth, barHeight);
+        }
+
+        private void ApplyResourceFont(PcCompatUnityHudFrame frame)
+        {
+            if (frame.PlainText.Any(character => character > 0x7f))
+            {
+                RestoreGameFont();
+                return;
+            }
+
+            var status = PcCompatResourceBundleLoader.TryGetOrRequestAsset(
+                _ownerId,
+                "overlay.font",
+                "TMP_FontAsset",
+                out var font,
+                out var binding);
+            if (status == PcCompatResourceAssetStatus.Ready && font != nint.Zero)
+            {
+                if (_resourceFontObject != nint.Zero && _resourceFontObject != font)
+                    _api.Forget(_resourceFontObject);
+                if (font != _font)
+                {
+                    _api.SetFont(_mainText, font);
+                    _font = font;
+                }
+                _resourceFontObject = font;
+                _resourceFontBinding = binding;
+                return;
+            }
+
+            if (_resourceFontBinding != null &&
+                (!PcCompatResourceRecipeRuntime.TryResolveLoadedBinding(
+                     _ownerId,
+                     "overlay.font",
+                     "TMP_FontAsset",
+                     out var currentBinding) ||
+                 !SameBinding(_resourceFontBinding, currentBinding)))
+                RestoreGameFont();
+        }
+
+        private bool TryApplyResourceProgressBar(
+            PcCompatUnityHudFrame frame,
+            float x,
+            float y,
+            float width,
+            float height,
+            float scale)
+        {
+            var status = PcCompatResourceBundleLoader.TryGetOrRequestAsset(
+                _ownerId,
+                "overlay.progress_bar",
+                "GameObject",
+                out var prefab,
+                out var binding);
+            if (status != PcCompatResourceAssetStatus.Ready || prefab == nint.Zero)
+            {
+                if (_resourceProgressBinding != null &&
+                    (!PcCompatResourceRecipeRuntime.TryResolveLoadedBinding(
+                         _ownerId,
+                         "overlay.progress_bar",
+                         "GameObject",
+                         out var currentBinding) ||
+                     !SameBinding(_resourceProgressBinding, currentBinding)))
+                    ReleaseResourceProgressBar(destroyObject: true);
                 return false;
             }
-        }
 
-        api.SetTopLeftRect(s_resourceProgressRect, x, y, width, height);
-        api.SetSizeDeltaX(
-            s_resourceProgressLineRect,
-            Math.Max(0f, (width - 4f * scale) * Math.Clamp(frame.ProgressBarValue, 0f, 1f)));
-        api.SetActive(s_resourceProgressObject, true);
-        return true;
-    }
-
-    private static void CreateResourceProgressBar(
-        PcCompatGeneratedUnityHudApi api,
-        nint prefab,
-        PcCompatResolvedResourceBinding binding)
-    {
-        ReleaseResourceProgressBar(api, destroyObject: true);
-        var instance = RequireObject(api.Instantiate(prefab), "resource progress prefab instance");
-        s_resourceProgressObject = instance;
-        RootResourceObject(instance);
-
-        var transform = RequireObject(api.GetTransform(instance), "resource progress Transform");
-        var rect = RequireObject(
-            api.GetComponent(transform, api.RectTransformType),
-            "resource progress RectTransform");
-        s_resourceProgressRect = rect;
-        RootResourceObject(rect);
-        api.SetParent(rect, s_rootTransform);
-
-        var lineTransform = RequireObject(api.FindChild(rect, "line"), "resource progress child 'line'");
-        var border = RequireObject(api.FindChild(rect, "borderLine"), "resource progress child 'borderLine'");
-        var background = RequireObject(api.FindChild(rect, "background"), "resource progress child 'background'");
-        var line = RequireObject(
-            api.GetComponent(lineTransform, api.RectTransformType),
-            "resource progress line RectTransform");
-        s_resourceProgressLineRect = line;
-        RootResourceObject(line);
-
-        var lineImage = RequireObject(api.GetComponent(line, api.ImageType), "resource progress line Image");
-        var borderImage = RequireObject(api.GetComponent(border, api.ImageType), "resource progress border Image");
-        var backgroundImage = RequireObject(api.GetComponent(background, api.ImageType), "resource progress background Image");
-        api.SetRaycastTarget(lineImage, false);
-        api.SetRaycastTarget(borderImage, false);
-        api.SetRaycastTarget(backgroundImage, false);
-        api.SetActive(instance, false);
-
-        s_resourceProgressBinding = binding;
-        s_resourceProgressFailureKey = string.Empty;
-        Logger.Info(
-            LogTag,
-            $"progress prefab instantiated mod={binding.ModId} asset={binding.AssetName} " +
-            $"generation={binding.SessionGeneration}");
-    }
-
-    private static void ReleaseForeignResourceVisuals(PcCompatGeneratedUnityHudApi api, string modId)
-    {
-        if (s_resourceFontBinding != null &&
-            !s_resourceFontBinding.ModId.Equals(modId, StringComparison.OrdinalIgnoreCase))
-            RestoreGameFont(api);
-        if (s_resourceProgressBinding != null &&
-            !s_resourceProgressBinding.ModId.Equals(modId, StringComparison.OrdinalIgnoreCase))
-            ReleaseResourceProgressBar(api, destroyObject: true);
-    }
-
-    private static void RestoreGameFont(PcCompatGeneratedUnityHudApi api)
-    {
-        if (s_resourceFontBinding == null && s_resourceFontObject == nint.Zero)
-            return;
-
-        var resourceFont = s_resourceFontObject;
-        s_resourceFontObject = nint.Zero;
-        s_resourceFontBinding = null;
-        api.Forget(resourceFont);
-
-        var localizedFont = api.ApplyLocalizedFont(s_mainText);
-        if (localizedFont != nint.Zero)
-        {
-            s_gameFont = localizedFont;
-            s_font = localizedFont;
-        }
-        else if (s_gameFont != nint.Zero && s_gameFont != s_font)
-        {
-            api.SetFont(s_mainText, s_gameFont);
-            s_font = s_gameFont;
-        }
-    }
-
-    private static void ReleaseResourceProgressBar(PcCompatGeneratedUnityHudApi api, bool destroyObject)
-    {
-        var instance = s_resourceProgressObject;
-        var rect = s_resourceProgressRect;
-        var lineRect = s_resourceProgressLineRect;
-        s_resourceProgressObject = nint.Zero;
-        s_resourceProgressRect = nint.Zero;
-        s_resourceProgressLineRect = nint.Zero;
-        s_resourceProgressBinding = null;
-        if (instance != nint.Zero)
-        {
-            try { api.SetActive(instance, false); } catch { }
-            if (destroyObject)
+            var bindingKey = BindingKey(binding);
+            if (_resourceProgressObject == nint.Zero ||
+                _resourceProgressBinding == null ||
+                !SameBinding(_resourceProgressBinding, binding))
             {
-                try { api.Destroy(instance); } catch { }
+                if (_resourceProgressFailureKey.Equals(bindingKey, StringComparison.Ordinal))
+                    return false;
+                try
+                {
+                    CreateResourceProgressBar(prefab, binding);
+                }
+                catch (Exception ex)
+                {
+                    _resourceProgressFailureKey = bindingKey;
+                    ReleaseResourceProgressBar(destroyObject: true);
+                    Logger.Warn(
+                        LogTag,
+                        $"progress prefab adapter rejected mod={binding.ModId} asset={binding.AssetName}: {ex.Message}");
+                    return false;
+                }
+            }
+
+            _api.SetTopLeftRect(_resourceProgressRect, x, y, width, height);
+            _api.SetSizeDeltaX(
+                _resourceProgressLineRect,
+                Math.Max(0f, (width - 4f * scale) * Math.Clamp(frame.ProgressBarValue, 0f, 1f)));
+            _api.SetActive(_resourceProgressObject, true);
+            return true;
+        }
+
+        private void CreateResourceProgressBar(
+            nint prefab,
+            PcCompatResolvedResourceBinding binding)
+        {
+            ReleaseResourceProgressBar(destroyObject: true);
+            var instance = RequireObject(_api.Instantiate(prefab), "resource progress prefab instance");
+            _resourceProgressObject = instance;
+            RootResourceObject(instance);
+            var transform = RequireObject(_api.GetTransform(instance), "resource progress Transform");
+            var rect = RequireObject(
+                _api.GetComponent(transform, _api.RectTransformType),
+                "resource progress RectTransform");
+            _resourceProgressRect = rect;
+            RootResourceObject(rect);
+            _api.SetParent(rect, _rootTransform);
+
+            var lineTransform = RequireObject(_api.FindChild(rect, "line"), "resource progress child 'line'");
+            var border = RequireObject(_api.FindChild(rect, "borderLine"), "resource progress child 'borderLine'");
+            var background = RequireObject(_api.FindChild(rect, "background"), "resource progress child 'background'");
+            var line = RequireObject(
+                _api.GetComponent(lineTransform, _api.RectTransformType),
+                "resource progress line RectTransform");
+            _resourceProgressLineRect = line;
+            RootResourceObject(line);
+            var lineImage = RequireObject(_api.GetComponent(line, _api.ImageType), "resource progress line Image");
+            var borderImage = RequireObject(_api.GetComponent(border, _api.ImageType), "resource progress border Image");
+            var backgroundImage = RequireObject(
+                _api.GetComponent(background, _api.ImageType),
+                "resource progress background Image");
+            _api.SetRaycastTarget(lineImage, false);
+            _api.SetRaycastTarget(borderImage, false);
+            _api.SetRaycastTarget(backgroundImage, false);
+            _api.SetActive(instance, false);
+            _resourceProgressBinding = binding;
+            _resourceProgressFailureKey = string.Empty;
+            Logger.Info(
+                LogTag,
+                $"progress prefab instantiated mod={binding.ModId} asset={binding.AssetName} " +
+                $"generation={binding.SessionGeneration}");
+        }
+
+        private void RestoreGameFont()
+        {
+            if (_resourceFontBinding == null && _resourceFontObject == nint.Zero)
+                return;
+            var resourceFont = _resourceFontObject;
+            _resourceFontObject = nint.Zero;
+            _resourceFontBinding = null;
+            _api.Forget(resourceFont);
+            var localizedFont = _api.ApplyLocalizedFont(_mainText);
+            if (localizedFont != nint.Zero)
+            {
+                _gameFont = localizedFont;
+                _font = localizedFont;
+            }
+            else if (_gameFont != nint.Zero && _gameFont != _font)
+            {
+                _api.SetFont(_mainText, _gameFont);
+                _font = _gameFont;
             }
         }
-        api.Forget(instance);
-        api.Forget(rect);
-        api.Forget(lineRect);
-        FreeResourceHandles();
+
+        private void ReleaseResourceProgressBar(bool destroyObject)
+        {
+            var instance = _resourceProgressObject;
+            var rect = _resourceProgressRect;
+            var lineRect = _resourceProgressLineRect;
+            _resourceProgressObject = nint.Zero;
+            _resourceProgressRect = nint.Zero;
+            _resourceProgressLineRect = nint.Zero;
+            _resourceProgressBinding = null;
+            if (instance != nint.Zero)
+            {
+                try { _api.SetActive(instance, false); } catch { }
+                if (destroyObject)
+                {
+                    try { _api.Destroy(instance); } catch { }
+                }
+            }
+            _api.Forget(instance);
+            _api.Forget(rect);
+            _api.Forget(lineRect);
+            _resourceGcRoots.Clear();
+        }
+
+        private void RootObject(nint obj)
+            => _gcRoots.Add(new Il2CppSystem.Object(obj));
+
+        private void RootResourceObject(nint obj)
+            => _resourceGcRoots.Add(new Il2CppSystem.Object(obj));
+
+        private static nint RequireObject(nint obj, string label)
+            => obj != nint.Zero
+                ? obj
+                : throw new InvalidOperationException($"Unity object creation failed: {label}");
     }
 
     private static bool BindingMatches(
@@ -633,73 +844,4 @@ public static unsafe class PcCompatUnityHudBridge
     private static string BindingKey(PcCompatResolvedResourceBinding binding)
         => binding.ModId + "\0" + binding.CandidateSha256Hex + "\0" +
            binding.AssetName + "\0" + binding.SessionGeneration;
-
-    private static void FailRenderer(string message, Exception ex)
-    {
-        if (s_failed)
-            return;
-
-        s_failed = true;
-        PcCompatUnityHudRuntime.MarkRendererFailed();
-        try
-        {
-            PcCompatNativeHookRules.SetOverlayChangedCallback(nint.Zero);
-        }
-        catch
-        {
-        }
-
-        try
-        {
-            if (s_root != nint.Zero)
-                s_api?.SetActive(s_root, false);
-        }
-        catch
-        {
-        }
-
-        FreeRootHandles();
-        FreeResourceHandles();
-        s_api?.Clear();
-
-        Logger.Error(LogTag, $"{message}; falling back to ImGui HUD: {ex}");
-    }
-
-    private static void RootObject(nint obj)
-    {
-        if (s_gcHandleCount >= GcRoots.Length)
-            throw new InvalidOperationException("Unity HUD GCHandle capacity exceeded");
-        GcRoots[s_gcHandleCount++] = new Il2CppSystem.Object(obj);
-    }
-
-    private static void RootResourceObject(nint obj)
-    {
-        if (s_resourceGcHandleCount >= ResourceGcRoots.Length)
-            throw new InvalidOperationException("Unity HUD resource GCHandle capacity exceeded");
-        ResourceGcRoots[s_resourceGcHandleCount++] = new Il2CppSystem.Object(obj);
-    }
-
-    private static nint RequireObject(nint obj, string label)
-        => obj != nint.Zero
-            ? obj
-            : throw new InvalidOperationException($"Unity object creation failed: {label}");
-
-    private static void FreeRootHandles()
-    {
-        while (s_gcHandleCount > 0)
-        {
-            var index = --s_gcHandleCount;
-            GcRoots[index] = null;
-        }
-    }
-
-    private static void FreeResourceHandles()
-    {
-        while (s_resourceGcHandleCount > 0)
-        {
-            var index = --s_resourceGcHandleCount;
-            ResourceGcRoots[index] = null;
-        }
-    }
-
 }

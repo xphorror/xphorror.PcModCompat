@@ -1,4 +1,5 @@
 using Xphorror.PcModCompat;
+using StArray.ModManager.Runtime;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.Loader;
@@ -7,6 +8,118 @@ namespace StArray.ModManager.Tests;
 
 public class PcCompatManagedLoaderTests
 {
+    [Test]
+    public void NativeSessionGenerationIsUsedWhenNoResourceRecipeExists()
+    {
+        var modId = "pccompat-generation-fallback-" + Guid.NewGuid().ToString("N");
+        var manifest = new PcModManifest
+        {
+            Id = modId,
+            DisplayName = modId,
+            FolderPath = Path.Combine(Path.GetTempPath(), modId)
+        };
+        var digest = Enumerable.Repeat((byte)1, 32).ToArray();
+        var request = new PcCompatModSessionRequest(
+            modId,
+            HostGeneration: 7,
+            ResourceGeneration: 42,
+            digest,
+            digest.ToArray());
+        using var lease = new PcCompatModSessionLease(
+            request,
+            sessionHandle: 1,
+            close: static () => { });
+
+        var identity = PcCompatManagedLoader.ResolveResourceSessionIdentity(manifest, lease);
+        Assert.Multiple(() =>
+        {
+            Assert.That(identity.Generation, Is.EqualTo(42));
+            Assert.That(identity.HasRecipeSession, Is.False);
+            Assert.That(
+                PcCompatManagedModSession.TryValidateResourceSessionIdentity(
+                    modId,
+                    identity.Generation,
+                    identity.HasRecipeSession,
+                    lease.Request.ResourceGeneration,
+                    out var error),
+                Is.True);
+            Assert.That(error, Is.Null);
+        });
+    }
+
+    [Test]
+    public void MissingExpectedResourceRecipeFailsWithGenerationDiagnostics()
+    {
+        var modId = "pccompat-generation-missing-" + Guid.NewGuid().ToString("N");
+
+        var valid = PcCompatManagedModSession.TryValidateResourceSessionIdentity(
+            modId,
+            expectedGeneration: 9,
+            hasResourceRecipeSession: true,
+            nativeGeneration: 9,
+            out var error);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(valid, Is.False);
+            Assert.That(error, Does.Contain("expected=9"));
+            Assert.That(error, Does.Contain("current=missing"));
+            Assert.That(error, Does.Contain("native=9"));
+        });
+    }
+
+    [Test]
+    public void SessionBindingsAreAvailableDuringBootstrapScopeAndRevokeTogether()
+    {
+        var modId = "pccompat-bootstrap-bindings-" + Guid.NewGuid().ToString("N");
+        var generation = 43L;
+        var manifest = new PcModManifest
+        {
+            Id = modId,
+            DisplayName = modId,
+            FolderPath = Path.Combine(Path.GetTempPath(), modId)
+        };
+
+        PcCompatManagedSessionBindings.Bind(manifest, generation);
+        try
+        {
+            using (PcCompatManagedExecutionContext.Enter(
+                       new PcCompatManagedExecutionState(
+                           modId,
+                           generation,
+                           PcCompatManagedExecutionPhase.Bootstrap)))
+            {
+                PcCompatManagedPathBridge.FileWriteAllText("Settings.json", "{}\n");
+                var cookies = PcCompatManagedNetworkBridge.CreateCookieContainer();
+                PcCompatManagedSessionBindings.Bind(manifest, generation);
+                Assert.That(
+                    PcCompatManagedNetworkBridge.CreateCookieContainer(),
+                    Is.SameAs(cookies));
+                using var client = PcCompatManagedNetworkBridge.CreateHttpClient();
+                Assert.That(
+                    PcCompatManagedPathBridge.FileReadAllText("Settings.json"),
+                    Is.EqualTo("{}\n"));
+            }
+
+            PcCompatManagedSessionBindings.Clear(modId, generation);
+            using var afterClear = PcCompatManagedExecutionContext.Enter(
+                new PcCompatManagedExecutionState(
+                    modId,
+                    generation,
+                    PcCompatManagedExecutionPhase.Bootstrap));
+            Assert.That(
+                () => PcCompatManagedPathBridge.FileExists("Settings.json"),
+                Throws.InvalidOperationException.With.Message.Contains("not bound"));
+        }
+        finally
+        {
+            PcCompatManagedSessionBindings.Clear(modId, generation);
+            var folder = Path.Combine(Path.GetTempPath(), modId);
+            if (Directory.Exists(folder))
+                Directory.Delete(folder, recursive: true);
+        }
+    }
+
     [Test]
     public void HostRuntimeAssemblyCannotBeShadowedByModFolderCopy()
     {
@@ -56,7 +169,7 @@ public class PcCompatManagedLoaderTests
     {
         var repoRoot = FindRepoRoot();
         var modDir = Path.Combine(repoRoot, "JipperResourcePack_release");
-        var shimDir = Path.Combine(repoRoot, "xphorror.PcModCompat", "out", "shims");
+        var shimDir = Path.Combine(repoRoot, "xphorror.PcModCompat", "out", "legacy_shims");
 
         Assume.That(Directory.Exists(modDir), Is.True, $"missing sample mod dir: {modDir}");
         Assume.That(Directory.Exists(shimDir), Is.True, $"missing shim dir: {shimDir}");
@@ -77,7 +190,7 @@ public class PcCompatManagedLoaderTests
     {
         var repoRoot = FindRepoRoot();
         var modDir = Path.Combine(repoRoot, "JipperResourcePack_release");
-        var shimDir = Path.Combine(repoRoot, "xphorror.PcModCompat", "out", "shims");
+        var shimDir = Path.Combine(repoRoot, "xphorror.PcModCompat", "out", "legacy_shims");
 
         Assume.That(Directory.Exists(modDir), Is.True, $"missing sample mod dir: {modDir}");
         Assume.That(Directory.Exists(shimDir), Is.True, $"missing shim dir: {shimDir}");
@@ -108,6 +221,42 @@ public class PcCompatManagedLoaderTests
     }
 
     [Test]
+    public void UMMStaticEntryIsBootstrappedWithoutConstructingItsAbstractDeclaringType()
+    {
+        var repoRoot = FindRepoRoot();
+        var modDir = Path.Combine(repoRoot, "JipperOverlayer-UMM");
+        var shimDir = Path.Combine(repoRoot, "xphorror.PcModCompat", "out", "legacy_shims");
+
+        Assume.That(Directory.Exists(modDir), Is.True, $"missing sample mod dir: {modDir}");
+        Assume.That(Directory.Exists(shimDir), Is.True, $"missing shim dir: {shimDir}");
+        Assert.That(PcModManifestReader.TryRead(modDir, out var manifest, out var error), Is.True, error);
+
+        using var session = PcCompatManagedLoader.Load(manifest, new PcCompatLoadOptions
+        {
+            ShimFolder = shimDir,
+            AllowLegacyStubExecution = true,
+            TryBootstrap = true,
+            Enable = false
+        });
+
+        var entryType = session.Assembly.GetType(
+            "JipperOverlayer.Loader.UmmEntry",
+            throwOnError: true)!;
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(entryType.IsAbstract, Is.True);
+            Assert.That(session.BootstrapAttempted, Is.True);
+            Assert.That(session.BootstrapSucceeded, Is.True);
+            Assert.That(session.SetupCompleted, Is.True);
+            Assert.That(
+                session.Instance.GetType().GetMethod("CompatEnable"),
+                Is.Not.Null,
+                "UMM sessions must expose the host lifecycle adapter rather than instantiate UmmEntry");
+        });
+    }
+
+    [Test]
     public void BootstrapTimeHarmonyPatchSurvivesIntoTheSnapshot()
     {
         // JALib's own bootstrap installs a Harmony prefix on Type.GetConstructor before CompatSetup runs.
@@ -115,7 +264,7 @@ public class PcCompatManagedLoaderTests
         // the case that proves both the Harmony registry wiring and the clear ordering.
         var repoRoot = FindRepoRoot();
         var modDir = Path.Combine(repoRoot, "JipperResourcePack_release");
-        var shimDir = Path.Combine(repoRoot, "xphorror.PcModCompat", "out", "shims");
+        var shimDir = Path.Combine(repoRoot, "xphorror.PcModCompat", "out", "legacy_shims");
 
         Assume.That(Directory.Exists(modDir), Is.True, $"missing sample mod dir: {modDir}");
         Assume.That(Directory.Exists(shimDir), Is.True, $"missing shim dir: {shimDir}");
@@ -151,7 +300,7 @@ public class PcCompatManagedLoaderTests
     {
         var repoRoot = FindRepoRoot();
         var modDir = Path.Combine(repoRoot, "JipperResourcePack_release");
-        var shimDir = Path.Combine(repoRoot, "xphorror.PcModCompat", "out", "shims");
+        var shimDir = Path.Combine(repoRoot, "xphorror.PcModCompat", "out", "legacy_shims");
         Assume.That(Directory.Exists(modDir), Is.True, $"missing sample mod dir: {modDir}");
         Assume.That(Directory.Exists(shimDir), Is.True, $"missing shim dir: {shimDir}");
         Assert.That(PcModManifestReader.TryRead(
@@ -207,7 +356,7 @@ public class PcCompatManagedLoaderTests
     {
         var repoRoot = FindRepoRoot();
         var modDir = Path.Combine(repoRoot, "JipperResourcePack_release");
-        var shimDir = Path.Combine(repoRoot, "xphorror.PcModCompat", "out", "shims");
+        var shimDir = Path.Combine(repoRoot, "xphorror.PcModCompat", "out", "legacy_shims");
 
         Assume.That(Directory.Exists(modDir), Is.True, $"missing sample mod dir: {modDir}");
         Assume.That(Directory.Exists(shimDir), Is.True, $"missing shim dir: {shimDir}");
@@ -308,7 +457,7 @@ public class PcCompatManagedLoaderTests
     {
         var repoRoot = FindRepoRoot();
         var modDir = Path.Combine(repoRoot, "JipperResourcePack_release");
-        var shimDir = Path.Combine(repoRoot, "xphorror.PcModCompat", "out", "shims");
+        var shimDir = Path.Combine(repoRoot, "xphorror.PcModCompat", "out", "legacy_shims");
 
         Assume.That(Directory.Exists(modDir), Is.True, $"missing sample mod dir: {modDir}");
         Assume.That(Directory.Exists(shimDir), Is.True, $"missing shim dir: {shimDir}");
@@ -356,6 +505,255 @@ public class PcCompatManagedLoaderTests
     }
 
     [Test]
+    public void JipperOverlayerVersionSafeHandlersKeepPlayerZeroStableAndDoNotAliasCoopData()
+    {
+        var expected = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["GetHideWithNoAuto"] = nameof(PcCompatReversePatchBridge.GetHideWithNoAuto),
+            ["GetPlayerIndex"] = nameof(PcCompatReversePatchBridge.GetPlayerIndex),
+            ["GetHitMarginsCountForPlayer"] = nameof(PcCompatReversePatchBridge.GetHitMarginsCountForPlayer),
+            ["GetPlayerColorHex"] = nameof(PcCompatReversePatchBridge.GetPlayerColorHex)
+        };
+
+        foreach (var (targetMethod, bridgeMethod) in expected)
+        {
+            Assert.That(
+                PcCompatReversePatchBridge.TryFindHandler(
+                    "JipperOverlayer.Overlayer.VersionSafe",
+                    targetMethod,
+                    out var handler),
+                Is.True,
+                targetMethod);
+            Assert.That(handler!.AndroidBridgeMethod, Is.EqualTo(bridgeMethod));
+            Assert.That(handler.ReturnType, Is.Not.Empty);
+        }
+
+        PcCompatReversePatchBridge.InitializeHitMarginsCountLayout(12);
+        PcCompatReversePatchBridge.PublishHitMarginsCount(Enumerable.Range(1, 12).ToArray());
+
+        var playerZero = PcCompatReversePatchBridge.GetHitMarginsCountForPlayer(0);
+        var playerOne = PcCompatReversePatchBridge.GetHitMarginsCountForPlayer(1);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(PcCompatReversePatchBridge.GetHideWithNoAuto(null), Is.True);
+            Assert.That(PcCompatReversePatchBridge.GetPlayerIndex(null), Is.Zero);
+            Assert.That(PcCompatReversePatchBridge.GetPlayerColorHex(1), Is.EqualTo("FFFFFF"));
+            Assert.That(playerZero, Is.SameAs(PcCompatReversePatchBridge.GetHitMarginsCount()));
+            Assert.That(playerOne, Is.Not.SameAs(playerZero));
+            Assert.That(playerOne, Has.All.EqualTo(0));
+        });
+    }
+
+    [Test]
+    public void ProductionRewriteIncludesGenericDynamicGetterFactoryBridges()
+    {
+        var builder = typeof(StArray.ModManager.Android.PcCompat.PcCompatAndroidManagedAssemblyRewrite)
+            .GetMethod("BuildManagedCallBridgeRewrites", BindingFlags.Static | BindingFlags.NonPublic);
+        Assert.That(builder, Is.Not.Null);
+
+        var specs = (IReadOnlyList<ManagedCallBridgeRewriteSpec>)builder!.Invoke(
+            null,
+            ["JipperOverlayer"])!;
+        var getters = specs
+            .Where(spec => spec.SourceAssembly == "JipperOverlayer" &&
+                          spec.SourceType == "JipperOverlayer.PatchManager")
+            .ToDictionary(
+                spec => $"{spec.SourceMethod}/{spec.SourceGenericArity}",
+                StringComparer.Ordinal);
+
+        Assert.That(getters.Keys, Is.EquivalentTo(new[]
+        {
+            "CreateStaticFieldGetter/1",
+            "CreateStaticPropertyGetter/1",
+            "CreateMemberGetter/1",
+            "CreateMemberGetter/2",
+            "CreateStaticMemberGetter/0"
+        }));
+        Assert.Multiple(() =>
+        {
+            Assert.That(getters.Values, Has.All.Property(nameof(ManagedCallBridgeRewriteSpec.AllowUnproxiedSource)).True);
+            Assert.That(getters.Values.Select(spec => spec.BridgeType).Distinct().ToArray(), Has.Length.EqualTo(1));
+            Assert.That(getters["CreateStaticFieldGetter/1"].SourceGenericArity, Is.EqualTo(1));
+            Assert.That(getters["CreateStaticPropertyGetter/1"].SourceGenericArity, Is.EqualTo(1));
+            Assert.That(getters["CreateMemberGetter/1"].SourceGenericArity, Is.EqualTo(1));
+            Assert.That(getters["CreateMemberGetter/2"].SourceGenericArity, Is.EqualTo(2));
+            Assert.That(getters["CreateStaticMemberGetter/0"].SourceGenericArity, Is.Zero);
+            Assert.That(getters["CreateStaticFieldGetter/1"].BridgeMethod, Is.EqualTo(
+                nameof(PcCompatManagedDynamicGetterBridge.CreateStaticFieldGetter)));
+            Assert.That(getters["CreateStaticPropertyGetter/1"].BridgeMethod, Is.EqualTo(
+                nameof(PcCompatManagedDynamicGetterBridge.CreateStaticPropertyGetter)));
+            Assert.That(getters["CreateMemberGetter/1"].BridgeMethod, Is.EqualTo(
+                nameof(PcCompatManagedDynamicGetterBridge.CreateMemberGetter)));
+            Assert.That(getters["CreateMemberGetter/2"].BridgeMethod, Is.EqualTo(
+                nameof(PcCompatManagedDynamicGetterBridge.CreateMemberGetter)));
+            Assert.That(getters["CreateStaticMemberGetter/0"].BridgeMethod, Is.EqualTo(
+                nameof(PcCompatManagedDynamicGetterBridge.CreateStaticMemberGetter)));
+        });
+    }
+
+    [Test]
+    public void JipperOverlayerDoesNotUseJpovSpecificGetterCallBridges()
+    {
+        var builder = typeof(StArray.ModManager.Android.PcCompat.PcCompatAndroidManagedAssemblyRewrite)
+            .GetMethod("BuildManagedCallBridgeRewrites", BindingFlags.Static | BindingFlags.NonPublic);
+        Assert.That(builder, Is.Not.Null);
+        var specs = (IReadOnlyList<ManagedCallBridgeRewriteSpec>)builder!.Invoke(
+            null,
+            ["JipperOverlayer"])!;
+        var specialized = specs
+            .Where(spec => spec.SourceAssembly == "JipperOverlayer" &&
+                          (spec.SourceType == "JipperOverlayer.Overlayer.GameRefs" ||
+                           spec.SourceType == "JipperOverlayer.Overlayer.VersionSafe"));
+        Assert.That(specialized, Is.Empty);
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void ReversePatchBridgeKeepsSnapshotsAndStableCountsPerManagedModSession()
+    {
+        PcCompatReversePatchBridge.RegisterSnapshotRefresh(null);
+        PcCompatReversePatchBridge.RegisterHitMarginsCountRefresh(null);
+        PcCompatReversePatchBridge.InitializeHitMarginsCountLayout(12);
+        var jrp = new PcCompatManagedExecutionState(
+            "JipperResourcePack-owner-" + Guid.NewGuid().ToString("N"),
+            11,
+            PcCompatManagedExecutionPhase.Update);
+        var jpov = new PcCompatManagedExecutionState(
+            "JipperOverlayer-owner-" + Guid.NewGuid().ToString("N"),
+            12,
+            PcCompatManagedExecutionPhase.Update);
+        int[] jrpCounts;
+        int[] jpovCounts;
+
+        using (PcCompatManagedExecutionContext.Enter(jrp))
+        {
+            PcCompatReversePatchBridge.PublishSnapshot(new PcCompatGameSnapshot
+            {
+                PercentAcc = 0.991f,
+                Progress = 0.25f,
+                CurrentSeqId = 17,
+                IsScnGame = true,
+                IsGameReady = true,
+                HitMarginsCount = Enumerable.Range(10, 12).ToArray()
+            });
+            PcCompatReversePatchBridge.LoadScene("jrp-scene");
+            jrpCounts = PcCompatReversePatchBridge.GetHitMarginsCount();
+        }
+
+        using (PcCompatManagedExecutionContext.Enter(jpov))
+        {
+            PcCompatReversePatchBridge.PublishSnapshot(new PcCompatGameSnapshot
+            {
+                PercentAcc = 0.875f,
+                Progress = 0.75f,
+                CurrentSeqId = 42,
+                IsScnGame = true,
+                IsGameReady = true,
+                HitMarginsCount = Enumerable.Range(30, 12).ToArray()
+            });
+            PcCompatReversePatchBridge.LoadScene("jpov-scene");
+            jpovCounts = PcCompatReversePatchBridge.GetHitMarginsCount();
+        }
+
+        using (PcCompatManagedExecutionContext.Enter(jrp))
+        {
+            Assert.Multiple(() =>
+            {
+                Assert.That(PcCompatReversePatchBridge.GetPercentAcc(), Is.EqualTo(0.991f));
+                Assert.That(PcCompatReversePatchBridge.GetProgress(), Is.EqualTo(0.25f));
+                Assert.That(PcCompatReversePatchBridge.GetCurrentSeqId(), Is.EqualTo(17));
+                Assert.That(PcCompatReversePatchBridge.GetHitMarginsCount(), Is.SameAs(jrpCounts));
+                Assert.That(jrpCounts[0], Is.EqualTo(10));
+                Assert.That(PcCompatReversePatchBridge.ConsumeRequestedSceneName(), Is.EqualTo("jrp-scene"));
+            });
+        }
+
+        using (PcCompatManagedExecutionContext.Enter(jpov))
+        {
+            Assert.Multiple(() =>
+            {
+                Assert.That(PcCompatReversePatchBridge.GetPercentAcc(), Is.EqualTo(0.875f));
+                Assert.That(PcCompatReversePatchBridge.GetProgress(), Is.EqualTo(0.75f));
+                Assert.That(PcCompatReversePatchBridge.GetCurrentSeqId(), Is.EqualTo(42));
+                Assert.That(PcCompatReversePatchBridge.GetHitMarginsCount(), Is.SameAs(jpovCounts));
+                Assert.That(jpovCounts[0], Is.EqualTo(30));
+                Assert.That(PcCompatReversePatchBridge.ConsumeRequestedSceneName(), Is.EqualTo("jpov-scene"));
+            });
+        }
+
+        Assert.That(jrpCounts, Is.Not.SameAs(jpovCounts));
+    }
+
+    [Test]
+    public void AndroidReversePatchRefreshUsesTheCurrentManagedOwnerAndSessionGeneration()
+    {
+        var source = File.ReadAllText(Path.Combine(
+            FindRepoRoot(),
+            "StArray.ModManager.Android",
+            "PcCompat",
+            "PcCompatDobbyBridge.cs"));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(source, Does.Contain("GetReversePatchState(out var modId)"));
+            Assert.That(source, Does.Contain("PcCompatNativeHookRules.GetSharedGameSnapshot()"));
+            Assert.That(source, Does.Contain("ReversePatchSessionKey"));
+            Assert.That(source, Does.Contain("ResourceSessionGeneration"));
+            Assert.That(source, Does.Contain("state.HitMarginsNativeGeneration"));
+        });
+    }
+
+    [Test]
+    [NonParallelizable]
+    public void ReversePatchBridgeSeparatesReloadedModGenerations()
+    {
+        PcCompatReversePatchBridge.RegisterSnapshotRefresh(null);
+        var modId = "JipperOverlayer-reload-" + Guid.NewGuid().ToString("N");
+        var first = new PcCompatManagedExecutionState(
+            modId,
+            71,
+            PcCompatManagedExecutionPhase.Update);
+        var second = first with { ResourceSessionGeneration = 72 };
+
+        using (PcCompatManagedExecutionContext.Enter(first))
+        {
+            PcCompatReversePatchBridge.PublishSnapshot(new PcCompatGameSnapshot
+            {
+                CurrentSeqId = 71,
+                Progress = 0.1f
+            });
+        }
+
+        using (PcCompatManagedExecutionContext.Enter(second))
+        {
+            PcCompatReversePatchBridge.PublishSnapshot(new PcCompatGameSnapshot
+            {
+                CurrentSeqId = 72,
+                Progress = 0.9f
+            });
+        }
+
+        using (PcCompatManagedExecutionContext.Enter(first))
+        {
+            Assert.Multiple(() =>
+            {
+                Assert.That(PcCompatReversePatchBridge.GetCurrentSeqId(), Is.EqualTo(71));
+                Assert.That(PcCompatReversePatchBridge.GetProgress(), Is.EqualTo(0.1f));
+            });
+        }
+
+        using (PcCompatManagedExecutionContext.Enter(second))
+        {
+            Assert.Multiple(() =>
+            {
+                Assert.That(PcCompatReversePatchBridge.GetCurrentSeqId(), Is.EqualTo(72));
+                Assert.That(PcCompatReversePatchBridge.GetProgress(), Is.EqualTo(0.9f));
+            });
+        }
+    }
+
+    [Test]
     public void ReversePatchBridgeKeepsOneStableArrayWithoutAliasingPublishedInput()
     {
         PcCompatReversePatchBridge.InitializeHitMarginsCountLayout(12);
@@ -378,8 +776,8 @@ public class PcCompatManagedLoaderTests
         Assert.That(PcCompatReversePatchBridge.GetPlanetSpeed(), Is.EqualTo(1.25));
         Assert.That(PcCompatReversePatchBridge.GetPercentAcc(), Is.EqualTo(98.5f));
         Assert.That(PcCompatReversePatchBridge.GetPercentXAcc(), Is.EqualTo(97.25f));
-        Assert.That(PcCompatReversePatchBridge.IsCoopMode(), Is.True);
-        Assert.That(PcCompatReversePatchBridge.GetPlayerCount(), Is.EqualTo(2));
+        Assert.That(PcCompatReversePatchBridge.IsCoopMode(), Is.False);
+        Assert.That(PcCompatReversePatchBridge.GetPlayerCount(), Is.EqualTo(1));
     }
 
     [TestCase(0d)]
@@ -424,6 +822,8 @@ public class PcCompatManagedLoaderTests
             PlanetSpeed = 1.5,
             PercentAcc = 0.1f,
             PercentXAcc = 0.2f,
+            IsScnGame = true,
+            IsGameReady = true,
             PlayerCount = 2,
             SceneName = "scnGame"
         });
@@ -441,6 +841,8 @@ public class PcCompatManagedLoaderTests
             Assert.That(snapshot.PercentAcc, Is.EqualTo(0.991f));
             Assert.That(snapshot.PercentXAcc, Is.EqualTo(0.982f));
             Assert.That(snapshot.PlanetSpeed, Is.EqualTo(1.5));
+            Assert.That(snapshot.IsScnGame, Is.True);
+            Assert.That(snapshot.IsGameReady, Is.True);
             Assert.That(snapshot.PlayerCount, Is.EqualTo(2));
             Assert.That(snapshot.SceneName, Is.EqualTo("scnGame"));
         }

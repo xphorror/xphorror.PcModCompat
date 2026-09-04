@@ -6,6 +6,7 @@ using ImGuiNET;
 using System.Globalization;
 using System.Numerics;
 using System.Text;
+using System.Text.Json;
 
 namespace Xphorror.PcModCompat;
 
@@ -81,6 +82,13 @@ public sealed class PcCompatModPlugin :
     private string? _keyViewerPreviewError;
     private string? _keyViewerLoweringStatus;
     private bool _keyViewerOverridesDirty;
+    private ModRuntimeSession? _runtimeSession;
+    private ModRuntimeKey _runtimeKey;
+    private PcCompatManagedModSession? _observedManagedSession;
+    private long _adapterActivationGeneration;
+    private readonly PcCompatManagedProviderSequenceWatcher _providerSequenceWatcher = new();
+    private string? _keyViewerRepublicationStatus;
+    private string? _keyViewerAdapterDiagnosticState;
 
     private const long HudDiagnosticsRefreshMilliseconds = 500;
     private static readonly int[] TouchKeyCountOptions = [2, 4, 6, 8, 10];
@@ -125,7 +133,7 @@ public sealed class PcCompatModPlugin :
             if (!_supportsStandardUnityHud)
                 return false;
 
-            if (PcCompatUnityHudRuntime.RendererAvailable)
+            if (PcCompatUnityHudRuntime.RendererAvailableFor(Id))
                 return false;
 
             if (ManagedSelfRenderBlocksCompatibilityPresentation)
@@ -140,7 +148,7 @@ public sealed class PcCompatModPlugin :
                 return false;
             }
 
-            var overlay = PcCompatOverlayRuntime.Snapshot();
+            var overlay = PcCompatOverlayRuntime.Snapshot(Id);
             if (!overlay.ProviderAvailable || !overlay.Visible)
             {
                 _hasPendingOverlaySnapshot = false;
@@ -155,13 +163,16 @@ public sealed class PcCompatModPlugin :
 
     public void OnLoad()
     {
-        PcCompatRuntime.RegisterMod(_manifest);
+        CaptureRuntimeIdentity();
+        PcCompatRuntime.RegisterMod(_manifest, _runtimeSession, _runtimeKey);
         ApplyResourceChangerSettings();
+        ObserveManagedActivation();
         RefreshRuntimeAdapters();
     }
 
     public void BeginLoad()
     {
+        CaptureRuntimeIdentity();
         lock (_loadLock)
         {
             if (_loadTask is { IsCompleted: false })
@@ -174,12 +185,63 @@ public sealed class PcCompatModPlugin :
             _loadStage = "Queued";
             _loadCompletionError = null;
             var token = _loadCancellation.Token;
-            _loadTask = Task.Run(
-                () => PcCompatRuntime.PrepareMod(
-                    _manifest,
-                    (progress, stage) => UpdateLoadProgress(generation, progress, stage),
-                    token),
-                token);
+            _loadTask = StartOwnedPrepareTask(generation, token);
+        }
+    }
+
+    private Task<PcCompatPreparedMod> StartOwnedPrepareTask(
+        int generation,
+        CancellationToken cancellationToken)
+    {
+        var runtimeSession = _runtimeSession;
+        var runtimeKey = _runtimeKey;
+        var identity = $"prepare-generation={generation};";
+        IModRuntimeOperationLease? operationLease = null;
+        CancellationTokenSource? linkedCancellation = null;
+
+        if (runtimeSession != null && runtimeKey.IsValid)
+        {
+            if (!runtimeSession.TryBeginOwnedOperation(
+                    runtimeKey,
+                    identity,
+                    out operationLease) ||
+                operationLease == null)
+            {
+                throw new InvalidOperationException(
+                    $"PcCompat background preparation rejected for retired generation " +
+                    $"mod={Id} generation={runtimeKey.Generation}.");
+            }
+            linkedCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+                cancellationToken,
+                operationLease.CancellationToken);
+        }
+
+        try
+        {
+            var effectiveCancellation = linkedCancellation?.Token ?? cancellationToken;
+            // Do not pass the cancellation token to Task.Run itself. The delegate must
+            // always enter its finally block so the runtime operation lease is released.
+            return Task.Run(() =>
+            {
+                try
+                {
+                    return PcCompatRuntime.PrepareMod(
+                        _manifest,
+                        (progress, stage) => UpdateLoadProgress(generation, progress, stage),
+                        effectiveCancellation);
+                }
+                finally
+                {
+                    linkedCancellation?.Dispose();
+                    operationLease?.Dispose();
+                }
+            });
+        }
+        catch
+        {
+            linkedCancellation?.Dispose();
+            operationLease?.Dispose();
+            throw;
         }
     }
 
@@ -213,6 +275,7 @@ public sealed class PcCompatModPlugin :
 
     public void CompleteLoad()
     {
+        CaptureRuntimeIdentity();
         Task<PcCompatPreparedMod>? task;
         lock (_loadLock)
             task = _loadTask;
@@ -240,7 +303,8 @@ public sealed class PcCompatModPlugin :
                 _loadTask = null;
             }
 
-            PcCompatRuntime.RegisterPreparedMod(prepared);
+            PcCompatRuntime.RegisterPreparedMod(prepared, _runtimeSession, _runtimeKey);
+            ObserveManagedActivation();
             RefreshRuntimeAdapters();
             lock (_loadLock)
             {
@@ -278,13 +342,16 @@ public sealed class PcCompatModPlugin :
             nameof(PcCompatModPlugin),
             $"[DEBUG-kv-unload-v1] plugin-unload-enter mod={Id} " +
             $"tid={Environment.CurrentManagedThreadId}");
+        StopObservingManagedActivation();
         // Native callback gates must retire before any managed/UI state they can
         // reach is dismantled. A retirement failure leaves this plugin intact.
         PcCompatRuntime.UnregisterMod(_manifest);
+        PcCompatOverlayRuntime.RemoveOwner(Id);
         if (_unityHudRegistered)
         {
             PcCompatUnityHudRuntime.UnregisterSource(this);
             _unityHudRegistered = false;
+            RetireOwnedHudSource();
         }
         _supportsStandardUnityHud = false;
         _playStats.Dispose();
@@ -298,6 +365,109 @@ public sealed class PcCompatModPlugin :
             nameof(PcCompatModPlugin),
             $"[DEBUG-kv-unload-v1] plugin-unload-complete mod={Id} " +
             $"tid={Environment.CurrentManagedThreadId}");
+    }
+
+    private void CaptureRuntimeIdentity()
+    {
+        var session = HookHelper.CurrentRuntimeSession;
+        var key = HookHelper.CurrentRuntimeKey;
+        if (session == null || !key.IsValid)
+            return;
+        _runtimeSession = session;
+        _runtimeKey = key;
+    }
+
+    private void ObserveManagedActivation()
+    {
+        var session = PcCompatRuntime.GetManagedSession(Id);
+        if (ReferenceEquals(session, _observedManagedSession))
+            return;
+        StopObservingManagedActivation();
+        if (session == null)
+            return;
+        _observedManagedSession = session;
+        session.RegisterActivationCompletedObserver(OnManagedActivationCompleted);
+        session.RegisterConfigurationPollObserver(OnManagedConfigurationPoll);
+    }
+
+    private void StopObservingManagedActivation()
+    {
+        var session = _observedManagedSession;
+        _observedManagedSession = null;
+        _providerSequenceWatcher.Clear();
+        _keyViewerRepublicationStatus = null;
+        if (session != null)
+        {
+            session.UnregisterActivationCompletedObserver(OnManagedActivationCompleted);
+            session.UnregisterConfigurationPollObserver(OnManagedConfigurationPoll);
+        }
+    }
+
+    /// <summary>
+    /// Re-reads the BindingProviders backing the live lowered plans and republishes when one of them
+    /// no longer matches what its plan was built from.
+    /// </summary>
+    /// <remarks>
+    /// A lowered plan is a snapshot of configuration the MOD keeps owning and keeps changing - the
+    /// audited key viewer resolves its key array from a settings field and its own menu both switches
+    /// the layout and rebinds individual keys. Without this, the snapshot and the MOD diverge on the
+    /// first such change: touch lanes publish identities the MOD no longer queries and the MOD queries
+    /// identities nobody publishes, so input silently stops arriving and stays that way until the MOD
+    /// is reloaded.
+    /// </remarks>
+    private void OnManagedConfigurationPoll(PcCompatManagedModSession session)
+    {
+        if (!ReferenceEquals(session, _observedManagedSession) ||
+            !_providerSequenceWatcher.IsWatching ||
+            !_providerSequenceWatcher.ShouldPoll(Environment.TickCount64))
+        {
+            return;
+        }
+        if (!_providerSequenceWatcher.TryDetectChange(
+                ResolveManagedProviderSequence,
+                out var reason))
+        {
+            return;
+        }
+
+        Logger.Info(
+            nameof(PcCompatModPlugin),
+            $"keyviewer provider configuration changed mod={Id} " +
+            $"resourceGeneration={session.ResourceSessionGeneration}; {reason}");
+        _keyViewerRepublicationStatus = reason;
+        RefreshKeyViewerPreviewRegistration();
+    }
+
+    private (bool Success, int[] Values, string? Error) ResolveManagedProviderSequence(
+        PcCompatKeyViewerRoleOverride role,
+        int requiredCount)
+        => PcCompatRuntime.TryResolveManagedIntSequence(
+            Id,
+            role,
+            requiredCount,
+            out var values,
+            out var error)
+            ? (true, values, null)
+            : (false, Array.Empty<int>(), error);
+
+    private void OnManagedActivationCompleted(PcCompatManagedModSession session)
+    {
+        if (!ReferenceEquals(session, _observedManagedSession) ||
+            session.ResourceSessionGeneration <= 0 ||
+            _adapterActivationGeneration == session.ResourceSessionGeneration)
+        {
+            return;
+        }
+        _adapterActivationGeneration = session.ResourceSessionGeneration;
+        // A new generation reloaded the MOD's own configuration, so fingerprints taken against the
+        // previous one carry no information about it - and neither does the reason text from it.
+        _providerSequenceWatcher.Clear();
+        _keyViewerRepublicationStatus = null;
+        RefreshRuntimeAdapters();
+        Logger.Info(
+            nameof(PcCompatModPlugin),
+            $"managed activation adapters refreshed mod={Id} " +
+            $"resourceGeneration={session.ResourceSessionGeneration}");
     }
 
     public void OnGui()
@@ -764,7 +934,7 @@ public sealed class PcCompatModPlugin :
                 StringComparison.Ordinal));
         if (feature?.ConsumerActive != true)
         {
-            var reason = feature?.ConsumerReason ?? _keyViewerLoweringStatus ??
+            var reason = _keyViewerLoweringStatus ?? feature?.ConsumerReason ??
                 L10n.Get("PcCompat_KeyViewerStatusNotApplied");
             ImGui.PushTextWrapPos();
             ImGui.TextColored(
@@ -891,8 +1061,10 @@ public sealed class PcCompatModPlugin :
 
     private void RefreshKeyViewerAdapter()
     {
-        var path = PcCompatRuntime.GetManagedAssemblyBundle(Id)?.KeyViewerAdapterPath;
-        if (string.Equals(path, _keyViewerAdapterPath, StringComparison.Ordinal))
+        var bundle = PcCompatRuntime.GetManagedAssemblyBundle(Id);
+        var path = bundle?.KeyViewerAdapterPath;
+        if (string.Equals(path, _keyViewerAdapterPath, StringComparison.Ordinal) &&
+            (_keyViewerAdapter != null || bundle == null))
             return;
 
         _keyViewerAdapterPath = path;
@@ -901,7 +1073,17 @@ public sealed class PcCompatModPlugin :
         _keyViewerOverridesPath = null;
         _keyViewerOverridesStatus = null;
         if (string.IsNullOrWhiteSpace(path))
+        {
+            var scanIssue = DescribeKeyViewerScanIssues(bundle?.KeyViewerScanIssuesPath);
+            _keyViewerAdapterError = scanIssue == "none"
+                ? "KeyViewer behavior scan produced no adapter candidate."
+                : scanIssue;
+            RecordKeyViewerAdapterState(
+                $"stage=adapter outcome=missing cache={bundle?.CacheKey ?? "none"} " +
+                $"issues={scanIssue}",
+                warning: false);
             return;
+        }
         try
         {
             var document = PcCompatKeyViewerAdapterDocument.FromJson(File.ReadAllText(path));
@@ -911,10 +1093,16 @@ public sealed class PcCompatModPlugin :
             if (!validation.IsValid)
                 throw new InvalidDataException(string.Join("; ", validation.Errors));
             _keyViewerAdapter = document;
+            RecordKeyViewerAdapterState(
+                $"stage=adapter outcome=ready path={path} features={document.Features.Count}",
+                warning: false);
         }
         catch (Exception exception) when (exception is IOException or InvalidDataException or System.Text.Json.JsonException)
         {
             _keyViewerAdapterError = $"{exception.GetType().Name}: {exception.Message}";
+            RecordKeyViewerAdapterState(
+                $"stage=adapter outcome=failed path={path} error={_keyViewerAdapterError}",
+                warning: true);
         }
     }
 
@@ -938,6 +1126,9 @@ public sealed class PcCompatModPlugin :
         if (!string.IsNullOrWhiteSpace(loadError))
         {
             _keyViewerOverridesError = loadError;
+            RecordKeyViewerAdapterState(
+                $"stage=override outcome=load-failed path={path} error={loadError}",
+                warning: true);
             return;
         }
         if (document == null)
@@ -959,21 +1150,98 @@ public sealed class PcCompatModPlugin :
                     "PcCompat_KeyViewerOverrideSaveFailed",
                     exception.Message);
             }
+            RecordKeyViewerAdapterState(
+                $"stage=override outcome=recommended path={path} " +
+                $"enabled={recommended.Features.Count(feature => feature.Enabled)} " +
+                $"saveError={_keyViewerOverridesError ?? "none"}",
+                warning: _keyViewerOverridesError != null);
             return;
         }
 
         var validation = PcCompatKeyViewerOverrideStore.Validate(document, _keyViewerAdapter);
         if (!validation.IsValid)
         {
+            if (PcCompatKeyViewerOverrideStore.TryRebase(
+                    document,
+                    _keyViewerAdapter,
+                    out var rebased,
+                    out var rebaseSummary))
+            {
+                _keyViewerOverrides = rebased;
+                try
+                {
+                    PcCompatKeyViewerOverrideStore.Save(_manifest.FolderPath, rebased!);
+                    _keyViewerOverridesStatus = L10n.Get(
+                        "PcCompat_KeyViewerRecommendedApplied");
+                }
+                catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+                {
+                    _keyViewerOverridesError = L10n.Get(
+                        "PcCompat_KeyViewerOverrideSaveFailed",
+                        exception.Message);
+                }
+                RecordKeyViewerAdapterState(
+                    $"stage=override outcome=rebased path={path} {rebaseSummary} " +
+                    $"saveError={_keyViewerOverridesError ?? "none"}",
+                    warning: true);
+                return;
+            }
             PcCompatKeyViewerLabelProjectionRuntime.Unregister(Id);
             PcCompatKeyViewerPreviewRuntime.Unregister(Id);
             PcCompatKeyViewerFallbackRuntime.Unregister(Id);
             _keyViewerOverridesError = L10n.Get(
                 "PcCompat_KeyViewerOverrideStale",
                 string.Join("; ", validation.Errors.Take(3)));
+            RecordKeyViewerAdapterState(
+                $"stage=override outcome=stale-rejected path={path} " +
+                $"validation={string.Join("; ", validation.Errors.Take(3))} " +
+                $"rebase={rebaseSummary}",
+                warning: true);
             return;
         }
         _keyViewerOverrides = document;
+        RecordKeyViewerAdapterState(
+            $"stage=override outcome=ready path={path} features={document.Features.Count}",
+            warning: false);
+    }
+
+    private void RecordKeyViewerAdapterState(string state, bool warning)
+    {
+        if (string.Equals(state, _keyViewerAdapterDiagnosticState, StringComparison.Ordinal))
+            return;
+        _keyViewerAdapterDiagnosticState = state;
+        var message = $"keyviewer adapter state mod={Id} {state}";
+        if (warning)
+            Logger.Warn(nameof(PcCompatModPlugin), message);
+        else
+            Logger.Info(nameof(PcCompatModPlugin), message);
+    }
+
+    private static string DescribeKeyViewerScanIssues(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+            return "none";
+        try
+        {
+            using var document = JsonDocument.Parse(File.ReadAllText(path));
+            if (document.RootElement.ValueKind != JsonValueKind.Array ||
+                document.RootElement.GetArrayLength() == 0)
+            {
+                return "none";
+            }
+            var first = document.RootElement[0];
+            var code = first.TryGetProperty("code", out var codeElement)
+                ? codeElement.GetString() ?? "unknown"
+                : "unknown";
+            var message = first.TryGetProperty("message", out var messageElement)
+                ? messageElement.GetString() ?? "unknown"
+                : "unknown";
+            return $"{code}: {message.Replace('\r', ' ').Replace('\n', ' ')}";
+        }
+        catch (Exception exception) when (exception is IOException or JsonException)
+        {
+            return $"{exception.GetType().Name}: {exception.Message}";
+        }
     }
 
     private void RenderKeyViewerManualControls(PcCompatKeyViewerFeatureAdapter feature)
@@ -1389,7 +1657,7 @@ public sealed class PcCompatModPlugin :
     private void RenderMobileDataStatus()
     {
         var game = PcCompatReversePatchBridge.Snapshot();
-        var overlay = PcCompatOverlayRuntime.Snapshot();
+        var overlay = PcCompatOverlayRuntime.Snapshot(Id);
         var hasAccuracy = TryGetAccuracy(overlay, game, out var percentAcc, out var percentXAcc);
 
         ImGui.Spacing();
@@ -1573,14 +1841,37 @@ public sealed class PcCompatModPlugin :
             var resourceSummary = PcCompatResourceRecipeRuntime.GetReadinessSummary(Id);
             var resourceReady = resourceSummary.ReadyCandidateCount;
             var resourceTotal = resourcePlan?.Candidates.Count ?? 0;
+            var virtualGeneration = managedSession?.ResourceSessionGeneration ??
+                                    (PcCompatResourceRecipeRuntime.TryGetSessionGeneration(
+                                        Id,
+                                        out var recipeGeneration)
+                                        ? recipeGeneration
+                                        : 0);
+            var virtualReadiness = virtualGeneration > 0
+                ? PcCompatVirtualBundleRegistry.GetSessionReadiness(Id, virtualGeneration)
+                : null;
             RenderMetricRow(
                 "Resource groups",
                 resourcePlan?.FeatureGroups.Count.ToString() ?? "-",
-                "Resource candidates",
+                "Raw bundle candidates",
                 resourcePlan == null
                     ? "-"
-                    : $"ready={resourceReady} controlled={resourceSummary.ControlledCandidateCount}/{resourceTotal}",
-                secondValueColor: resourcePlan != null && resourceReady == 0 ? WarningColor : null);
+                    : $"ready={resourceReady} controlled={resourceSummary.ControlledCandidateCount}/{resourceTotal}");
+
+            RenderMetricRow(
+                "VirtualBundle",
+                virtualReadiness == null || !virtualReadiness.SessionPresent
+                    ? "-"
+                    : virtualReadiness.IsReady ? "ready" : "pending",
+                "Required assets",
+                virtualReadiness == null || !virtualReadiness.SessionPresent
+                    ? "-"
+                    : $"ready={virtualReadiness.RequiredReadyCount}/" +
+                      $"{virtualReadiness.RequiredAssetCount} " +
+                      $"pending={virtualReadiness.RequiredPendingCount} " +
+                      $"unsupported={virtualReadiness.RequiredUnsupportedCount} " +
+                      $"failed={virtualReadiness.RequiredFailedCount}",
+                secondValueColor: virtualReadiness is { IsReady: false } ? WarningColor : null);
 
             RenderMetricRow(
                 "Managed lifecycle",
@@ -1609,6 +1900,15 @@ public sealed class PcCompatModPlugin :
         }
         var resourceSession = PcCompatResourceRecipeRuntime.GetPlan(Id);
         var resourceReadiness = PcCompatResourceRecipeRuntime.GetReadinessSummary(Id);
+        var virtualResourceGeneration = managedSession?.ResourceSessionGeneration ??
+                                        (PcCompatResourceRecipeRuntime.TryGetSessionGeneration(
+                                            Id,
+                                            out var loadedRecipeGeneration)
+                                            ? loadedRecipeGeneration
+                                            : 0);
+        var virtualResourceReadiness = virtualResourceGeneration > 0
+            ? PcCompatVirtualBundleRegistry.GetSessionReadiness(Id, virtualResourceGeneration)
+            : null;
         var localResourceRecipePath = Path.Combine(_manifest.FolderPath, ".pccompat", "resource_recipe.bin");
         if (resourceSession == null)
         {
@@ -1642,13 +1942,25 @@ public sealed class PcCompatModPlugin :
                 $"compatibility={resourceSession.Compatibility} " +
                 $"groups={resourceSession.FeatureGroups.Count} " +
                 $"candidates={resourceSession.Candidates.Count} " +
-                $"ready={resourceReadiness.ReadyCandidateCount} " +
-                $"controlled={resourceReadiness.ControlledCandidateCount} " +
+                $"rawReady={resourceReadiness.ReadyCandidateCount} " +
+                $"rawControlled={resourceReadiness.ControlledCandidateCount} " +
                 $"queued={resourceReadiness.QueuedCandidateCount} " +
                 $"loaded={resourceReadiness.LoadedCandidateCount} " +
                 $"loadEnabled={resourceReadiness.RuntimeLoadEnabled} " +
                 $"sink={resourceReadiness.LoadSinkRegistered} " +
                 $"compiledResources={(string.IsNullOrWhiteSpace(resourceSession.CompiledResourcesDirectory) ? "none" : "yes")}");
+            if (virtualResourceReadiness is { SessionPresent: true })
+            {
+                ImGui.TextDisabled(
+                    $"virtualBundle={(virtualResourceReadiness.IsReady ? "ready" : "pending")} " +
+                    $"required={virtualResourceReadiness.RequiredReadyCount}/" +
+                    $"{virtualResourceReadiness.RequiredAssetCount} " +
+                    $"pending={virtualResourceReadiness.RequiredPendingCount} " +
+                    $"unsupported={virtualResourceReadiness.RequiredUnsupportedCount} " +
+                    $"failed={virtualResourceReadiness.RequiredFailedCount} " +
+                    $"optional={virtualResourceReadiness.OptionalReadyCount}/" +
+                    $"{virtualResourceReadiness.OptionalAssetCount}");
+            }
             if (!resourceReadiness.RuntimeLoadEnabled)
             {
                 ImGui.TextDisabled(
@@ -2067,6 +2379,20 @@ public sealed class PcCompatModPlugin :
         builder.AppendLine($"entry={_manifest.EntryAssemblyPath}");
         builder.AppendLine();
 
+        builder.AppendLine("[ownedResources]");
+        if (_runtimeSession != null && _runtimeKey.IsValid)
+        {
+            builder.AppendLine(ModOwnedResourceRegistry.CreateAuditSnapshot(
+                    new[] { _runtimeSession.Snapshot() },
+                    _runtimeKey)
+                .ToDiagnosticText(includeResources: true));
+        }
+        else
+        {
+            builder.AppendLine("unavailable: runtime generation is not bound");
+        }
+        builder.AppendLine();
+
         builder.AppendLine("[managed]");
         builder.AppendLine($"staticPatches={scan?.ActivePatches.Count ?? 0}/{scan?.Patches.Count ?? 0}");
         builder.AppendLine($"scanIssues={scan?.Issues.Count ?? 0}");
@@ -2087,6 +2413,44 @@ public sealed class PcCompatModPlugin :
         builder.AppendLine($"rewriteReport={managedBundle?.ReportPath ?? "none"}");
         builder.AppendLine($"keyViewerAdapter={managedBundle?.KeyViewerAdapterPath ?? "none"}");
         builder.AppendLine($"keyViewerAdapterIssues={managedBundle?.KeyViewerScanIssuesPath ?? "none"}");
+        var diagnosticResourceGeneration = managedSession?.ResourceSessionGeneration ??
+                                           (PcCompatResourceRecipeRuntime.TryGetSessionGeneration(
+                                               Id,
+                                               out var diagnosticRecipeGeneration)
+                                               ? diagnosticRecipeGeneration
+                                               : 0);
+        if (diagnosticResourceGeneration > 0)
+        {
+            var virtualReadiness = PcCompatVirtualBundleRegistry.GetSessionReadiness(
+                Id,
+                diagnosticResourceGeneration);
+            builder.AppendLine(
+                $"virtualBundleReadiness=present={virtualReadiness.SessionPresent} " +
+                $"ready={virtualReadiness.IsReady} " +
+                $"required={virtualReadiness.RequiredReadyCount}/" +
+                $"{virtualReadiness.RequiredAssetCount} " +
+                $"pending={virtualReadiness.RequiredPendingCount} " +
+                $"unsupported={virtualReadiness.RequiredUnsupportedCount} " +
+                $"failed={virtualReadiness.RequiredFailedCount} " +
+                $"optional={virtualReadiness.OptionalReadyCount}/" +
+                $"{virtualReadiness.OptionalAssetCount} " +
+                $"error={FirstStatusLine(virtualReadiness.LastError)}");
+        }
+        if (managedSession != null || managedBundle != null)
+        {
+            // Stage-4 unified lease audit: one line answers "does any backend still hold
+            // objects for this session", instead of cross-referencing four export sections.
+            var leaseGeneration = managedSession?.ResourceSessionGeneration
+                ?? (PcCompatResourceRecipeRuntime.TryGetSessionGeneration(Id, out var recipeGeneration)
+                    ? recipeGeneration
+                    : 0);
+            var leaseAudit = PcCompatUnityObjectLeaseAudit.Snapshot(Id, leaseGeneration);
+            builder.AppendLine(
+                $"unityLease=hostObjects={leaseAudit.OwnedHostGameObjects} " +
+                $"virtualBundle={leaseAudit.VirtualBundleSessionPresent} " +
+                $"resourceChanger={leaseAudit.ResourceChangerContributionPresent} " +
+                $"hudSurfaces={leaseAudit.HudSurfaces}");
+        }
         builder.AppendLine($"managedSessionLoaded={managedSession != null}");
         builder.AppendLine($"managedUsesRewrittenAssembly={managedSession?.UsesRewrittenAssembly ?? false}");
         builder.AppendLine($"managedActivationPending={managedSession?.ActivationPending ?? false}");
@@ -2577,7 +2941,7 @@ public sealed class PcCompatModPlugin :
         if (!_supportsStandardUnityHud)
             return;
 
-        if (PcCompatUnityHudRuntime.RendererAvailable)
+        if (PcCompatUnityHudRuntime.RendererAvailableFor(Id))
             return;
 
         if (!_mobileSettings.ShowHud)
@@ -2591,7 +2955,7 @@ public sealed class PcCompatModPlugin :
         }
         else
         {
-            overlay = PcCompatOverlayRuntime.Snapshot();
+            overlay = PcCompatOverlayRuntime.Snapshot(Id);
         }
 
         if (!overlay.ProviderAvailable || !overlay.Visible)
@@ -2807,7 +3171,7 @@ public sealed class PcCompatModPlugin :
             return false;
         }
 
-        var overlay = PcCompatOverlayRuntime.Snapshot();
+        var overlay = PcCompatOverlayRuntime.Snapshot(Id);
         _playStatsSnapshot = _playStats.Update(overlay);
         // Managed self-render owns every MOD visual while claimed; report the
         // compatibility HUD as hidden so only the MOD's own objects remain.
@@ -2983,18 +3347,63 @@ public sealed class PcCompatModPlugin :
 
         if (_supportsStandardUnityHud && !_unityHudRegistered)
         {
-            PcCompatUnityHudRuntime.RegisterSource(this);
-            _unityHudRegistered = true;
+            var sessionGeneration = PcCompatRuntime.GetManagedSession(Id)?.ResourceSessionGeneration ?? 0;
+            if (TryRegisterOwnedHudSource())
+            {
+                try
+                {
+                    PcCompatUnityHudRuntime.RegisterSource(Id, sessionGeneration, this);
+                    _unityHudRegistered = true;
+                }
+                catch
+                {
+                    RetireOwnedHudSource();
+                    throw;
+                }
+            }
+            else
+            {
+                PcCompatUnityHudRuntime.MarkSourceRendererFailed(Id);
+                Logger.Warn(
+                    nameof(PcCompatModPlugin),
+                    $"Unity HUD ownership registration rejected mod={Id} " +
+                    $"generation={_runtimeKey.Generation}; ImGui fallback retained");
+            }
         }
         else if (!_supportsStandardUnityHud && _unityHudRegistered)
         {
             PcCompatUnityHudRuntime.UnregisterSource(this);
             _unityHudRegistered = false;
+            RetireOwnedHudSource();
         }
 
         RefreshKeyViewerAdapter();
         RefreshKeyViewerOverrides();
         RefreshKeyViewerPreviewRegistration();
+    }
+
+    private string OwnedHudIdentity
+        => $"source=0x{System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(this):X};";
+
+    private bool TryRegisterOwnedHudSource()
+    {
+        if (_runtimeSession == null || !_runtimeKey.IsValid)
+            return true;
+        return _runtimeSession.CanRegisterOwnedResource(_runtimeKey) &&
+               ModOwnedResourceRegistry.TryRegister(
+                   _runtimeKey,
+                   ModOwnedResourceKind.Hud,
+                   OwnedHudIdentity);
+    }
+
+    private void RetireOwnedHudSource()
+    {
+        if (!_runtimeKey.IsValid)
+            return;
+        ModOwnedResourceRegistry.RetireMatching(
+            _runtimeKey,
+            ModOwnedResourceKind.Hud,
+            OwnedHudIdentity);
     }
 
     private void RefreshKeyViewerPreviewRegistration()
@@ -3004,23 +3413,30 @@ public sealed class PcCompatModPlugin :
         PcCompatKeyViewerLoweredConsumerPlanRegistry.Remove(Id);
         if (_keyViewerAdapter == null || _keyViewerOverrides == null)
         {
+            RecordKeyViewerAdapterState(
+                $"stage=registration outcome=blocked adapter={(_keyViewerAdapter == null ? "missing" : "ready")} " +
+                $"adapterError={_keyViewerAdapterError ?? "none"} " +
+                $"override={(_keyViewerOverrides == null ? "missing" : "ready")} " +
+                $"overrideError={_keyViewerOverridesError ?? "none"}",
+                warning: _keyViewerAdapterError != null || _keyViewerOverridesError != null);
             PcCompatKeyViewerLabelProjectionRuntime.Unregister(Id);
             PcCompatKeyViewerPreviewRuntime.Unregister(Id);
             PcCompatKeyViewerFallbackRuntime.Unregister(Id);
+            _providerSequenceWatcher.Clear();
             return;
         }
 
         var lowering = PcCompatKeyViewerBindingPlanLowerer.Lower(
             _keyViewerAdapter,
             _keyViewerOverrides,
-            role => PcCompatRuntime.TryResolveManagedIntSequence(
-                Id,
-                role,
-                out var values,
-                out var error)
-                ? (true, values, null)
-                : (false, Array.Empty<int>(), error));
+            ResolveManagedProviderSequence);
+        // Baseline before registering: the lowerer already called every provider, and this is the
+        // value the plans about to be registered were actually built from. A lowering that resolved
+        // nothing leaves the previous baseline in place so the change that restores it is still
+        // observable.
+        _providerSequenceWatcher.SetBaseline(lowering.ResolvedProviders);
         var loweringIssues = new List<string>(lowering.Issues);
+        var registeredPlanCount = 0;
         foreach (var plan in lowering.Plans)
         {
             if (!PcCompatKeyViewerLoweredConsumerPlanRegistry.Register(
@@ -3032,6 +3448,7 @@ public sealed class PcCompatModPlugin :
                 loweringIssues.Add($"feature '{plan.FeatureId}': {planError}");
                 continue;
             }
+            registeredPlanCount++;
         }
         loweringIssues.AddRange(lowering.PresentationIssues);
         _keyViewerLoweringStatus = loweringIssues.Count == 0
@@ -3041,11 +3458,12 @@ public sealed class PcCompatModPlugin :
                   $"presentation plans={lowering.PresentationPlans.Count}"
             : string.Join("; ", loweringIssues.Take(3));
 
-        if (!PcCompatKeyViewerPreviewRuntime.RegisterOrUpdate(
+        var previewRegistered = PcCompatKeyViewerPreviewRuntime.RegisterOrUpdate(
                 Id,
                 _keyViewerAdapter,
                 _keyViewerOverrides,
-                out var error))
+                out var error);
+        if (!previewRegistered)
         {
             _keyViewerPreviewError = error;
             PcCompatKeyViewerLabelProjectionRuntime.Unregister(Id);
@@ -3063,7 +3481,18 @@ public sealed class PcCompatModPlugin :
                 Id,
                 _keyViewerAdapter,
                 _keyViewerOverrides,
-                lowering.PresentationPlans);
+                lowering.PresentationPlans,
+                PcCompatRuntime.GetManagedSession(Id)?.ResourceSessionGeneration ?? 0);
+        var managedSession = PcCompatRuntime.GetManagedSession(Id);
+        Logger.Info(
+            nameof(PcCompatModPlugin),
+            $"keyviewer adapter registration mod={Id} " +
+            $"resourceGeneration={managedSession?.ResourceSessionGeneration ?? 0} " +
+            $"activationReady={managedSession?.EnableCompleted == true} " +
+            $"features={_keyViewerAdapter.Features.Count} loweringPlans={lowering.Plans.Count} " +
+            $"registeredPlans={registeredPlanCount} loweringIssues={loweringIssues.Count} " +
+            $"previewRegistered={previewRegistered} " +
+            $"loweringStatus={FirstStatusLine(_keyViewerLoweringStatus)}");
     }
 
     private void RenderKeyViewerPreviewStatus()
@@ -3083,6 +3512,14 @@ public sealed class PcCompatModPlugin :
         {
             ImGui.PushTextWrapPos();
             ImGui.TextDisabled(_keyViewerLoweringStatus);
+            ImGui.PopTextWrapPos();
+        }
+        // Shown because a republication is otherwise invisible: the plan silently becomes a
+        // different one, and this is the only place that says which provider moved and to what.
+        if (!string.IsNullOrWhiteSpace(_keyViewerRepublicationStatus))
+        {
+            ImGui.PushTextWrapPos();
+            ImGui.TextDisabled(_keyViewerRepublicationStatus);
             ImGui.PopTextWrapPos();
         }
         var labelProjectionError = PcCompatKeyViewerLabelProjectionRuntime.GetLastError(Id);

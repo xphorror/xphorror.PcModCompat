@@ -16,6 +16,7 @@ public sealed class PcCompatVirtualBundleRegistryTests
         File.WriteAllText(Path.Combine(_root, "resource_ir.bin"), "test");
         PcCompatVirtualBundleRegistry.RegisterAssetReleaseSink(null);
         PcCompatVirtualBundleRegistry.RemoveMod("virtual.test");
+        PcCompatVirtualBundleRegistry.RemoveMod("virtual.foreign");
         PcCompatVirtualBundleRegistry.RegisterAssetResolver(null);
         PcCompatVirtualBundleRegistry.RegisterAssetProjectionResolver(null);
         PcCompatVirtualBundleRegistry.RegisterAssetLivenessProbe(null);
@@ -26,6 +27,7 @@ public sealed class PcCompatVirtualBundleRegistryTests
     public void TearDown()
     {
         PcCompatVirtualBundleRegistry.RemoveMod("virtual.test");
+        PcCompatVirtualBundleRegistry.RemoveMod("virtual.foreign");
         PcCompatVirtualBundleRegistry.RegisterAssetResolver(null);
         PcCompatVirtualBundleRegistry.RegisterAssetProjectionResolver(null);
         PcCompatVirtualBundleRegistry.RegisterAssetLivenessProbe(null);
@@ -66,6 +68,191 @@ public sealed class PcCompatVirtualBundleRegistryTests
         Assert.That(
             () => PcCompatVirtualBundleRegistry.LoadAllAssets(handle),
             Throws.InvalidOperationException.With.Message.Contains("stale"));
+    }
+
+    [Test]
+    public void SessionReadinessSeparatesReadyRequiredAssetsFromUnsupportedOptionalMetadata()
+    {
+        var proxy = new object();
+        PcCompatVirtualBundleRegistry.RegisterAssetResolver(request =>
+            request.Asset.RequiredByMod
+                ? new PcCompatVirtualAssetResolveResult(PcCompatVirtualAssetResolveStatus.Ready, proxy)
+                : new PcCompatVirtualAssetResolveResult(PcCompatVirtualAssetResolveStatus.Unsupported, null));
+        PcCompatVirtualBundleRegistry.RegisterSession(
+            "virtual.test",
+            31,
+            _root,
+            Path.Combine(_root, "resource_ir.bin"),
+            CreateDocument(PcCompatResourceIrMaterializationKind.CapabilityReference));
+
+        Assert.That(
+            PcCompatVirtualBundleRegistry.TryPrepareRequiredAssets("virtual.test", 31, out var pending),
+            Is.True);
+        var readiness = PcCompatVirtualBundleRegistry.GetSessionReadiness("virtual.test", 31);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(pending, Is.Null);
+            Assert.That(readiness.SessionPresent, Is.True);
+            Assert.That(readiness.IsReady, Is.True);
+            Assert.That(readiness.RequiredAssetCount, Is.EqualTo(1));
+            Assert.That(readiness.RequiredReadyCount, Is.EqualTo(1));
+            Assert.That(readiness.RequiredPendingCount, Is.Zero);
+            Assert.That(readiness.RequiredUnsupportedCount, Is.Zero);
+            Assert.That(readiness.RequiredFailedCount, Is.Zero);
+            Assert.That(readiness.OptionalAssetCount, Is.EqualTo(1));
+            Assert.That(readiness.OptionalPendingCount, Is.Zero);
+            Assert.That(readiness.OptionalUnsupportedCount, Is.EqualTo(1));
+            Assert.That(readiness.LastError, Is.Null);
+        });
+    }
+
+    [Test]
+    public void SessionReadinessReportsUnsupportedRequiredMaterializationBeforeResolution()
+    {
+        PcCompatVirtualBundleRegistry.RegisterSession(
+            "virtual.test",
+            32,
+            _root,
+            Path.Combine(_root, "resource_ir.bin"),
+            CreateDocument(PcCompatResourceIrMaterializationKind.MetadataOnly));
+
+        var readiness = PcCompatVirtualBundleRegistry.GetSessionReadiness("virtual.test", 32);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(readiness.SessionPresent, Is.True);
+            Assert.That(readiness.IsReady, Is.False);
+            Assert.That(readiness.RequiredAssetCount, Is.EqualTo(1));
+            Assert.That(readiness.RequiredUnsupportedCount, Is.EqualTo(1));
+            Assert.That(readiness.RequiredPendingCount, Is.Zero);
+            Assert.That(readiness.LastError, Does.Contain("Required"));
+        });
+    }
+
+    [Test]
+    public void UnloadFalseInvalidatesOnlyTheHandleAndDefersOwnedAssetReleaseToSessionTeardown()
+    {
+        var proxy = new object();
+        var resolverCalls = 0;
+        var releases = new List<PcCompatVirtualAssetReleaseBatch>();
+        PcCompatVirtualBundleRegistry.RegisterAssetResolver(_ =>
+        {
+            resolverCalls++;
+            return new PcCompatVirtualAssetResolveResult(
+                PcCompatVirtualAssetResolveStatus.Ready,
+                proxy,
+                ReleaseWithSession: true);
+        });
+        PcCompatVirtualBundleRegistry.RegisterAssetReleaseSink(releases.Add);
+        PcCompatVirtualBundleRegistry.RegisterSession(
+            "virtual.test",
+            29,
+            _root,
+            Path.Combine(_root, "resource_ir.bin"),
+            CreateDocument(PcCompatResourceIrMaterializationKind.CapabilityReference));
+        var first = PcCompatVirtualBundleRegistry.Acquire("virtual.test", 29, "Linux/bundle");
+        Assert.That(PcCompatVirtualBundleRegistry.LoadAsset(first, "Required"), Is.SameAs(proxy));
+
+        PcCompatVirtualBundleRegistry.Release(first, unloadAllLoadedObjects: false);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(
+                () => PcCompatVirtualBundleRegistry.LoadAsset(first, "Required"),
+                Throws.InvalidOperationException.With.Message.Contains("stale"));
+            Assert.That(releases, Is.Empty);
+            Assert.That(PcCompatVirtualBundleRegistry.GetSnapshot().ReadyAssetCount, Is.EqualTo(1));
+            Assert.That(PcCompatVirtualBundleRegistry.GetSnapshot().ReleaseLeaseCount, Is.EqualTo(1));
+        });
+
+        var second = PcCompatVirtualBundleRegistry.Acquire("virtual.test", 29, "Linux/bundle");
+        Assert.That(PcCompatVirtualBundleRegistry.LoadAsset(second, "Required"), Is.SameAs(proxy));
+        Assert.That(resolverCalls, Is.EqualTo(1));
+
+        PcCompatVirtualBundleRegistry.RemoveMod("virtual.test");
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(releases, Has.Count.EqualTo(1));
+            Assert.That(releases[0].Assets, Is.EqualTo(new[] { proxy }));
+            Assert.That(PcCompatVirtualBundleRegistry.GetSnapshot().ReleaseLeaseCount, Is.Zero);
+        });
+    }
+
+    [Test]
+    public void UnloadTrueReleasesBundleAssetsInDependencyOrderAndPermitsCleanRematerialization()
+    {
+        var materialized = new Dictionary<string, List<object>>(StringComparer.Ordinal);
+        var releases = new List<PcCompatVirtualAssetReleaseBatch>();
+        PcCompatVirtualBundleRegistry.RegisterAssetResolver(request =>
+        {
+            var proxy = new object();
+            if (!materialized.TryGetValue(request.Asset.Name, out var values))
+                materialized.Add(request.Asset.Name, values = []);
+            values.Add(proxy);
+            return new PcCompatVirtualAssetResolveResult(
+                PcCompatVirtualAssetResolveStatus.Ready,
+                proxy,
+                ReleaseWithSession: true);
+        });
+        PcCompatVirtualBundleRegistry.RegisterArrayFactory((_, values) => values.ToArray());
+        PcCompatVirtualBundleRegistry.RegisterAssetReleaseSink(releases.Add);
+        PcCompatVirtualBundleRegistry.RegisterSession(
+            "virtual.test",
+            30,
+            _root,
+            Path.Combine(_root, "resource_ir.bin"),
+            CreateReleaseDocument());
+        var first = PcCompatVirtualBundleRegistry.Acquire("virtual.test", 30, "Linux/bundle");
+        PcCompatVirtualBundleRegistry.LoadAllAssets(first);
+
+        PcCompatVirtualBundleRegistry.Release(first, unloadAllLoadedObjects: true);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(releases, Has.Count.EqualTo(1));
+            Assert.That(
+                releases[0].Assets,
+                Is.EqualTo(new[]
+                {
+                    materialized["Prefab"][0],
+                    materialized["Sprite"][0],
+                    materialized["Font"][0],
+                    materialized["Texture"][0]
+                }));
+            Assert.That(PcCompatVirtualBundleRegistry.GetSnapshot().SessionCount, Is.EqualTo(1));
+            Assert.That(PcCompatVirtualBundleRegistry.GetSnapshot().ReadyAssetCount, Is.Zero);
+            Assert.That(PcCompatVirtualBundleRegistry.GetSnapshot().ReleaseLeaseCount, Is.Zero);
+            Assert.That(
+                () => PcCompatVirtualBundleRegistry.LoadAllAssets(first),
+                Throws.InvalidOperationException.With.Message.Contains("stale"));
+        });
+
+        var second = PcCompatVirtualBundleRegistry.Acquire("virtual.test", 30, "Linux/bundle");
+        PcCompatVirtualBundleRegistry.LoadAllAssets(second);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(materialized.Values, Has.All.Count.EqualTo(2));
+            Assert.That(PcCompatVirtualBundleRegistry.GetSnapshot().ReadyAssetCount, Is.EqualTo(4));
+            Assert.That(PcCompatVirtualBundleRegistry.GetSnapshot().ReleaseLeaseCount, Is.EqualTo(4));
+        });
+
+        PcCompatVirtualBundleRegistry.RemoveMod("virtual.test");
+        Assert.Multiple(() =>
+        {
+            Assert.That(releases, Has.Count.EqualTo(2));
+            Assert.That(
+                releases[1].Assets,
+                Is.EqualTo(new[]
+                {
+                    materialized["Prefab"][1],
+                    materialized["Sprite"][1],
+                    materialized["Font"][1],
+                    materialized["Texture"][1]
+                }));
+        });
     }
 
     [Test]
@@ -154,7 +341,7 @@ public sealed class PcCompatVirtualBundleRegistryTests
     public void LivenessProbeFailurePreservesSessionReleaseOwnership()
     {
         var proxy = new object();
-        IReadOnlyList<object>? released = null;
+        PcCompatVirtualAssetReleaseBatch? released = null;
         PcCompatVirtualBundleRegistry.RegisterAssetResolver(_ =>
             new PcCompatVirtualAssetResolveResult(
                 PcCompatVirtualAssetResolveStatus.Ready,
@@ -163,7 +350,7 @@ public sealed class PcCompatVirtualBundleRegistryTests
         PcCompatVirtualBundleRegistry.RegisterAssetLivenessProbe(_ =>
             throw new InvalidOperationException("probe unavailable"));
         PcCompatVirtualBundleRegistry.RegisterArrayFactory((_, values) => values.ToArray());
-        PcCompatVirtualBundleRegistry.RegisterAssetReleaseSink(values => released = values);
+        PcCompatVirtualBundleRegistry.RegisterAssetReleaseSink(batch => released = batch);
         PcCompatVirtualBundleRegistry.RegisterSession(
             "virtual.test",
             15,
@@ -177,7 +364,13 @@ public sealed class PcCompatVirtualBundleRegistryTests
             Throws.InvalidOperationException.With.Message.Contains("liveness probe failed: probe unavailable"));
 
         PcCompatVirtualBundleRegistry.RemoveMod("virtual.test");
-        Assert.That(released, Is.EqualTo(new[] { proxy }));
+        Assert.Multiple(() =>
+        {
+            Assert.That(released, Is.Not.Null);
+            Assert.That(released!.ModId, Is.EqualTo("virtual.test"));
+            Assert.That(released.SessionGeneration, Is.EqualTo(15));
+            Assert.That(released.Assets, Is.EqualTo(new[] { proxy }));
+        });
     }
 
     [Test]
@@ -284,7 +477,7 @@ public sealed class PcCompatVirtualBundleRegistryTests
         var fontClone = new object();
         var sprite = new object();
         var prefab = new object();
-        IReadOnlyList<object>? released = null;
+        PcCompatVirtualAssetReleaseBatch? released = null;
         PcCompatVirtualBundleRegistry.RegisterAssetResolver(request =>
         {
             var proxy = request.Asset.ExpectedType switch
@@ -301,7 +494,7 @@ public sealed class PcCompatVirtualBundleRegistryTests
                 ReleaseWithSession: true);
         });
         PcCompatVirtualBundleRegistry.RegisterArrayFactory((_, values) => values.ToArray());
-        PcCompatVirtualBundleRegistry.RegisterAssetReleaseSink(values => released = values);
+        PcCompatVirtualBundleRegistry.RegisterAssetReleaseSink(batch => released = batch);
         PcCompatVirtualBundleRegistry.RegisterSession(
             "virtual.test",
             11,
@@ -313,7 +506,13 @@ public sealed class PcCompatVirtualBundleRegistryTests
 
         PcCompatVirtualBundleRegistry.RemoveMod("virtual.test");
 
-        Assert.That(released, Is.EqualTo(new[] { prefab, sprite, fontClone, texture }));
+        Assert.Multiple(() =>
+        {
+            Assert.That(released, Is.Not.Null);
+            Assert.That(released!.ModId, Is.EqualTo("virtual.test"));
+            Assert.That(released.SessionGeneration, Is.EqualTo(11));
+            Assert.That(released.Assets, Is.EqualTo(new[] { prefab, sprite, fontClone, texture }));
+        });
     }
 
     [Test]
@@ -322,7 +521,7 @@ public sealed class PcCompatVirtualBundleRegistryTests
         var source = new object();
         var projection = new object();
         var projectionCalls = 0;
-        IReadOnlyList<object>? released = null;
+        PcCompatVirtualAssetReleaseBatch? released = null;
         PcCompatVirtualBundleRegistry.RegisterAssetResolver(_ =>
             new PcCompatVirtualAssetResolveResult(
                 PcCompatVirtualAssetResolveStatus.Ready,
@@ -343,7 +542,7 @@ public sealed class PcCompatVirtualBundleRegistryTests
                 projection,
                 ReleaseWithSession: true);
         });
-        PcCompatVirtualBundleRegistry.RegisterAssetReleaseSink(values => released = values);
+        PcCompatVirtualBundleRegistry.RegisterAssetReleaseSink(batch => released = batch);
         PcCompatVirtualBundleRegistry.RegisterSession(
             "virtual.test",
             12,
@@ -374,7 +573,50 @@ public sealed class PcCompatVirtualBundleRegistryTests
             Assert.That(projectionCalls, Is.EqualTo(1));
         });
         PcCompatVirtualBundleRegistry.RemoveMod("virtual.test");
-        Assert.That(released, Is.EqualTo(new[] { projection, source }));
+        Assert.That(released!.Assets, Is.EqualTo(new[] { projection, source }));
+    }
+
+    [Test]
+    public void RejectsReleaseOwnedProxySharedAcrossModSessions()
+    {
+        var sharedProxy = new object();
+        PcCompatVirtualBundleRegistry.RegisterAssetResolver(_ =>
+            new PcCompatVirtualAssetResolveResult(
+                PcCompatVirtualAssetResolveStatus.Ready,
+                sharedProxy,
+                ReleaseWithSession: true));
+        PcCompatVirtualBundleRegistry.RegisterSession(
+            "virtual.test",
+            18,
+            _root,
+            Path.Combine(_root, "resource_ir.bin"),
+            CreateDocument(
+                PcCompatResourceIrMaterializationKind.CapabilityReference));
+        var first = PcCompatVirtualBundleRegistry.Acquire("virtual.test", 18, "Linux/bundle");
+        Assert.That(
+            PcCompatVirtualBundleRegistry.LoadAsset(first, "Required"),
+            Is.SameAs(sharedProxy));
+
+        PcCompatVirtualBundleRegistry.RegisterSession(
+            "virtual.foreign",
+            19,
+            _root,
+            Path.Combine(_root, "resource_ir.bin"),
+            CreateDocument(
+                PcCompatResourceIrMaterializationKind.CapabilityReference,
+                modId: "virtual.foreign"));
+        var second = PcCompatVirtualBundleRegistry.Acquire("virtual.foreign", 19, "Linux/bundle");
+
+        var error = Assert.Throws<InvalidOperationException>(() =>
+            PcCompatVirtualBundleRegistry.LoadAsset(second, "Required"));
+        Assert.Multiple(() =>
+        {
+            Assert.That(error!.Message, Does.Contain("lease"));
+            Assert.That(error.Message, Does.Contain("virtual.test"));
+            Assert.That(error.Message, Does.Contain("generation=18"));
+            Assert.That(error.Message, Does.Contain("virtual.foreign"));
+            Assert.That(error.Message, Does.Contain("generation=19"));
+        });
     }
 
     [Test]
@@ -412,17 +654,183 @@ public sealed class PcCompatVirtualBundleRegistryTests
         });
     }
 
+    [Test]
+    public void ReleaseLeaseAllowsMultipleClaimsWithinOneSession()
+    {
+        var sharedProxy = new object();
+        PcCompatVirtualBundleRegistry.RegisterAssetResolver(_ =>
+            new PcCompatVirtualAssetResolveResult(
+                PcCompatVirtualAssetResolveStatus.Ready,
+                sharedProxy,
+                ReleaseWithSession: true));
+        PcCompatVirtualBundleRegistry.RegisterAssetProjectionResolver(_ =>
+            new PcCompatVirtualAssetResolveResult(
+                PcCompatVirtualAssetResolveStatus.Ready,
+                sharedProxy,
+                ReleaseWithSession: true));
+        PcCompatVirtualBundleRegistry.RegisterSession(
+            "virtual.test",
+            20,
+            _root,
+            Path.Combine(_root, "resource_ir.bin"),
+            CreateDocument(PcCompatResourceIrMaterializationKind.CapabilityReference));
+        var handle = PcCompatVirtualBundleRegistry.Acquire("virtual.test", 20, "Linux/bundle");
+
+        Assert.That(
+            PcCompatVirtualBundleRegistry.LoadAsset(handle, "Required"),
+            Is.SameAs(sharedProxy));
+        Assert.That(
+            PcCompatVirtualBundleRegistry.ResolvePreferredAsset(
+                "virtual.test",
+                20,
+                "UnityEngine.Font",
+                "TMPro.TMP_FontAsset").Asset,
+            Is.SameAs(sharedProxy));
+
+        var leases = PcCompatVirtualBundleRegistry.SnapshotReleaseLeases("virtual.test", 20);
+        Assert.Multiple(() =>
+        {
+            Assert.That(leases, Has.Count.EqualTo(1));
+            Assert.That(leases[0].ClaimCount, Is.EqualTo(2));
+        });
+    }
+
+    [Test]
+    public void RejectsNonOwningUseOfReleaseOwnedProxy()
+    {
+        var sharedProxy = new object();
+        PcCompatVirtualBundleRegistry.RegisterAssetResolver(request =>
+            new PcCompatVirtualAssetResolveResult(
+                PcCompatVirtualAssetResolveStatus.Ready,
+                sharedProxy,
+                ReleaseWithSession: request.ModId.Equals(
+                    "virtual.test",
+                    StringComparison.OrdinalIgnoreCase)));
+        PcCompatVirtualBundleRegistry.RegisterSession(
+            "virtual.test",
+            25,
+            _root,
+            Path.Combine(_root, "resource_ir.bin"),
+            CreateDocument(PcCompatResourceIrMaterializationKind.CapabilityReference));
+        var first = PcCompatVirtualBundleRegistry.Acquire("virtual.test", 25, "Linux/bundle");
+        Assert.That(
+            PcCompatVirtualBundleRegistry.LoadAsset(first, "Required"),
+            Is.SameAs(sharedProxy));
+
+        PcCompatVirtualBundleRegistry.RegisterSession(
+            "virtual.foreign",
+            26,
+            _root,
+            Path.Combine(_root, "resource_ir.bin"),
+            CreateDocument(
+                PcCompatResourceIrMaterializationKind.CapabilityReference,
+                modId: "virtual.foreign"));
+        var second = PcCompatVirtualBundleRegistry.Acquire("virtual.foreign", 26, "Linux/bundle");
+
+        Assert.That(
+            () => PcCompatVirtualBundleRegistry.LoadAsset(second, "Required"),
+            Throws.InvalidOperationException.With.Message.Contains("release lease collision"));
+    }
+
+    [Test]
+    public void AllowsReadOnlySharingWhenNoSessionOwnsRelease()
+    {
+        var sharedProxy = new object();
+        PcCompatVirtualBundleRegistry.RegisterAssetResolver(_ =>
+            new PcCompatVirtualAssetResolveResult(
+                PcCompatVirtualAssetResolveStatus.Ready,
+                sharedProxy));
+        PcCompatVirtualBundleRegistry.RegisterSession(
+            "virtual.test",
+            27,
+            _root,
+            Path.Combine(_root, "resource_ir.bin"),
+            CreateDocument(PcCompatResourceIrMaterializationKind.CapabilityReference));
+        PcCompatVirtualBundleRegistry.RegisterSession(
+            "virtual.foreign",
+            28,
+            _root,
+            Path.Combine(_root, "resource_ir.bin"),
+            CreateDocument(
+                PcCompatResourceIrMaterializationKind.CapabilityReference,
+                modId: "virtual.foreign"));
+        var first = PcCompatVirtualBundleRegistry.Acquire("virtual.test", 27, "Linux/bundle");
+        var second = PcCompatVirtualBundleRegistry.Acquire("virtual.foreign", 28, "Linux/bundle");
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(PcCompatVirtualBundleRegistry.LoadAsset(first, "Required"), Is.SameAs(sharedProxy));
+            Assert.That(PcCompatVirtualBundleRegistry.LoadAsset(second, "Required"), Is.SameAs(sharedProxy));
+            Assert.That(PcCompatVirtualBundleRegistry.SnapshotReleaseLeases("virtual.test", 27), Is.Empty);
+            Assert.That(PcCompatVirtualBundleRegistry.SnapshotReleaseLeases("virtual.foreign", 28), Is.Empty);
+        });
+    }
+
+    [Test]
+    public void ReleaseLeaseRemainsRetiredUntilReleaseSinkReturns()
+    {
+        var sharedProxy = new object();
+        var sinkEntered = new ManualResetEventSlim();
+        var allowSinkToReturn = new ManualResetEventSlim();
+        PcCompatVirtualBundleRegistry.RegisterAssetResolver(_ =>
+            new PcCompatVirtualAssetResolveResult(
+                PcCompatVirtualAssetResolveStatus.Ready,
+                sharedProxy,
+                ReleaseWithSession: true));
+        PcCompatVirtualBundleRegistry.RegisterAssetReleaseSink(_ =>
+        {
+            sinkEntered.Set();
+            Assert.That(allowSinkToReturn.Wait(TimeSpan.FromSeconds(5)), Is.True);
+        });
+        PcCompatVirtualBundleRegistry.RegisterSession(
+            "virtual.test",
+            21,
+            _root,
+            Path.Combine(_root, "resource_ir.bin"),
+            CreateDocument(PcCompatResourceIrMaterializationKind.CapabilityReference));
+        var first = PcCompatVirtualBundleRegistry.Acquire("virtual.test", 21, "Linux/bundle");
+        Assert.That(
+            PcCompatVirtualBundleRegistry.LoadAsset(first, "Required"),
+            Is.SameAs(sharedProxy));
+
+        var removal = Task.Run(() => PcCompatVirtualBundleRegistry.RemoveMod("virtual.test"));
+        Assert.That(sinkEntered.Wait(TimeSpan.FromSeconds(5)), Is.True);
+        try
+        {
+            PcCompatVirtualBundleRegistry.RegisterSession(
+                "virtual.foreign",
+                22,
+                _root,
+                Path.Combine(_root, "resource_ir.bin"),
+                CreateDocument(
+                    PcCompatResourceIrMaterializationKind.CapabilityReference,
+                    modId: "virtual.foreign"));
+            var second = PcCompatVirtualBundleRegistry.Acquire("virtual.foreign", 22, "Linux/bundle");
+            Assert.That(
+                () => PcCompatVirtualBundleRegistry.LoadAsset(second, "Required"),
+                Throws.InvalidOperationException.With.Message.Contains("virtual.test"));
+        }
+        finally
+        {
+            allowSinkToReturn.Set();
+        }
+        Assert.That(removal.Wait(TimeSpan.FromSeconds(5)), Is.True);
+        removal.GetAwaiter().GetResult();
+        Assert.That(PcCompatVirtualBundleRegistry.SnapshotReleaseLeases("virtual.test", 21), Is.Empty);
+    }
+
     private static PcCompatResourceIrDocument CreateDocument(
         PcCompatResourceIrMaterializationKind requiredKind,
         PcCompatResourceIrMaterializationKind optionalKind =
-            PcCompatResourceIrMaterializationKind.MetadataOnly)
+            PcCompatResourceIrMaterializationKind.MetadataOnly,
+        string modId = "virtual.test")
     {
         const string bundleId = "vb.0123456789abcdef0123456789abcdef";
         const string requiredId = "res.0123456789abcdef0123456789abcdef";
         const string optionalId = "res.fedcba9876543210fedcba9876543210";
         return new PcCompatResourceIrDocument
         {
-            ModId = "virtual.test",
+            ModId = modId,
             TargetUnityVersion = "6000.3.10f1",
             Bundles =
             [

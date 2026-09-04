@@ -19,6 +19,7 @@ internal static class ReflectionSurfaceFlowScanner
     private abstract record SymbolicValue;
     private sealed record UnknownValue : SymbolicValue;
     private sealed record StringValue(string Value) : SymbolicValue;
+    private sealed record TypedInstanceValue(ITypeDefOrRef Type) : SymbolicValue;
     private sealed record TypeHandleValue(ITypeDefOrRef Type) : SymbolicValue;
     private sealed record TypeValue(ITypeDefOrRef Type) : SymbolicValue;
 
@@ -51,6 +52,16 @@ internal static class ReflectionSurfaceFlowScanner
                     break;
                 case Code.Ldtoken when instruction.Operand is ITypeDefOrRef type:
                     stack.Add(new TypeHandleValue(type));
+                    break;
+                case Code.Ldarg:
+                case Code.Ldarg_S:
+                case Code.Ldarg_0:
+                case Code.Ldarg_1:
+                case Code.Ldarg_2:
+                case Code.Ldarg_3:
+                    stack.Add(TryGetArgumentRuntimeType(method, instruction) is { } argumentType
+                        ? new TypedInstanceValue(argumentType)
+                        : Unknown);
                     break;
                 case Code.Dup:
                     stack.Add(stack.Count == 0 ? Unknown : stack[^1]);
@@ -130,6 +141,17 @@ internal static class ReflectionSurfaceFlowScanner
             return;
         }
 
+        // Many MODs retain desktop-version compatibility by reflecting through a typed Unity
+        // object rather than typeof(T). The receiver still gives us a closed compile-time type,
+        // so it is safe to retain that exact reflected member in the proxy surface.
+        if (IsObjectGetType(target) &&
+            arguments.LastOrDefault() is TypedInstanceValue typedInstance)
+        {
+            stack.Add(new TypeValue(typedInstance.Type));
+            PushUnknown(stack, pushes - 1);
+            return;
+        }
+
         if (TryClassifyLookup(target, out var kind))
         {
             var declaringType = arguments.OfType<TypeValue>().FirstOrDefault();
@@ -150,6 +172,12 @@ internal static class ReflectionSurfaceFlowScanner
     private static bool IsTypeGetTypeFromHandle(IMethod method)
         => method.DeclaringType.FullName == "System.Type" &&
            method.Name.String == "GetTypeFromHandle";
+
+    private static bool IsObjectGetType(IMethod method)
+        => method.DeclaringType.FullName == "System.Object" &&
+           method.Name.String == "GetType" &&
+           method.MethodSig is { Params.Count: 0 } signature &&
+           signature.RetType.RemovePinnedAndModifiers().FullName == "System.Type";
 
     private static bool TryClassifyLookup(IMethod method, out ReflectedMemberKind kind)
     {
@@ -238,6 +266,32 @@ internal static class ReflectionSurfaceFlowScanner
 
         local = null!;
         return false;
+    }
+
+    private static ITypeDefOrRef? TryGetArgumentRuntimeType(MethodDef method, Instruction instruction)
+    {
+        var signature = method.MethodSig;
+        var index = instruction.GetParameterIndex();
+        if (signature is null || index < 0)
+            return null;
+
+        TypeSig? type;
+        if (signature.HasThis && index == 0)
+        {
+            type = method.DeclaringType?.ToTypeSig();
+        }
+        else
+        {
+            var parameterIndex = signature.HasThis ? index - 1 : index;
+            if (parameterIndex < 0 || parameterIndex >= signature.Params.Count)
+                return null;
+            type = signature.Params[parameterIndex];
+        }
+
+        type = type?.RemovePinnedAndModifiers();
+        while (type is ByRefSig byReference)
+            type = byReference.Next.RemovePinnedAndModifiers();
+        return type is null or GenericVar or GenericMVar ? null : type.ToTypeDefOrRef();
     }
 
     private static HashSet<Instruction> CollectFlowBoundaries(MethodDef method)

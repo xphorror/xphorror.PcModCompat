@@ -75,6 +75,18 @@ public static class PcCompatUnityMainExecutionContext
 
     public static Scope Enter()
     {
+        EnterCore();
+        return new Scope();
+    }
+
+    internal static IDisposable EnterExternalCallback()
+    {
+        EnterCore();
+        return new ExternalCallbackScope();
+    }
+
+    private static void EnterCore()
+    {
         if (t_depth == int.MaxValue)
             throw new InvalidOperationException("UnityMain execution context depth overflow.");
         if (t_depth == 0)
@@ -83,7 +95,6 @@ public static class PcCompatUnityMainExecutionContext
             SynchronizationContext.SetSynchronizationContext(UnityMainContext);
         }
         ++t_depth;
-        return new Scope();
     }
 
     internal static ManagedOwnerScope EnterManagedOwner(
@@ -174,6 +185,17 @@ public static class PcCompatUnityMainExecutionContext
         {
             if (active)
                 SynchronizationContext.SetSynchronizationContext(previous);
+        }
+    }
+
+    private sealed class ExternalCallbackScope : IDisposable
+    {
+        private int _disposed;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) == 0)
+                Leave();
         }
     }
 

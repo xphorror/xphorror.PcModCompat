@@ -6,4 +6,7 @@
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
   </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\ProxySurfaceContract\ManagedBridgeOwnedSurface.cs" Link="ManagedBridgeOwnedSurface.cs" />
+  </ItemGroup>
 </Project>

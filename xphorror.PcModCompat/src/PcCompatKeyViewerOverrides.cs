@@ -15,7 +15,8 @@ public enum PcCompatKeyViewerInputOrigin
 {
     Unavailable,
     AsyncInput,
-    OfficialActivity
+    OfficialActivity,
+    ReplayVirtual
 }
 
 public sealed class PcCompatKeyViewerRoleOverride
@@ -262,6 +263,119 @@ public static class PcCompatKeyViewerOverrideStore
         }
 
         return new PcCompatKeyViewerOverrideValidationResult { Errors = errors };
+    }
+
+    public static bool TryRebase(
+        PcCompatKeyViewerOverrideDocument stale,
+        PcCompatKeyViewerAdapterDocument adapter,
+        out PcCompatKeyViewerOverrideDocument? rebased,
+        out string summary)
+    {
+        ArgumentNullException.ThrowIfNull(stale);
+        ArgumentNullException.ThrowIfNull(adapter);
+        rebased = null;
+
+        if (!string.Equals(
+                stale.FormatVersion,
+                PcCompatKeyViewerOverrideDocument.CurrentFormatVersion,
+                StringComparison.Ordinal))
+        {
+            summary = $"unsupported override format '{stale.FormatVersion}'";
+            return false;
+        }
+        if (!string.Equals(stale.ModId, adapter.ModId, StringComparison.OrdinalIgnoreCase))
+        {
+            summary = "override belongs to another MOD";
+            return false;
+        }
+        var adapterValidation = PcCompatKeyViewerAdapterValidator.Validate(adapter);
+        if (!adapterValidation.IsValid)
+        {
+            summary = "current adapter is invalid: " +
+                      string.Join("; ", adapterValidation.Errors.Take(3));
+            return false;
+        }
+
+        var staleFeatures = stale.Features ?? [];
+        var duplicateFeature = staleFeatures
+            .GroupBy(feature => feature.FeatureId, StringComparer.Ordinal)
+            .FirstOrDefault(group => group.Count() != 1);
+        if (duplicateFeature != null)
+        {
+            summary = $"duplicate feature override '{duplicateFeature.Key}'";
+            return false;
+        }
+
+        var staleById = staleFeatures.ToDictionary(
+            feature => feature.FeatureId,
+            StringComparer.Ordinal);
+        var current = CreateRecommendedFor(adapter);
+        var retainedFeatures = 0;
+        var retainedRoles = 0;
+        var droppedRoles = staleFeatures
+            .Where(feature => !adapter.Features.Any(candidate =>
+                string.Equals(candidate.Id, feature.FeatureId, StringComparison.Ordinal)))
+            .Sum(feature => feature.Roles?.Count ?? 0);
+
+        foreach (var currentFeature in current.Features)
+        {
+            if (!staleById.TryGetValue(currentFeature.FeatureId, out var previous))
+                continue;
+            var adapterFeature = adapter.Features.Single(feature =>
+                string.Equals(feature.Id, currentFeature.FeatureId, StringComparison.Ordinal));
+            retainedFeatures++;
+            currentFeature.Enabled = previous.Enabled;
+            currentFeature.InputMode = Enum.IsDefined(previous.InputMode)
+                ? previous.InputMode
+                : PcCompatKeyViewerInputMode.Auto;
+            currentFeature.TouchLaneCount = previous.TouchLaneCount is 2 or 4 or 6 or 8 or 10
+                ? previous.TouchLaneCount
+                : currentFeature.TouchLaneCount;
+            currentFeature.CompatibleFallbackEnabled = previous.CompatibleFallbackEnabled;
+
+            var retainedRoleNames = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var role in previous.Roles ?? [])
+            {
+                var candidateStillExists = adapterFeature.Roles.Any(candidate =>
+                    string.Equals(candidate.Role, role.Role, StringComparison.Ordinal) &&
+                    string.Equals(
+                        GetCandidateKey(
+                            candidate.AssemblyName,
+                            candidate.TypeName,
+                            candidate.MemberName,
+                            candidate.MemberKind),
+                        role.CandidateKey,
+                        StringComparison.Ordinal));
+                if (!candidateStillExists || !retainedRoleNames.Add(role.Role))
+                {
+                    droppedRoles++;
+                    continue;
+                }
+                currentFeature.Roles.Add(new PcCompatKeyViewerRoleOverride
+                {
+                    Role = role.Role,
+                    AssemblyName = role.AssemblyName,
+                    TypeName = role.TypeName,
+                    MemberName = role.MemberName,
+                    MemberKind = role.MemberKind
+                });
+                retainedRoles++;
+            }
+            currentFeature.Normalize();
+        }
+
+        var validation = Validate(current, adapter);
+        if (!validation.IsValid)
+        {
+            summary = "rebased override is invalid: " +
+                      string.Join("; ", validation.Errors.Take(3));
+            return false;
+        }
+
+        rebased = current;
+        summary = $"retainedFeatures={retainedFeatures} retainedRoles={retainedRoles} " +
+                  $"droppedRoles={droppedRoles} newFeatures={current.Features.Count - retainedFeatures}";
+        return true;
     }
 
     public static string GetCandidateKey(

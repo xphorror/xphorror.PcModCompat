@@ -1,5 +1,6 @@
 using dnlib.DotNet;
 using dnlib.DotNet.Emit;
+using StArray.ModManager.Android.PcCompat;
 using Xphorror.PcModCompat;
 
 namespace StArray.ModManager.Tests;
@@ -10,6 +11,9 @@ public sealed class PcCompatManagedBridgeRewriteTests
     private string _inputPath = null!;
     private string _outputPath = null!;
     private string _reportPath = null!;
+    private string _bootstrapInputPath = null!;
+    private string _bootstrapOutputPath = null!;
+    private RewriteReport _bootstrapReport = null!;
     private string _proxyDirectory = null!;
     private string _bridgeAssemblyPath = null!;
     private IReadOnlyList<ManagedBridgeRewriteSpec> _specs = null!;
@@ -109,12 +113,302 @@ public sealed class PcCompatManagedBridgeRewriteTests
                 "AddSetting",
                 "System.Action",
                 typeof(PcCompatManagedSettingsDelegateBridge).FullName!,
-                nameof(PcCompatManagedSettingsDelegateBridge.CreateOptionalAction)));
+                nameof(PcCompatManagedSettingsDelegateBridge.CreateOptionalAction)),
+            managedWritableCollections: CreateWritableCollectionSpecs());
 
         Assert.That(_report.Issues, Is.Empty);
         Assert.That(_report.MethodIssues, Is.Empty);
         Assert.That(_report.ManagedBridgeIssues, Is.Empty);
         Assert.That(_report.OutputWritten, Is.True);
+
+        // JAMod.Bootstrap.dll is the second rewrite root (manifest EntryAssemblyPath) and the
+        // only sample assembly that touches the network (JALib's self-updater), so the network
+        // coverage is pinned against it rather than the primary DLL.
+        _bootstrapInputPath = Path.Combine(_root, "JAMod.Bootstrap.input.dll");
+        _bootstrapOutputPath = Path.Combine(_root, "JAMod.Bootstrap.rewritten.dll");
+        File.Copy(
+            Path.Combine(modDirectory, "JAMod.Bootstrap.dll"),
+            _bootstrapInputPath,
+            overwrite: true);
+        _bootstrapReport = ModAssemblyRewriteApi.Rewrite(
+            _bootstrapInputPath,
+            _bootstrapOutputPath,
+            _proxyDirectory,
+            Path.Combine(_root, "bootstrap-rewrite-report.json"),
+            managedBridgeAssemblyPath: _bridgeAssemblyPath,
+            // ReversePatch stand-ins live in the primary assembly only; production scopes
+            // those specs per assembly, and unlike call-bridge specs their zero-match is
+            // recorded as an issue instead of being silently skipped.
+            managedBridgeRewrites: [],
+            managedCallBridgeRewrites: _callSpecs,
+            managedFieldConstantRewrites: _fieldConstantSpecs,
+            managedProxyCastBridge: new ManagedProxyCastBridgeSpec(
+                typeof(PcCompatProxyCastBridge).FullName!,
+                nameof(PcCompatProxyCastBridge.IsInstance),
+                nameof(PcCompatProxyCastBridge.Cast)),
+            managedReadProgressGuard: new ManagedReadProgressGuardSpec(
+                typeof(PcCompatManagedIoBridge).FullName!,
+                nameof(PcCompatManagedIoBridge.RequireFileReadProgress),
+                nameof(PcCompatManagedIoBridge.TryReadFileExactly)),
+            managedPollingWaitRewrite: new ManagedPollingWaitRewriteSpec(
+                typeof(PcCompatManagedPollingBridge).FullName!,
+                nameof(PcCompatManagedPollingBridge.WaitForCoarseClockAdvance)),
+            managedOptionalDelegateRewrite: new ManagedOptionalDelegateRewriteSpec(
+                "JALib",
+                "JALib.Tools.SettingGUI",
+                "AddSetting",
+                "System.Action",
+                typeof(PcCompatManagedSettingsDelegateBridge).FullName!,
+                nameof(PcCompatManagedSettingsDelegateBridge.CreateOptionalAction)),
+            managedWritableCollections: CreateWritableCollectionSpecs());
+
+        Assert.That(_bootstrapReport.Issues, Is.Empty);
+        Assert.That(_bootstrapReport.MethodIssues, Is.Empty);
+        Assert.That(_bootstrapReport.ManagedBridgeIssues, Is.Empty);
+        Assert.That(_bootstrapReport.OutputWritten, Is.True);
+    }
+
+    [Test]
+    public void FilesystemEntryPointsAreRoutedThroughTheDomainPathBridge()
+    {
+        using var module = ModuleDefMD.Load(_outputPath);
+        var called = module.GetTypes()
+            .SelectMany(type => type.Methods.Where(method => method.HasBody))
+            .SelectMany(method => method.Body.Instructions)
+            .Where(instruction =>
+                instruction.OpCode.Code is Code.Call or Code.Callvirt or Code.Newobj)
+            .Select(instruction => instruction.Operand)
+            .OfType<IMethod>()
+            .ToArray();
+
+        var bridgeCalls = called
+            .Where(method =>
+                method.DeclaringType?.FullName == typeof(PcCompatManagedPathBridge).FullName)
+            .Select(method => method.Name.String)
+            .ToArray();
+
+        Assert.Multiple(() =>
+        {
+            // Guards against a silently zero-match registration: Jipper really does read and
+            // write its own settings/state files, so the bridge must be reached.
+            Assert.That(bridgeCalls, Is.Not.Empty, "file rewrite matched nothing");
+            // Real Jipper coverage, so a spec that silently stops matching is caught.
+            Assert.That(bridgeCalls, Has.Length.EqualTo(14));
+
+            // No ambient-state filesystem entry point may survive.
+            Assert.That(
+                called.Any(method =>
+                    method.DeclaringType?.FullName is "System.IO.File" or "System.IO.Directory"),
+                Is.False,
+                "raw File/Directory calls survived the rewrite");
+            Assert.That(
+                called.Any(method =>
+                    method.DeclaringType?.FullName == "System.IO.Path" &&
+                    method.Name.String is "GetFullPath" or "GetDirectoryName"),
+                Is.False,
+                "raw owner-sensitive Path helper survived the rewrite");
+            Assert.That(
+                called.Any(method =>
+                    method.DeclaringType?.FullName == "System.IO.FileStream" &&
+                    method.Name == ".ctor"),
+                Is.False,
+                "raw FileStream construction survived the rewrite");
+
+            // Pure helpers without virtual-root parent semantics stay untouched by design.
+            Assert.That(
+                called.Any(method =>
+                    method.DeclaringType?.FullName == "System.IO.Path" &&
+                    method.Name == "Combine"),
+                Is.True,
+                "Path.Combine is a pure helper and must not be rewritten");
+        });
+    }
+
+    [Test]
+    public void BootstrapNetworkConstructionsAreRoutedThroughTheSessionNetworkBridge()
+    {
+        using var module = ModuleDefMD.Load(_bootstrapOutputPath);
+        var called = module.GetTypes()
+            .SelectMany(type => type.Methods.Where(method => method.HasBody))
+            .SelectMany(method => method.Body.Instructions)
+            .Where(instruction =>
+                instruction.OpCode.Code is Code.Call or Code.Callvirt or Code.Newobj)
+            .Select(instruction => instruction.Operand)
+            .OfType<IMethod>()
+            .ToArray();
+
+        Assert.Multiple(() =>
+        {
+            // JALib's self-updater builds its HttpClient here — the only real network
+            // construction in either PcCompat sample assembly, so a silent zero-match would
+            // leave the self-update download unisolated.
+            Assert.That(
+                called.Count(method =>
+                    method.DeclaringType?.FullName == typeof(PcCompatManagedNetworkBridge).FullName &&
+                    method.Name == nameof(PcCompatManagedNetworkBridge.CreateHttpClient)),
+                Is.EqualTo(1));
+
+            Assert.That(
+                called.Any(method =>
+                    method.DeclaringType?.FullName == "System.Net.Http.HttpClient" &&
+                    method.Name == ".ctor"),
+                Is.False,
+                "raw HttpClient construction survived the rewrite");
+
+            // Operations on the bound client inherit its session identity by design and stay
+            // untouched — same reasoning that leaves Path.Combine alone.
+            Assert.That(
+                called.Any(method =>
+                    method.DeclaringType?.FullName == "System.Net.Http.HttpClient" &&
+                    (method.Name == "GetAsync" || method.Name == "get_DefaultRequestHeaders")),
+                Is.True,
+                "bound-client operations must not be rewritten");
+        });
+    }
+
+    [Test]
+    public void ExternalStaticEventSubscriptionsAreRoutedThroughTheRegistrationBridge()
+    {
+        using var module = ModuleDefMD.Load(_outputPath);
+        var instructions = module.GetTypes()
+            .SelectMany(type => type.Methods.Where(method => method.HasBody))
+            .SelectMany(method => method.Body.Instructions)
+            .ToArray();
+
+        Assert.Multiple(() =>
+        {
+            // Real Jipper subscribes SceneManager.sceneUnloaded (Main.OnEnable) and
+            // Application.quitting (KeyViewer.OnEnable); both must reach the registration
+            // bridge with their event identity embedded.
+            var subscribeCalls = instructions
+                .Where(instruction => instruction.OpCode.Code == Code.Call)
+                .Select(instruction => instruction.Operand)
+                .OfType<IMethod>()
+                .Where(method =>
+                    method.DeclaringType?.FullName ==
+                    typeof(PcCompatManagedEventSubscriptionBridge).FullName &&
+                    method.Name == nameof(PcCompatManagedEventSubscriptionBridge.Subscribe))
+                .ToArray();
+            Assert.That(subscribeCalls, Has.Length.EqualTo(2));
+            var unsubscribeCalls = instructions
+                .Where(instruction => instruction.OpCode.Code == Code.Call)
+                .Select(instruction => instruction.Operand)
+                .OfType<IMethod>()
+                .Where(method =>
+                    method.DeclaringType?.FullName ==
+                    typeof(PcCompatManagedEventSubscriptionBridge).FullName &&
+                    method.Name == nameof(PcCompatManagedEventSubscriptionBridge.Unsubscribe))
+                .ToArray();
+            Assert.That(unsubscribeCalls, Has.Length.EqualTo(2));
+
+            Assert.That(
+                instructions
+                    .Where(instruction => instruction.OpCode.Code == Code.Ldstr)
+                    .Select(instruction => instruction.Operand)
+                    .OfType<string>(),
+                Does.Contain("UnityEngine.CoreModule!UnityEngine.Application::quitting"));
+            Assert.That(
+                instructions
+                    .Where(instruction => instruction.OpCode.Code == Code.Ldstr)
+                    .Select(instruction => instruction.Operand)
+                    .OfType<string>(),
+                Does.Contain("UnityEngine.CoreModule!UnityEngine.SceneManagement.SceneManager::sceneUnloaded"));
+
+            Assert.That(
+                instructions
+                    .Where(instruction => instruction.OpCode.Code is Code.Call or Code.Callvirt)
+                    .Select(instruction => instruction.Operand)
+                    .OfType<IMethod>()
+                    .Any(method =>
+                        method.DeclaringType?.FullName is
+                            "UnityEngine.Application" or
+                            "UnityEngine.SceneManagement.SceneManager" &&
+                        method.Name!.String.StartsWith("add_", StringComparison.Ordinal)),
+                Is.False,
+                "raw static-event add_ accessor calls survived the rewrite");
+
+            Assert.That(
+                instructions
+                    .Where(instruction => instruction.OpCode.Code is Code.Call or Code.Callvirt)
+                    .Select(instruction => instruction.Operand)
+                    .OfType<IMethod>()
+                    .Count(method =>
+                        method.DeclaringType?.FullName is
+                            "UnityEngine.Application" or
+                            "UnityEngine.SceneManagement.SceneManager" &&
+                        method.Name!.String.StartsWith("remove_", StringComparison.Ordinal)),
+                Is.EqualTo(0),
+                "raw static-event remove_ accessor calls survived the rewrite");
+        });
+    }
+
+    [Test]
+    public void ModCreatedUnityObjectsAreRoutedThroughTheOwnerRegisteringBridge()
+    {
+        using var module = ModuleDefMD.Load(_outputPath);
+        var called = module.GetTypes()
+            .SelectMany(type => type.Methods.Where(method => method.HasBody))
+            .SelectMany(method => method.Body.Instructions)
+            .Where(instruction =>
+                instruction.OpCode.Code is Code.Call or Code.Callvirt or Code.Newobj)
+            .Select(instruction => instruction.Operand)
+            .OfType<IMethod>()
+            .ToArray();
+        var instantiateCalls = called
+            .Where(method =>
+                method.DeclaringType?.FullName == typeof(PcCompatManagedComponentBridge).FullName &&
+                method.Name == nameof(PcCompatManagedComponentBridge.Instantiate))
+            .ToArray();
+
+        Assert.Multiple(() =>
+        {
+            // Jipper builds 19 host GameObjects and clones 2 objects; none may reach Unity
+            // without first being registered to the owning MOD session.
+            Assert.That(
+                called.Count(method =>
+                    method.DeclaringType?.FullName == typeof(PcCompatManagedComponentBridge).FullName &&
+                    method.Name == nameof(PcCompatManagedComponentBridge.CreateGameObject)),
+                Is.EqualTo(19));
+            Assert.That(
+                instantiateCalls,
+                Has.Length.EqualTo(2));
+            Assert.That(
+                instantiateCalls.All(method => method is not MethodSpec),
+                Is.True,
+                "generic Object.Instantiate<T> must target the non-generic ownership bridge " +
+                "without retaining a MethodSpec");
+            Assert.That(
+                instantiateCalls.All(method => method.MethodSig?.GenParamCount == 0),
+                Is.True,
+                "the erased ownership bridge must remain non-generic");
+
+            Assert.That(
+                called.Any(method =>
+                    method.DeclaringType?.FullName == "UnityEngine.GameObject" &&
+                    method.Name == ".ctor"),
+                Is.False,
+                "no raw GameObject construction may survive the rewrite");
+            Assert.That(
+                called.Any(method =>
+                    method.DeclaringType?.FullName == "UnityEngine.Object" &&
+                    method.Name == "Instantiate"),
+                Is.False,
+                "no raw Object.Instantiate may survive the rewrite");
+
+            // The pre-existing component/destroy coverage must stay wired. Exact counts are not
+            // asserted here: those specs carry a GenericArgumentFilter, so the number of
+            // rewritten sites is a property of the filter rather than of this slice.
+            Assert.That(
+                called.Any(method =>
+                    method.DeclaringType?.FullName == typeof(PcCompatManagedComponentBridge).FullName &&
+                    method.Name == nameof(PcCompatManagedComponentBridge.AddComponent)),
+                Is.True);
+            Assert.That(
+                called.Any(method =>
+                    method.DeclaringType?.FullName == typeof(PcCompatManagedComponentBridge).FullName &&
+                    method.Name == nameof(PcCompatManagedComponentBridge.Destroy)),
+                Is.True);
+        });
     }
 
     [Test]
@@ -708,6 +1002,99 @@ public sealed class PcCompatManagedBridgeRewriteTests
     }
 
     [Test]
+    public void RewritesJipperListenerThreadToScopedThreadBridge()
+    {
+        using var module = ModuleDefMD.Load(_outputPath);
+        var keyViewer = module.GetTypes().Single(type =>
+            type.FullName == "JipperResourcePack.KeyViewerContents.KeyViewer");
+        var calls = keyViewer.Methods
+            .Where(method => method.HasBody)
+            .SelectMany(method => method.Body.Instructions)
+            .Where(instruction => instruction.OpCode.Code is Code.Call or Code.Callvirt or Code.Newobj)
+            .Select(instruction => (IMethod)instruction.Operand)
+            .ToArray();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(calls.Count(call =>
+                call.DeclaringType.FullName == typeof(PcCompatManagedThreadBridge).FullName &&
+                call.Name == nameof(PcCompatManagedThreadBridge.Create)), Is.EqualTo(1));
+            Assert.That(calls.Any(call =>
+                call.DeclaringType.FullName == "System.Threading.Thread" &&
+                call.Name == ".ctor" &&
+                call.MethodSig?.Params.Count == 1 &&
+                call.MethodSig.Params[0].FullName == "System.Threading.ThreadStart"), Is.False);
+            Assert.That(_report.ManagedBridgeRewrites.Any(item =>
+                item.SourceMethod.Contains("System.Threading.Thread::.ctor", StringComparison.Ordinal) &&
+                item.BridgeMethod.Contains(
+                    nameof(PcCompatManagedThreadBridge.Create),
+                    StringComparison.Ordinal)), Is.True);
+        });
+    }
+
+    [Test]
+    public void RewritesJipperKeyCountBackgroundSaveToScopedTaskBridge()
+    {
+        using var module = ModuleDefMD.Load(_outputPath);
+        var keyCountData = module.GetTypes().Single(type =>
+            type.FullName == "JipperResourcePack.KeyViewerContents.KeyCountData");
+        var save = keyCountData.Methods.Single(method => method.Name == "Save");
+        var calls = save.Body.Instructions
+            .Where(instruction => instruction.OpCode.Code is Code.Call or Code.Callvirt)
+            .Select(instruction => (IMethod)instruction.Operand)
+            .ToArray();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(calls.Count(call =>
+                call.DeclaringType.FullName == typeof(PcCompatManagedThreadBridge).FullName &&
+                call.Name == "Run"), Is.EqualTo(1));
+            Assert.That(calls.Any(call =>
+                call.DeclaringType.FullName == "System.Threading.Tasks.Task" &&
+                call.Name == "Run"), Is.False);
+            Assert.That(_report.ManagedBridgeRewrites.Any(item =>
+                item.Method.Contains("KeyCountData::Save", StringComparison.Ordinal) &&
+                item.SourceMethod.Contains(
+                    "System.Threading.Tasks.Task::Run",
+                    StringComparison.Ordinal) &&
+                item.BridgeMethod.Contains(
+                    nameof(PcCompatManagedThreadBridge),
+                    StringComparison.Ordinal)), Is.True);
+        });
+    }
+
+    [Test]
+    public void RewritesBootstrapInstallerToScopedTaskBridge()
+    {
+        using var module = ModuleDefMD.Load(_bootstrapOutputPath);
+        var bootModData = module.GetTypes().Single(type =>
+            type.FullName == "JAMod.Bootstrap.BootModData");
+        var checker = bootModData.Methods.Single(method => method.Name == "Checker");
+        var calls = checker.Body.Instructions
+            .Where(instruction => instruction.OpCode.Code is Code.Call or Code.Callvirt)
+            .Select(instruction => (IMethod)instruction.Operand)
+            .ToArray();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(calls.Count(call =>
+                call.DeclaringType.FullName == typeof(PcCompatManagedThreadBridge).FullName &&
+                call.Name == nameof(PcCompatManagedThreadBridge.Run)), Is.EqualTo(1));
+            Assert.That(calls.Any(call =>
+                call.DeclaringType.FullName == "System.Threading.Tasks.Task" &&
+                call.Name == "Run"), Is.False);
+            Assert.That(_bootstrapReport.ManagedBridgeRewrites.Any(item =>
+                item.Method.Contains("BootModData::Checker", StringComparison.Ordinal) &&
+                item.SourceMethod.Contains(
+                    "System.Threading.Tasks.Task::Run",
+                    StringComparison.Ordinal) &&
+                item.BridgeMethod.Contains(
+                    nameof(PcCompatManagedThreadBridge.Run),
+                    StringComparison.Ordinal)), Is.True);
+        });
+    }
+
+    [Test]
     public void RewritesJipperPersistentKeyViewerRootToOwnedLifecycleBridge()
     {
         using var module = ModuleDefMD.Load(_outputPath);
@@ -879,11 +1266,61 @@ public sealed class PcCompatManagedBridgeRewriteTests
             Assert.That(calls, Does.Contain(nameof(PcCompatManagedImGuiBridge.ButtonTextWithStyle)));
             Assert.That(calls, Does.Contain(nameof(PcCompatManagedImGuiBridge.ButtonTextureWithStyle)));
             Assert.That(calls, Does.Contain(nameof(PcCompatManagedImGuiBridge.ToggleTextWithStyle)));
+            Assert.That(calls, Does.Contain(nameof(PcCompatManagedImGuiBridge.ToggleContent)));
             Assert.That(calls, Does.Contain(nameof(PcCompatManagedImGuiBridge.TextArea)));
+            Assert.That(calls, Does.Contain(nameof(PcCompatManagedImGuiBridge.SetNextControlName)));
+            Assert.That(calls, Does.Contain(nameof(PcCompatManagedImGuiBridge.GetNameOfFocusedControl)));
             Assert.That(
                 _report.ManagedBridgeRewrites.Count(item =>
                     item.BridgeMethod.Contains(nameof(PcCompatManagedImGuiBridge), StringComparison.Ordinal)),
                 Is.GreaterThanOrEqualTo(3));
+        });
+    }
+
+    [Test]
+    public void RewritesUnity6StrippedGuiDragWindowWithAValueTypeBox()
+    {
+        using var module = ModuleDefMD.Load(_outputPath);
+        var bridgeType = typeof(PcCompatManagedImGuiBridge).FullName!;
+        var calls = FindBridgeCalls(
+                module,
+                bridgeType,
+                nameof(PcCompatManagedImGuiBridge.DragWindow))
+            .ToArray();
+
+        Assert.That(calls, Is.Not.Empty, "no GUI.DragWindow callsite was rewritten");
+        foreach (var (method, call) in calls)
+        {
+            var previous = method.Body.Instructions[method.Body.Instructions.IndexOf(call) - 1];
+            Assert.Multiple(() =>
+            {
+                Assert.That(previous.OpCode.Code, Is.EqualTo(Code.Box));
+                Assert.That(
+                    (previous.Operand as ITypeDefOrRef)?.FullName,
+                    Is.EqualTo("UnityEngine.Rect"));
+            });
+        }
+    }
+
+    [Test]
+    public void SharedGuiProxyDoesNotResolveBridgeOwnedFocusWrappers()
+    {
+        using var module = ModuleDefMD.Load(Path.Combine(
+            _proxyDirectory,
+            "UnityEngine.IMGUIModule.dll"));
+        var gui = module.GetTypes().Single(type => type.FullName == "UnityEngine.GUI");
+        var cctor = gui.FindStaticConstructor();
+        Assert.That(cctor, Is.Not.Null);
+        var resolvedNames = cctor!.Body.Instructions
+            .Where(instruction => instruction.OpCode.Code == Code.Ldstr)
+            .Select(instruction => instruction.Operand)
+            .OfType<string>()
+            .ToArray();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(resolvedNames, Does.Not.Contain("SetNextControlName"));
+            Assert.That(resolvedNames, Does.Not.Contain("GetNameOfFocusedControl"));
         });
     }
 
@@ -1466,6 +1903,320 @@ public sealed class PcCompatManagedBridgeRewriteTests
                                       target.Name == methodName)
                 .Select(instruction => (method, instruction)));
 
+    /// <summary>
+    /// The shared-property bridge takes and returns <c>object</c> because the proxy
+    /// <c>UnityEngine.Vector2</c> only exists at runtime, so the rewriter has to box on the way in
+    /// and unbox on the way out. Getting either instruction wrong produces IL that verifies but
+    /// corrupts the stack, which is why the exact shape is asserted rather than just the call.
+    /// </summary>
+    [Test]
+    public void SharedAnchoredPositionRewriteBoxesTheArgumentAndUnboxesTheReturn()
+    {
+        using var module = ModuleDefMD.Load(_outputPath);
+        var bridgeType = typeof(PcCompatManagedComponentBridge).FullName!;
+
+        var setters = FindBridgeCalls(
+            module,
+            bridgeType,
+            nameof(PcCompatManagedComponentBridge.SetAnchoredPosition)).ToArray();
+        var getters = FindBridgeCalls(
+            module,
+            bridgeType,
+            nameof(PcCompatManagedComponentBridge.GetAnchoredPosition)).ToArray();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(setters, Is.Not.Empty, "no set_anchoredPosition callsite was rewritten");
+            Assert.That(getters, Is.Not.Empty, "no get_anchoredPosition callsite was rewritten");
+        });
+
+        foreach (var (method, call) in setters)
+        {
+            var instructions = method.Body.Instructions;
+            var previous = instructions[instructions.IndexOf(call) - 1];
+            Assert.Multiple(() =>
+            {
+                Assert.That(
+                    previous.OpCode.Code,
+                    Is.EqualTo(Code.Box),
+                    $"{method.FullName}: the Vector2 argument must be boxed before the bridge call");
+                Assert.That(
+                    (previous.Operand as ITypeDefOrRef)?.FullName,
+                    Is.EqualTo("UnityEngine.Vector2"));
+            });
+        }
+
+        foreach (var (method, call) in getters)
+        {
+            var instructions = method.Body.Instructions;
+            var next = instructions[instructions.IndexOf(call) + 1];
+            Assert.Multiple(() =>
+            {
+                Assert.That(
+                    next.OpCode.Code,
+                    Is.EqualTo(Code.Unbox_Any),
+                    $"{method.FullName}: the boxed return must be unboxed after the bridge call");
+                Assert.That(
+                    (next.Operand as ITypeDefOrRef)?.FullName,
+                    Is.EqualTo("UnityEngine.Vector2"));
+            });
+        }
+    }
+
+    /// <summary>
+    /// The read-modify-write in ResourceChanger.OnLogoTextAwake -
+    /// <c>rectTransform.anchoredPosition = rectTransform.anchoredPosition with { y = 0.75f }</c> -
+    /// is the case that forced the getter to be routed too: the x it preserves has to be the game's
+    /// own, not whatever another MOD currently projects.
+    /// </summary>
+    [Test]
+    public void LogoTextReadModifyWriteRoutesBothAnchoredPositionAccessors()
+    {
+        using var module = ModuleDefMD.Load(_outputPath);
+        var bridgeType = typeof(PcCompatManagedComponentBridge).FullName!;
+        var method = module.GetTypes()
+            .SelectMany(type => type.Methods)
+            .Single(candidate => candidate.Name == "OnLogoTextAwake");
+
+        var calls = method.Body.Instructions
+            .Where(instruction => instruction.OpCode.Code == Code.Call &&
+                                  instruction.Operand is IMethod target &&
+                                  target.DeclaringType.FullName == bridgeType)
+            .Select(instruction => ((IMethod)instruction.Operand).Name.String)
+            .ToArray();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(
+                calls,
+                Does.Contain(nameof(PcCompatManagedComponentBridge.GetAnchoredPosition)));
+            Assert.That(
+                calls,
+                Does.Contain(nameof(PcCompatManagedComponentBridge.SetAnchoredPosition)));
+        });
+    }
+
+    /// <summary>
+    /// Pins the converter on every <c>List</c>-returning site the sample MOD actually has, and which
+    /// of the two it gets.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Two of these three sites are genuinely read-only and must keep copy semantics:
+    /// <c>scrLevelMaker::listFloors</c> (ten field sites, all <c>Count</c>/<c>Last()</c>/LINQ) and
+    /// <c>scnGame::get_events</c> (one <c>foreach</c> in <c>PlayCount</c>). The third,
+    /// <c>TMP_FontAsset::get_fallbackFontAssetTable</c>, is registered as a writable collection and so
+    /// gets the bound copy - <c>BundleLoader</c> calls <c>.Add</c> on it, and with a plain copy that
+    /// <c>.Add</c> reached nothing, leaving the CJK fallback font silently unapplied.
+    /// </para>
+    /// <para>
+    /// Asserting the split by name is the point: it is the only thing standing between "one property
+    /// was upgraded deliberately" and "every List-returning member silently changed semantics".
+    /// </para>
+    /// <para>
+    /// <c>PlanetarySystem::allPlanets</c> is not listed. The proxy surface has it, but the MOD reads
+    /// it via <c>obj.GetValue&lt;List&lt;scrPlanet&gt;&gt;("allPlanets")</c> - reflection, so no
+    /// callsite reaches the converter at all.
+    /// </para>
+    /// </remarks>
+    [Test]
+    public void ListSitesGetTheCopyConverterMatchingTheirWritability()
+    {
+        const string converter =
+            "System.Collections.Generic.List`1<{1}> " +
+            "StArray.ModManager.Android.PcCompat.PcCompatCollectionBridge::{0}<{1}>" +
+            "(Il2CppSystem.Collections.Generic.List`1<{1}>)";
+
+        var floors = _report.Rewrites
+            .Where(item => item.OriginalField.EndsWith("scrLevelMaker::listFloors", StringComparison.Ordinal))
+            .ToArray();
+        var events = _report.MethodCalls
+            .Where(item => item.Target.StartsWith("Assembly-CSharp!scnGame::get_events(", StringComparison.Ordinal))
+            .ToArray();
+        var fallback = _report.MethodCalls
+            .Where(item => item.Target.Contains(
+                "TMPro.TMP_FontAsset::get_fallbackFontAssetTable(",
+                StringComparison.Ordinal))
+            .ToArray();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(floors, Has.Length.EqualTo(10), "scrLevelMaker::listFloors site count");
+            Assert.That(events, Has.Length.EqualTo(1), "scnGame::get_events site count");
+            Assert.That(fallback, Has.Length.EqualTo(1), "get_fallbackFontAssetTable site count");
+
+            Assert.That(
+                floors.Select(item => item.ProxyAccessor).Distinct(StringComparer.Ordinal),
+                Is.EqualTo(new[]
+                {
+                    "Il2CppSystem.Collections.Generic.List`1<scrFloor> scrLevelMaker::get_listFloors()" +
+                    " -> " + string.Format(converter, "CopyList", "scrFloor")
+                }));
+            Assert.That(
+                events[0].ProxyMethod,
+                Is.EqualTo(
+                    "Il2CppSystem.Collections.Generic.List`1<ADOFAI.LevelEvent> scnGame::get_events()" +
+                    " -> " + string.Format(converter, "CopyList", "ADOFAI.LevelEvent")));
+            Assert.That(
+                fallback[0].ProxyMethod,
+                Is.EqualTo(
+                    "Il2CppSystem.Collections.Generic.List`1<TMPro.TMP_FontAsset> " +
+                    "TMPro.TMP_FontAsset::get_fallbackFontAssetTable()" +
+                    " -> System.Collections.Generic.List`1<TMPro.TMP_FontAsset> " +
+                    "StArray.ModManager.Android.PcCompat.PcCompatCollectionBridge::" +
+                    "CopyOrCreateBoundList<TMPro.TMP_FontAsset>(" +
+                    "System.Object,Il2CppSystem.Collections.Generic.List`1<TMPro.TMP_FontAsset>," +
+                    "System.String)"));
+        });
+    }
+
+    /// <summary>
+    /// JipperResourcePack's <c>BundleLoader</c> adds the CJK font to the fallback table. That
+    /// <c>List&lt;T&gt;::Add</c> has to become a write-through bridge call, or the font never reaches
+    /// Unity - the failure being invisible is what makes it worth pinning.
+    /// </summary>
+    [Test]
+    public void FallbackFontTableMutationWritesThroughToUnity()
+    {
+        using var module = ModuleDefMD.Load(_outputPath);
+        var loadBundle = module.GetTypes()
+            .Single(type => type.FullName == "JipperResourcePack.BundleLoader")
+            .Methods.Single(method => method.Name == "LoadBundle");
+
+        var calls = loadBundle.Body.Instructions
+            .Where(instruction => instruction.Operand is IMethod)
+            .Select(instruction => new
+            {
+                instruction.OpCode.Code,
+                Target = (IMethod)instruction.Operand
+            })
+            .ToArray();
+
+        Assert.Multiple(() =>
+        {
+            var addCall = calls.SingleOrDefault(call =>
+                call.Code == Code.Call &&
+                call.Target.Name == nameof(PcCompatCollectionBridge.AddToBoundList) &&
+                call.Target.DeclaringType.FullName == typeof(PcCompatCollectionBridge).FullName);
+            Assert.That(addCall, Is.Not.Null, "the fallback-table Add was not routed to the write-through bridge");
+            var addList = addCall?.Target.MethodSig?.Params.FirstOrDefault() as GenericInstSig;
+            Assert.That(
+                addList?.GenericType.TypeDefOrRef.DefinitionAssembly?.Name?.String,
+                Is.EqualTo("System.Collections"),
+                "the bridge List<T> must use the host runtime assembly, not the MOD mscorlib facade");
+            Assert.That(
+                addList?.GenericArguments.Single(),
+                Is.TypeOf<GenericMVar>()
+                    .And.Property(nameof(GenericMVar.Number)).EqualTo(0u),
+                "the bridge receiver must use its own method generic parameter (!!0)");
+            Assert.That(
+                addCall?.Target.MethodSig?.Params.ElementAtOrDefault(1),
+                Is.TypeOf<GenericMVar>()
+                    .And.Property(nameof(GenericMVar.Number)).EqualTo(0u),
+                "List<T>.Add's type generic parameter (!0) must become the bridge method parameter (!!0)");
+            Assert.That(
+                addCall?.Target,
+                Is.InstanceOf<MethodSpec>());
+            Assert.That(
+                ((MethodSpec)addCall!.Target).GenericInstMethodSig.GenericArguments.Single().FullName,
+                Is.EqualTo("TMPro.TMP_FontAsset"),
+                "the bridge MethodSpec must close !!0 with the rewritten collection element type");
+            // No List<TMP_FontAsset> mutator may survive; one that did would be a silent no-op.
+            Assert.That(
+                calls.Any(call =>
+                    call.Target.Name.String is "Add" or "Remove" or "Clear" or "Insert" &&
+                    call.Target.DeclaringType is TypeSpec { TypeSig: GenericInstSig list } &&
+                    list.GenericType.TypeDefOrRef.FullName == "System.Collections.Generic.List`1" &&
+                    list.GenericArguments[0].FullName == "TMPro.TMP_FontAsset"),
+                Is.False,
+                "a raw List<TMP_FontAsset> mutator survived the rewrite");
+        });
+    }
+
+    /// <summary>
+    /// The IL shape the converters depend on. Read-only accessors are immediately followed by
+    /// <c>CopyList</c>. A writable accessor preserves its owner with <c>dup</c>, then appends the
+    /// trusted property name before the create-or-bind converter.
+    /// </summary>
+    /// <remarks>
+    /// The two rewrite paths reach the same converter with different opcodes, and both are pinned.
+    /// The field path (<c>ldfld listFloors</c>) is retargeted to <c>call get_listFloors</c>; the
+    /// method path (<c>callvirt get_events</c>) only swaps the operand and stays <c>callvirt</c>.
+    /// </remarks>
+    [Test]
+    public void CopyListConverterIsEmittedDirectlyAfterTheProxyAccessor()
+    {
+        using var module = ModuleDefMD.Load(_outputPath);
+        var expected = new Dictionary<string, (Code Opcode, string Converter)>(StringComparer.Ordinal)
+        {
+            ["get_listFloors"] = (Code.Call, nameof(PcCompatCollectionBridge.CopyList)),
+            ["get_events"] = (Code.Callvirt, nameof(PcCompatCollectionBridge.CopyList)),
+            ["get_fallbackFontAssetTable"] =
+                (Code.Callvirt, nameof(PcCompatCollectionBridge.CopyOrCreateBoundList))
+        };
+        var seen = new List<string>();
+
+        foreach (var method in module.GetTypes()
+                     .SelectMany(type => type.Methods.Where(candidate => candidate.HasBody)))
+        {
+            var instructions = method.Body.Instructions;
+            for (var index = 0; index < instructions.Count; index++)
+            {
+                if (instructions[index].OpCode.Code is not (Code.Call or Code.Callvirt) ||
+                    instructions[index].Operand is not IMethod accessor ||
+                    !expected.TryGetValue(accessor.Name.String, out var expectation))
+                {
+                    continue;
+                }
+
+                seen.Add(accessor.Name.String);
+                Assert.That(
+                    instructions[index].OpCode.Code,
+                    Is.EqualTo(expectation.Opcode),
+                    $"{method.FullName}: {accessor.Name} opcode");
+                Assert.That(
+                    index + 1,
+                    Is.LessThan(instructions.Count),
+                    $"{method.FullName}: {accessor.Name} is the last instruction");
+                var converterIndex = index + 1;
+                if (accessor.Name == "get_fallbackFontAssetTable")
+                {
+                    Assert.That(instructions[index - 1].OpCode.Code, Is.EqualTo(Code.Dup));
+                    Assert.That(instructions[converterIndex].OpCode.Code, Is.EqualTo(Code.Ldstr));
+                    Assert.That(
+                        instructions[converterIndex].Operand,
+                        Is.EqualTo("fallbackFontAssetTable"));
+                    converterIndex++;
+                }
+                var next = instructions[converterIndex];
+                Assert.Multiple(() =>
+                {
+                    Assert.That(
+                        next.OpCode.Code,
+                        Is.EqualTo(Code.Call),
+                        $"{method.FullName}: {accessor.Name} is not followed by a call");
+                    Assert.That(
+                        (next.Operand as IMethod)?.Name.String,
+                        Is.EqualTo(expectation.Converter),
+                        $"{method.FullName}: {accessor.Name} got the wrong copy converter");
+                    Assert.That(
+                        (next.Operand as IMethod)?.DeclaringType.FullName,
+                        Is.EqualTo(typeof(PcCompatCollectionBridge).FullName));
+                });
+            }
+        }
+
+        Assert.That(
+            seen.GroupBy(name => name, StringComparer.Ordinal)
+                .ToDictionary(group => group.Key, group => group.Count(), StringComparer.Ordinal),
+            Is.EqualTo(new Dictionary<string, int>(StringComparer.Ordinal)
+            {
+                ["get_listFloors"] = 10,
+                ["get_events"] = 1,
+                ["get_fallbackFontAssetTable"] = 1
+            }));
+    }
+
     private static void AssertGenericAssetBridge(
         MethodDef method,
         string expectedBridgeMethod,
@@ -1491,16 +2242,541 @@ public sealed class PcCompatManagedBridgeRewriteTests
         Assert.That(method.MethodSig!.Params[0].FullName, Is.EqualTo("System.Object"));
     }
 
+    private static IReadOnlyList<ManagedWritableCollectionSpec> CreateWritableCollectionSpecs()
+        =>
+        [
+            new ManagedWritableCollectionSpec(
+                "Unity.TextMeshPro",
+                "TMPro.TMP_FontAsset",
+                "fallbackFontAssetTable",
+                "TMPro.TMP_FontAsset",
+                typeof(PcCompatCollectionBridge).FullName!,
+                nameof(PcCompatCollectionBridge.CopyOrCreateBoundList),
+                nameof(PcCompatCollectionBridge.AddToBoundList),
+                nameof(PcCompatCollectionBridge.RemoveFromBoundList),
+                nameof(PcCompatCollectionBridge.ClearBoundList),
+                nameof(PcCompatCollectionBridge.InsertIntoBoundList))
+        ];
+
     private static IReadOnlyList<ManagedCallBridgeRewriteSpec> CreateManagedCallSpecs()
     {
         var resourceBridgeType = typeof(PcCompatManagedResourceBridge).FullName!;
         var componentBridgeType = typeof(PcCompatManagedComponentBridge).FullName!;
+        var pathBridgeType = typeof(PcCompatManagedPathBridge).FullName!;
+        var networkBridgeType = typeof(PcCompatManagedNetworkBridge).FullName!;
+        var subscriptionBridgeType = typeof(PcCompatManagedEventSubscriptionBridge).FullName!;
         var logBridgeType = typeof(PcCompatManagedLogBridge).FullName!;
         var inputBridgeType = typeof(PcCompatLegacyInputBridge).FullName!;
         var imGuiBridgeType = typeof(PcCompatManagedImGuiBridge).FullName!;
         var threadBridgeType = typeof(PcCompatManagedThreadBridge).FullName!;
         return
         [
+            // ModEntry.Path is a virtual package root, so its parent must stay owner-scoped.
+            new ManagedCallBridgeRewriteSpec(
+                "mscorlib",
+                "System.IO.Path",
+                "GetDirectoryName",
+                SourceIsStatic: true,
+                SourceGenericArity: 0,
+                "System.String",
+                ["System.String"],
+                pathBridgeType,
+                nameof(PcCompatManagedPathBridge.GetDirectoryName),
+                ManagedCallInstanceForwarding.None,
+                AllowObjectReturnCast: false,
+                AllowUnproxiedSource: true),
+            new ManagedCallBridgeRewriteSpec(
+                "mscorlib",
+                "System.IO.Path",
+                "GetFullPath",
+                SourceIsStatic: true,
+                SourceGenericArity: 0,
+                "System.String",
+                ["System.String"],
+                pathBridgeType,
+                nameof(PcCompatManagedPathBridge.GetFullPath),
+                ManagedCallInstanceForwarding.None,
+                AllowObjectReturnCast: false,
+                AllowUnproxiedSource: true),
+            new ManagedCallBridgeRewriteSpec(
+                "mscorlib",
+                "System.IO.File",
+                "Exists",
+                SourceIsStatic: true,
+                SourceGenericArity: 0,
+                "System.Boolean",
+                ["System.String"],
+                pathBridgeType,
+                nameof(PcCompatManagedPathBridge.FileExists),
+                ManagedCallInstanceForwarding.None,
+                AllowObjectReturnCast: false,
+                AllowUnproxiedSource: true),
+            new ManagedCallBridgeRewriteSpec(
+                "mscorlib",
+                "System.IO.File",
+                "ReadAllText",
+                SourceIsStatic: true,
+                SourceGenericArity: 0,
+                "System.String",
+                ["System.String"],
+                pathBridgeType,
+                nameof(PcCompatManagedPathBridge.FileReadAllText),
+                ManagedCallInstanceForwarding.None,
+                AllowObjectReturnCast: false,
+                AllowUnproxiedSource: true),
+            new ManagedCallBridgeRewriteSpec(
+                "mscorlib",
+                "System.IO.File",
+                "ReadAllBytes",
+                SourceIsStatic: true,
+                SourceGenericArity: 0,
+                "System.Byte[]",
+                ["System.String"],
+                pathBridgeType,
+                nameof(PcCompatManagedPathBridge.FileReadAllBytes),
+                ManagedCallInstanceForwarding.None,
+                AllowObjectReturnCast: false,
+                AllowUnproxiedSource: true),
+            new ManagedCallBridgeRewriteSpec(
+                "mscorlib",
+                "System.IO.File",
+                "WriteAllText",
+                SourceIsStatic: true,
+                SourceGenericArity: 0,
+                "System.Void",
+                ["System.String", "System.String"],
+                pathBridgeType,
+                nameof(PcCompatManagedPathBridge.FileWriteAllText),
+                ManagedCallInstanceForwarding.None,
+                AllowObjectReturnCast: false,
+                AllowUnproxiedSource: true),
+            new ManagedCallBridgeRewriteSpec(
+                "mscorlib",
+                "System.IO.File",
+                "WriteAllBytes",
+                SourceIsStatic: true,
+                SourceGenericArity: 0,
+                "System.Void",
+                ["System.String", "System.Byte[]"],
+                pathBridgeType,
+                nameof(PcCompatManagedPathBridge.FileWriteAllBytes),
+                ManagedCallInstanceForwarding.None,
+                AllowObjectReturnCast: false,
+                AllowUnproxiedSource: true),
+            new ManagedCallBridgeRewriteSpec(
+                "mscorlib",
+                "System.IO.File",
+                "Delete",
+                SourceIsStatic: true,
+                SourceGenericArity: 0,
+                "System.Void",
+                ["System.String"],
+                pathBridgeType,
+                nameof(PcCompatManagedPathBridge.FileDelete),
+                ManagedCallInstanceForwarding.None,
+                AllowObjectReturnCast: false,
+                AllowUnproxiedSource: true),
+            new ManagedCallBridgeRewriteSpec(
+                "mscorlib",
+                "System.IO.File",
+                "Copy",
+                SourceIsStatic: true,
+                SourceGenericArity: 0,
+                "System.Void",
+                ["System.String", "System.String"],
+                pathBridgeType,
+                nameof(PcCompatManagedPathBridge.FileCopy),
+                ManagedCallInstanceForwarding.None,
+                AllowObjectReturnCast: false,
+                AllowUnproxiedSource: true),
+            new ManagedCallBridgeRewriteSpec(
+                "mscorlib",
+                "System.IO.File",
+                "Copy",
+                SourceIsStatic: true,
+                SourceGenericArity: 0,
+                "System.Void",
+                ["System.String", "System.String", "System.Boolean"],
+                pathBridgeType,
+                nameof(PcCompatManagedPathBridge.FileCopyOverwrite),
+                ManagedCallInstanceForwarding.None,
+                AllowObjectReturnCast: false,
+                AllowUnproxiedSource: true),
+            new ManagedCallBridgeRewriteSpec(
+                "mscorlib",
+                "System.IO.File",
+                "Move",
+                SourceIsStatic: true,
+                SourceGenericArity: 0,
+                "System.Void",
+                ["System.String", "System.String"],
+                pathBridgeType,
+                nameof(PcCompatManagedPathBridge.FileMove),
+                ManagedCallInstanceForwarding.None,
+                AllowObjectReturnCast: false,
+                AllowUnproxiedSource: true),
+            new ManagedCallBridgeRewriteSpec(
+                "mscorlib",
+                "System.IO.File",
+                "OpenRead",
+                SourceIsStatic: true,
+                SourceGenericArity: 0,
+                "System.IO.FileStream",
+                ["System.String"],
+                pathBridgeType,
+                nameof(PcCompatManagedPathBridge.FileOpenRead),
+                ManagedCallInstanceForwarding.None,
+                AllowObjectReturnCast: false,
+                AllowUnproxiedSource: true),
+            new ManagedCallBridgeRewriteSpec(
+                "mscorlib",
+                "System.IO.File",
+                "OpenWrite",
+                SourceIsStatic: true,
+                SourceGenericArity: 0,
+                "System.IO.FileStream",
+                ["System.String"],
+                pathBridgeType,
+                nameof(PcCompatManagedPathBridge.FileOpenWrite),
+                ManagedCallInstanceForwarding.None,
+                AllowObjectReturnCast: false,
+                AllowUnproxiedSource: true),
+            new ManagedCallBridgeRewriteSpec(
+                "mscorlib",
+                "System.IO.Directory",
+                "Exists",
+                SourceIsStatic: true,
+                SourceGenericArity: 0,
+                "System.Boolean",
+                ["System.String"],
+                pathBridgeType,
+                nameof(PcCompatManagedPathBridge.DirectoryExists),
+                ManagedCallInstanceForwarding.None,
+                AllowObjectReturnCast: false,
+                AllowUnproxiedSource: true),
+            new ManagedCallBridgeRewriteSpec(
+                "mscorlib",
+                "System.IO.Directory",
+                "CreateDirectory",
+                SourceIsStatic: true,
+                SourceGenericArity: 0,
+                "System.IO.DirectoryInfo",
+                ["System.String"],
+                pathBridgeType,
+                nameof(PcCompatManagedPathBridge.DirectoryCreate),
+                ManagedCallInstanceForwarding.None,
+                AllowObjectReturnCast: false,
+                AllowUnproxiedSource: true),
+            new ManagedCallBridgeRewriteSpec(
+                "mscorlib",
+                "System.IO.Directory",
+                "Delete",
+                SourceIsStatic: true,
+                SourceGenericArity: 0,
+                "System.Void",
+                ["System.String"],
+                pathBridgeType,
+                nameof(PcCompatManagedPathBridge.DirectoryDelete),
+                ManagedCallInstanceForwarding.None,
+                AllowObjectReturnCast: false,
+                AllowUnproxiedSource: true),
+            new ManagedCallBridgeRewriteSpec(
+                "mscorlib",
+                "System.IO.Directory",
+                "Delete",
+                SourceIsStatic: true,
+                SourceGenericArity: 0,
+                "System.Void",
+                ["System.String", "System.Boolean"],
+                pathBridgeType,
+                nameof(PcCompatManagedPathBridge.DirectoryDeleteRecursive),
+                ManagedCallInstanceForwarding.None,
+                AllowObjectReturnCast: false,
+                AllowUnproxiedSource: true),
+            new ManagedCallBridgeRewriteSpec(
+                "mscorlib",
+                "System.IO.FileStream",
+                ".ctor",
+                SourceIsStatic: false,
+                SourceGenericArity: 0,
+                "System.IO.FileStream",
+                ["System.String", "System.IO.FileMode"],
+                pathBridgeType,
+                nameof(PcCompatManagedPathBridge.OpenFileStream),
+                ManagedCallInstanceForwarding.None,
+                AllowObjectReturnCast: false,
+                AllowUnproxiedSource: true,
+                SourceIsConstructor: true),
+            new ManagedCallBridgeRewriteSpec(
+                "mscorlib",
+                "System.IO.FileStream",
+                ".ctor",
+                SourceIsStatic: false,
+                SourceGenericArity: 0,
+                "System.IO.FileStream",
+                ["System.String", "System.IO.FileMode", "System.IO.FileAccess"],
+                pathBridgeType,
+                nameof(PcCompatManagedPathBridge.OpenFileStreamAccess),
+                ManagedCallInstanceForwarding.None,
+                AllowObjectReturnCast: false,
+                AllowUnproxiedSource: true,
+                SourceIsConstructor: true),
+            new ManagedCallBridgeRewriteSpec(
+                "mscorlib",
+                "System.IO.FileStream",
+                ".ctor",
+                SourceIsStatic: false,
+                SourceGenericArity: 0,
+                "System.IO.FileStream",
+                ["System.String", "System.IO.FileMode", "System.IO.FileAccess", "System.IO.FileShare"],
+                pathBridgeType,
+                nameof(PcCompatManagedPathBridge.OpenFileStreamShare),
+                ManagedCallInstanceForwarding.None,
+                AllowObjectReturnCast: false,
+                AllowUnproxiedSource: true,
+                SourceIsConstructor: true),
+            // MOD network sessions: only client-producing constructions are rewritten.
+            // Operations on a bound client and its response objects inherit this session's
+            // identity already, so they stay as-is (same reasoning as Path.Combine above).
+            // ServicePointManager, WebRequest/WebClient and raw sockets have no spec and are
+            // not bridged; a MOD using them is an isolation downgrade, not a supported path.
+            new ManagedCallBridgeRewriteSpec(
+                "System.Net.Http",
+                "System.Net.Http.HttpClient",
+                ".ctor",
+                SourceIsStatic: false,
+                SourceGenericArity: 0,
+                "System.Net.Http.HttpClient",
+                [],
+                networkBridgeType,
+                nameof(PcCompatManagedNetworkBridge.CreateHttpClient),
+                ManagedCallInstanceForwarding.None,
+                AllowObjectReturnCast: false,
+                AllowUnproxiedSource: true,
+                SourceIsConstructor: true),
+            new ManagedCallBridgeRewriteSpec(
+                "System.Net.Http",
+                "System.Net.Http.HttpClient",
+                ".ctor",
+                SourceIsStatic: false,
+                SourceGenericArity: 0,
+                "System.Net.Http.HttpClient",
+                ["System.Net.Http.HttpMessageHandler"],
+                networkBridgeType,
+                nameof(PcCompatManagedNetworkBridge.CreateHttpClientWithHandler),
+                ManagedCallInstanceForwarding.None,
+                AllowObjectReturnCast: false,
+                AllowUnproxiedSource: true,
+                SourceIsConstructor: true),
+            new ManagedCallBridgeRewriteSpec(
+                "System.Net.Http",
+                "System.Net.Http.HttpClient",
+                ".ctor",
+                SourceIsStatic: false,
+                SourceGenericArity: 0,
+                "System.Net.Http.HttpClient",
+                ["System.Net.Http.HttpMessageHandler", "System.Boolean"],
+                networkBridgeType,
+                nameof(PcCompatManagedNetworkBridge.CreateHttpClientWithHandlerDisposal),
+                ManagedCallInstanceForwarding.None,
+                AllowObjectReturnCast: false,
+                AllowUnproxiedSource: true,
+                SourceIsConstructor: true),
+            new ManagedCallBridgeRewriteSpec(
+                "System.Net.Http",
+                "System.Net.Http.HttpClientHandler",
+                ".ctor",
+                SourceIsStatic: false,
+                SourceGenericArity: 0,
+                "System.Net.Http.HttpClientHandler",
+                [],
+                networkBridgeType,
+                nameof(PcCompatManagedNetworkBridge.CreateHttpClientHandler),
+                ManagedCallInstanceForwarding.None,
+                AllowObjectReturnCast: false,
+                AllowUnproxiedSource: true,
+                SourceIsConstructor: true),
+            // CookieContainer's declaring assembly differs across target frameworks
+            // (System.Net.Primitives on netstandard, System on desktop); a single spelling
+            // would zero-match silently on the other, so both are registered.
+            new ManagedCallBridgeRewriteSpec(
+                "System.Net.Primitives",
+                "System.Net.CookieContainer",
+                ".ctor",
+                SourceIsStatic: false,
+                SourceGenericArity: 0,
+                "System.Net.CookieContainer",
+                [],
+                networkBridgeType,
+                nameof(PcCompatManagedNetworkBridge.CreateCookieContainer),
+                ManagedCallInstanceForwarding.None,
+                AllowObjectReturnCast: false,
+                AllowUnproxiedSource: true,
+                SourceIsConstructor: true),
+            new ManagedCallBridgeRewriteSpec(
+                "System",
+                "System.Net.CookieContainer",
+                ".ctor",
+                SourceIsStatic: false,
+                SourceGenericArity: 0,
+                "System.Net.CookieContainer",
+                [],
+                networkBridgeType,
+                nameof(PcCompatManagedNetworkBridge.CreateCookieContainer),
+                ManagedCallInstanceForwarding.None,
+                AllowObjectReturnCast: false,
+                AllowUnproxiedSource: true,
+                SourceIsConstructor: true),
+            // External static-event subscriptions are routed through the registration bridge
+            // in both directions. The generated IL2CPP proxy uses Il2CppSystem delegate
+            // parameters, so remove_ must use the same conversion path as add_.
+            new ManagedCallBridgeRewriteSpec(
+                "UnityEngine.CoreModule",
+                "UnityEngine.Application",
+                "add_quitting",
+                SourceIsStatic: true,
+                SourceGenericArity: 0,
+                "System.Void",
+                ["System.Action"],
+                subscriptionBridgeType,
+                nameof(PcCompatManagedEventSubscriptionBridge.Subscribe),
+                ManagedCallInstanceForwarding.None,
+                AllowObjectReturnCast: false,
+                AllowObjectParameterForwarding: true,
+                AllowUnproxiedSource: true,
+                AppendOwnerId: "UnityEngine.CoreModule!UnityEngine.Application::quitting"),
+            new ManagedCallBridgeRewriteSpec(
+                "UnityEngine.CoreModule",
+                "UnityEngine.Application",
+                "remove_quitting",
+                SourceIsStatic: true,
+                SourceGenericArity: 0,
+                "System.Void",
+                ["System.Action"],
+                subscriptionBridgeType,
+                nameof(PcCompatManagedEventSubscriptionBridge.Unsubscribe),
+                ManagedCallInstanceForwarding.None,
+                AllowObjectReturnCast: false,
+                AllowObjectParameterForwarding: true,
+                AllowUnproxiedSource: true,
+                AppendOwnerId: "UnityEngine.CoreModule!UnityEngine.Application::quitting"),
+            new ManagedCallBridgeRewriteSpec(
+                "UnityEngine.CoreModule",
+                "UnityEngine.SceneManagement.SceneManager",
+                "add_sceneUnloaded",
+                SourceIsStatic: true,
+                SourceGenericArity: 0,
+                "System.Void",
+                ["UnityEngine.Events.UnityAction`1<UnityEngine.SceneManagement.Scene>"],
+                subscriptionBridgeType,
+                nameof(PcCompatManagedEventSubscriptionBridge.Subscribe),
+                ManagedCallInstanceForwarding.None,
+                AllowObjectReturnCast: false,
+                AllowObjectParameterForwarding: true,
+                AllowUnproxiedSource: true,
+                AppendOwnerId: "UnityEngine.CoreModule!UnityEngine.SceneManagement.SceneManager::sceneUnloaded"),
+            new ManagedCallBridgeRewriteSpec(
+                "UnityEngine.CoreModule",
+                "UnityEngine.SceneManagement.SceneManager",
+                "remove_sceneUnloaded",
+                SourceIsStatic: true,
+                SourceGenericArity: 0,
+                "System.Void",
+                ["UnityEngine.Events.UnityAction`1<UnityEngine.SceneManagement.Scene>"],
+                subscriptionBridgeType,
+                nameof(PcCompatManagedEventSubscriptionBridge.Unsubscribe),
+                ManagedCallInstanceForwarding.None,
+                AllowObjectReturnCast: false,
+                AllowObjectParameterForwarding: true,
+                AllowUnproxiedSource: true,
+                AppendOwnerId: "UnityEngine.CoreModule!UnityEngine.SceneManagement.SceneManager::sceneUnloaded"),
+            new ManagedCallBridgeRewriteSpec(
+                "UnityEngine.CoreModule",
+                "UnityEngine.GameObject",
+                ".ctor",
+                SourceIsStatic: false,
+                SourceGenericArity: 0,
+                "UnityEngine.GameObject",
+                ["System.String"],
+                componentBridgeType,
+                nameof(PcCompatManagedComponentBridge.CreateGameObject),
+                ManagedCallInstanceForwarding.None,
+                AllowObjectReturnCast: true,
+                SourceIsConstructor: true),
+            new ManagedCallBridgeRewriteSpec(
+                "UnityEngine.CoreModule",
+                "UnityEngine.Object",
+                "Instantiate",
+                SourceIsStatic: true,
+                SourceGenericArity: 1,
+                "!!0",
+                ["!!0"],
+                componentBridgeType,
+                nameof(PcCompatManagedComponentBridge.Instantiate),
+                ManagedCallInstanceForwarding.None,
+                AllowObjectReturnCast: true,
+                AllowObjectParameterForwarding: true,
+                EraseBridgeGenericArity: true),
+            new ManagedCallBridgeRewriteSpec(
+                "UnityEngine.CoreModule",
+                "UnityEngine.Object",
+                "Instantiate",
+                SourceIsStatic: true,
+                SourceGenericArity: 1,
+                "!!0",
+                ["!!0", "UnityEngine.Transform"],
+                componentBridgeType,
+                nameof(PcCompatManagedComponentBridge.Instantiate),
+                ManagedCallInstanceForwarding.None,
+                AllowObjectReturnCast: true,
+                AllowObjectParameterForwarding: true,
+                EraseBridgeGenericArity: true),
+            // Shared RectTransform.anchoredPosition arbitration. JipperResourcePack writes it on
+            // both kinds of target in one assembly: game-owned rects (scrShowIfDebug's, which
+            // JipperOverlayer and CheryTools also reposition; scrLogoText's; ADOBase.controller's
+            // txtLevelName) and its own overlay/keyviewer/rain objects. Both accessors are
+            // rewritten because ResourceChanger does a read-modify-write - `anchoredPosition with
+            // { y = 0.75f }` - so an unrouted getter would bake another MOD's x into the write.
+            new ManagedCallBridgeRewriteSpec(
+                "UnityEngine.CoreModule",
+                "UnityEngine.RectTransform",
+                "get_anchoredPosition",
+                SourceIsStatic: false,
+                SourceGenericArity: 0,
+                "UnityEngine.Vector2",
+                [],
+                componentBridgeType,
+                nameof(PcCompatManagedComponentBridge.GetAnchoredPosition),
+                ManagedCallInstanceForwarding.AsObject,
+                AllowObjectReturnCast: false,
+                AllowValueTypeReturnUnbox: true),
+            new ManagedCallBridgeRewriteSpec(
+                "UnityEngine.CoreModule",
+                "UnityEngine.RectTransform",
+                "set_anchoredPosition",
+                SourceIsStatic: false,
+                SourceGenericArity: 0,
+                "System.Void",
+                ["UnityEngine.Vector2"],
+                componentBridgeType,
+                nameof(PcCompatManagedComponentBridge.SetAnchoredPosition),
+                ManagedCallInstanceForwarding.AsObject,
+                AllowObjectReturnCast: false,
+                BoxLastValueTypeArgument: true),
+            new ManagedCallBridgeRewriteSpec(
+                "mscorlib",
+                "System.Threading.Thread",
+                ".ctor",
+                false,
+                0,
+                "System.Threading.Thread",
+                ["System.Threading.ThreadStart"],
+                threadBridgeType,
+                nameof(PcCompatManagedThreadBridge.Create),
+                ManagedCallInstanceForwarding.None,
+                false,
+                AllowUnproxiedSource: true,
+                SourceIsConstructor: true),
             new ManagedCallBridgeRewriteSpec(
                 "mscorlib",
                 "System.Threading.Thread",
@@ -1512,6 +2788,19 @@ public sealed class PcCompatManagedBridgeRewriteTests
                 threadBridgeType,
                 nameof(PcCompatManagedThreadBridge.Abort),
                 ManagedCallInstanceForwarding.AsObject,
+                false,
+                AllowUnproxiedSource: true),
+            new ManagedCallBridgeRewriteSpec(
+                "mscorlib",
+                "System.Threading.Tasks.Task",
+                "Run",
+                true,
+                0,
+                "System.Threading.Tasks.Task",
+                ["System.Action"],
+                threadBridgeType,
+                nameof(PcCompatManagedThreadBridge.Run),
+                ManagedCallInstanceForwarding.None,
                 false,
                 AllowUnproxiedSource: true),
             new ManagedCallBridgeRewriteSpec(
@@ -1606,6 +2895,19 @@ public sealed class PcCompatManagedBridgeRewriteTests
             new ManagedCallBridgeRewriteSpec(
                 "UnityEngine.IMGUIModule",
                 "UnityEngine.GUILayout",
+                "Toggle",
+                true,
+                0,
+                "System.Boolean",
+                ["System.Boolean", "UnityEngine.GUIContent", "UnityEngine.GUILayoutOption[]"],
+                imGuiBridgeType,
+                nameof(PcCompatManagedImGuiBridge.ToggleContent),
+                ManagedCallInstanceForwarding.None,
+                false,
+                AllowObjectParameterForwarding: true),
+            new ManagedCallBridgeRewriteSpec(
+                "UnityEngine.IMGUIModule",
+                "UnityEngine.GUILayout",
                 "Button",
                 true,
                 0,
@@ -1629,6 +2931,43 @@ public sealed class PcCompatManagedBridgeRewriteTests
                 ManagedCallInstanceForwarding.None,
                 false,
                 AllowObjectParameterForwarding: true),
+            new ManagedCallBridgeRewriteSpec(
+                "UnityEngine.IMGUIModule",
+                "UnityEngine.GUI",
+                "SetNextControlName",
+                true,
+                0,
+                "System.Void",
+                ["System.String"],
+                imGuiBridgeType,
+                nameof(PcCompatManagedImGuiBridge.SetNextControlName),
+                ManagedCallInstanceForwarding.None,
+                false),
+            new ManagedCallBridgeRewriteSpec(
+                "UnityEngine.IMGUIModule",
+                "UnityEngine.GUI",
+                "GetNameOfFocusedControl",
+                true,
+                0,
+                "System.String",
+                [],
+                imGuiBridgeType,
+                nameof(PcCompatManagedImGuiBridge.GetNameOfFocusedControl),
+                ManagedCallInstanceForwarding.None,
+                false),
+            new ManagedCallBridgeRewriteSpec(
+                "UnityEngine.IMGUIModule",
+                "UnityEngine.GUI",
+                "DragWindow",
+                true,
+                0,
+                "System.Void",
+                ["UnityEngine.Rect"],
+                imGuiBridgeType,
+                nameof(PcCompatManagedImGuiBridge.DragWindow),
+                ManagedCallInstanceForwarding.None,
+                false,
+                BoxLastValueTypeArgument: true),
             new ManagedCallBridgeRewriteSpec(
                 "UnityEngine.InputLegacyModule",
                 "UnityEngine.Input",
@@ -1698,6 +3037,82 @@ public sealed class PcCompatManagedBridgeRewriteTests
                 ["System.Exception"],
                 logBridgeType,
                 nameof(PcCompatManagedLogBridge.LogException),
+                ManagedCallInstanceForwarding.None,
+                false),
+            // Debug.Log/LogWarning/LogError(System.Object) - see the production registration for
+            // why these are a manual bridge rather than a proxy forward.
+            new ManagedCallBridgeRewriteSpec(
+                "UnityEngine.CoreModule",
+                "UnityEngine.Debug",
+                "Log",
+                true,
+                0,
+                "System.Void",
+                ["System.Object"],
+                logBridgeType,
+                nameof(PcCompatManagedLogBridge.Log),
+                ManagedCallInstanceForwarding.None,
+                false),
+            new ManagedCallBridgeRewriteSpec(
+                "UnityEngine.CoreModule",
+                "UnityEngine.Debug",
+                "LogWarning",
+                true,
+                0,
+                "System.Void",
+                ["System.Object"],
+                logBridgeType,
+                nameof(PcCompatManagedLogBridge.LogWarning),
+                ManagedCallInstanceForwarding.None,
+                false),
+            new ManagedCallBridgeRewriteSpec(
+                "UnityEngine.CoreModule",
+                "UnityEngine.Debug",
+                "LogError",
+                true,
+                0,
+                "System.Void",
+                ["System.Object"],
+                logBridgeType,
+                nameof(PcCompatManagedLogBridge.LogError),
+                ManagedCallInstanceForwarding.None,
+                false),
+            // JsonUtility - the MOD's own CoreCLR types are not in the IL2CPP class table, so
+            // serialization has to stay managed. See the production registration.
+            new ManagedCallBridgeRewriteSpec(
+                "UnityEngine.JSONSerializeModule",
+                "UnityEngine.JsonUtility",
+                "ToJson",
+                true,
+                0,
+                "System.String",
+                ["System.Object", "System.Boolean"],
+                typeof(PcCompatJsonBridge).FullName!,
+                nameof(PcCompatJsonBridge.ToJson),
+                ManagedCallInstanceForwarding.None,
+                false),
+            new ManagedCallBridgeRewriteSpec(
+                "UnityEngine.JSONSerializeModule",
+                "UnityEngine.JsonUtility",
+                "FromJsonOverwrite",
+                true,
+                0,
+                "System.Void",
+                ["System.String", "System.Object"],
+                typeof(PcCompatJsonBridge).FullName!,
+                nameof(PcCompatJsonBridge.FromJsonOverwrite),
+                ManagedCallInstanceForwarding.None,
+                false),
+            new ManagedCallBridgeRewriteSpec(
+                "UnityEngine.JSONSerializeModule",
+                "UnityEngine.JsonUtility",
+                "FromJson",
+                true,
+                1,
+                "!!0",
+                ["System.String"],
+                typeof(PcCompatJsonBridge).FullName!,
+                nameof(PcCompatJsonBridge.FromJson),
                 ManagedCallInstanceForwarding.None,
                 false),
             new ManagedCallBridgeRewriteSpec(
@@ -2192,8 +3607,123 @@ public sealed class PcCompatManagedBridgeRewriteTests
         AddGenericAssetBundleCalls(module, probe);
         AddManagedComponentCalls(module, probe);
         AddUnrelatedThreadYield(module, probe);
+        AddGuiFocusCalls(module, probe);
+        AddGuiDragWindowCall(module, probe);
+        AddGuiToggleContentCall(module, probe);
 
         module.Write(outputPath);
+    }
+
+    private static void AddGuiFocusCalls(ModuleDef module, TypeDef probe)
+    {
+        var imguiAssembly = module.GetAssemblyRefs().Single(reference =>
+            reference.Name == "UnityEngine.IMGUIModule");
+        var guiType = new TypeRefUser(
+            module,
+            "UnityEngine",
+            "GUI",
+            imguiAssembly);
+        var setNextControlName = new MemberRefUser(
+            module,
+            "SetNextControlName",
+            MethodSig.CreateStatic(module.CorLibTypes.Void, module.CorLibTypes.String),
+            guiType);
+        var getNameOfFocusedControl = new MemberRefUser(
+            module,
+            "GetNameOfFocusedControl",
+            MethodSig.CreateStatic(module.CorLibTypes.String),
+            guiType);
+        var caller = new MethodDefUser(
+            "RoundTripGuiControlFocus",
+            MethodSig.CreateStatic(module.CorLibTypes.String, module.CorLibTypes.String),
+            MethodImplAttributes.IL | MethodImplAttributes.Managed,
+            MethodAttributes.Public | MethodAttributes.Static)
+        {
+            Body = new CilBody()
+        };
+        caller.Body.Instructions.Add(Instruction.Create(OpCodes.Ldarg_0));
+        caller.Body.Instructions.Add(Instruction.Create(OpCodes.Call, setNextControlName));
+        caller.Body.Instructions.Add(Instruction.Create(OpCodes.Call, getNameOfFocusedControl));
+        caller.Body.Instructions.Add(Instruction.Create(OpCodes.Ret));
+        probe.Methods.Add(caller);
+    }
+
+    private static void AddGuiDragWindowCall(ModuleDef module, TypeDef probe)
+    {
+        var imguiAssembly = module.GetAssemblyRefs().Single(reference =>
+            reference.Name == "UnityEngine.IMGUIModule");
+        var coreAssembly = module.GetAssemblyRefs().Single(reference =>
+            reference.Name == "UnityEngine.CoreModule");
+        var guiType = new TypeRefUser(
+            module,
+            "UnityEngine",
+            "GUI",
+            imguiAssembly);
+        var rectType = new TypeRefUser(
+            module,
+            "UnityEngine",
+            "Rect",
+            coreAssembly);
+        var rect = new ValueTypeSig(rectType);
+        var dragWindow = new MemberRefUser(
+            module,
+            "DragWindow",
+            MethodSig.CreateStatic(module.CorLibTypes.Void, rect),
+            guiType);
+        var caller = new MethodDefUser(
+            "CallGuiDragWindow",
+            MethodSig.CreateStatic(module.CorLibTypes.Void, rect),
+            MethodImplAttributes.IL | MethodImplAttributes.Managed,
+            MethodAttributes.Public | MethodAttributes.Static)
+        {
+            Body = new CilBody()
+        };
+        caller.Body.Instructions.Add(Instruction.Create(OpCodes.Ldarg_0));
+        caller.Body.Instructions.Add(Instruction.Create(OpCodes.Call, dragWindow));
+        caller.Body.Instructions.Add(Instruction.Create(OpCodes.Ret));
+        probe.Methods.Add(caller);
+    }
+
+    private static void AddGuiToggleContentCall(ModuleDef module, TypeDef probe)
+    {
+        var imguiAssembly = module.GetAssemblyRefs().Single(reference =>
+            reference.Name == "UnityEngine.IMGUIModule");
+        var guiLayoutType = new TypeRefUser(
+            module,
+            "UnityEngine",
+            "GUILayout",
+            imguiAssembly);
+        var guiContentType = new TypeRefUser(
+            module,
+            "UnityEngine",
+            "GUIContent",
+            imguiAssembly);
+        var guiLayoutOptionType = new TypeRefUser(
+            module,
+            "UnityEngine",
+            "GUILayoutOption",
+            imguiAssembly);
+        var content = new ClassSig(guiContentType);
+        var options = new SZArraySig(new ClassSig(guiLayoutOptionType));
+        var toggle = new MemberRefUser(
+            module,
+            "Toggle",
+            MethodSig.CreateStatic(module.CorLibTypes.Boolean, module.CorLibTypes.Boolean, content, options),
+            guiLayoutType);
+        var caller = new MethodDefUser(
+            "CallGuiToggleContent",
+            MethodSig.CreateStatic(module.CorLibTypes.Boolean, module.CorLibTypes.Boolean, content, options),
+            MethodImplAttributes.IL | MethodImplAttributes.Managed,
+            MethodAttributes.Public | MethodAttributes.Static)
+        {
+            Body = new CilBody()
+        };
+        caller.Body.Instructions.Add(Instruction.Create(OpCodes.Ldarg_0));
+        caller.Body.Instructions.Add(Instruction.Create(OpCodes.Ldarg_1));
+        caller.Body.Instructions.Add(Instruction.Create(OpCodes.Ldarg_2));
+        caller.Body.Instructions.Add(Instruction.Create(OpCodes.Call, toggle));
+        caller.Body.Instructions.Add(Instruction.Create(OpCodes.Ret));
+        probe.Methods.Add(caller);
     }
 
     private static void AddUnrelatedThreadYield(ModuleDef module, TypeDef probe)
@@ -2671,7 +4201,7 @@ public sealed class PcCompatManagedBridgeRewriteTests
         var directory = new DirectoryInfo(TestContext.CurrentContext.TestDirectory);
         while (directory != null)
         {
-            if (File.Exists(Path.Combine(directory.FullName, "StArray.ModManager.slnx")))
+            if (Directory.Exists(Path.Combine(directory.FullName, "JipperResourcePack_release")))
                 return directory.FullName;
             directory = directory.Parent;
         }

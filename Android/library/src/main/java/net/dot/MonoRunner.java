@@ -4,6 +4,7 @@
 package net.dot;
 
 import android.util.Log;
+import java.io.File;
 import java.util.ArrayList;
 
 /**
@@ -62,42 +63,83 @@ public final class MonoRunner {
      * @return 托管退出码
      */
     public static int run(String entryDll, String typeName, String methodName, String... args) {
-        if (s_dotnetRoot == null)
+        final long startedAt = android.os.SystemClock.elapsedRealtime();
+        Log.i(TAG, "[DEBUG-coreclr-init-v2] run begin root=" + s_dotnetRoot
+                + " entry=" + entryDll + " type=" + typeName + " method=" + methodName
+                + " initialized=" + s_initialized + " args=" + (args == null ? -1 : args.length));
+        if (s_dotnetRoot == null || s_dotnetRoot.isEmpty()) {
+            Log.e(TAG, "[DEBUG-coreclr-init-v2] run rejected: dotnetRoot is empty");
             throw new IllegalStateException("dotnetRoot not set");
+        }
+        if (entryDll == null || entryDll.isEmpty() || typeName == null || typeName.isEmpty()
+                || methodName == null || methodName.isEmpty()) {
+            Log.e(TAG, "[DEBUG-coreclr-init-v2] run rejected: entry/type/method is empty");
+            throw new IllegalArgumentException("CoreCLR entry arguments must not be empty");
+        }
 
-        Log.i(TAG, "dotnetRoot=" + s_dotnetRoot
+        Log.i(TAG, "[DEBUG-coreclr-init-v2] inputs root=" + s_dotnetRoot
                 + " entry=" + entryDll
                 + " args=" + java.util.Arrays.toString(args)
                 + " dirs=" + s_assemblyDirs
                 + " native=" + s_nativeDirs);
+        File root = new File(s_dotnetRoot);
+        File entry = new File(root, entryDll);
+        Log.i(TAG, "[DEBUG-coreclr-init-v2] path rootExists=" + root.exists()
+                + " rootDir=" + root.isDirectory() + " rootReadable=" + root.canRead()
+                + " entry=" + entry.getAbsolutePath() + " entryExists=" + entry.exists()
+                + " entryReadable=" + entry.canRead() + " entryBytes="
+                + (entry.exists() ? entry.length() : -1));
 
         // 环境变量
-        setEnv("DOTNET_ROOT", s_dotnetRoot);
-        setEnv("DOTNET_CLI_TELEMETRY_OPTOUT", "1");
-        setEnv("HOME", s_dotnetRoot);
+        int dotnetRootEnv = setEnv("DOTNET_ROOT", s_dotnetRoot);
+        int telemetryEnv = setEnv("DOTNET_CLI_TELEMETRY_OPTOUT", "1");
+        int homeEnv = setEnv("HOME", s_dotnetRoot);
+        Log.i(TAG, "[DEBUG-coreclr-init-v2] env basic dotnetRoot=" + dotnetRootEnv
+                + " telemetry=" + telemetryEnv + " home=" + homeEnv);
 
         // 托管搜索路径（dotnetRoot 排最前）
         s_assemblyDirs.add(0, s_dotnetRoot);
         String tpa = join(s_assemblyDirs, ":");
-        setEnv("TRUSTED_PLATFORM_ASSEMBLIES", tpa);
-        setEnv("APP_PATHS", tpa);
+        int tpaEnv = setEnv("TRUSTED_PLATFORM_ASSEMBLIES", tpa);
+        int appPathsEnv = setEnv("APP_PATHS", tpa);
 
         // 原生搜索路径
+        int nativePathsEnv = 0;
         if (!s_nativeDirs.isEmpty())
-            setEnv("NATIVE_DLL_SEARCH_DIRECTORIES", join(s_nativeDirs, ":"));
+            nativePathsEnv = setEnv("NATIVE_DLL_SEARCH_DIRECTORIES", join(s_nativeDirs, ":"));
+        Log.i(TAG, "[DEBUG-coreclr-init-v2] env paths tpaResult=" + tpaEnv
+                + " appPathsResult=" + appPathsEnv + " nativePathsResult=" + nativePathsEnv
+                + " tpaCount=" + s_assemblyDirs.size() + " nativeCount=" + s_nativeDirs.size()
+                + " tpaChars=" + tpa.length());
 
         // 初始化
+        Log.i(TAG, "[DEBUG-coreclr-init-v2] initRuntime begin elapsedMs="
+                + (android.os.SystemClock.elapsedRealtime() - startedAt));
         int rv = initRuntime(s_dotnetRoot, entryDll, 0);
-        if (rv != 0)
+        Log.i(TAG, "[DEBUG-coreclr-init-v2] initRuntime end rv=0x"
+                + Integer.toHexString(rv) + " initialized=" + s_initialized
+                + " elapsedMs=" + (android.os.SystemClock.elapsedRealtime() - startedAt));
+        if (rv != 0) {
+            Log.e(TAG, "[DEBUG-coreclr-init-v2] CoreCLR initialization failed rv=0x"
+                    + Integer.toHexString(rv));
             throw new RuntimeException("coreclr_initialize: 0x" + Integer.toHexString(rv));
+        }
         s_initialized = true;
-        Log.i(TAG, "CoreCLR initialized");
+        Log.i(TAG, "[DEBUG-coreclr-init-v2] CoreCLR initialized elapsedMs="
+                + (android.os.SystemClock.elapsedRealtime() - startedAt));
 
         // delegate 调用（传参）
-        if (args.length > 0)
-            return execEntryPointWithArgs(entryDll, entryDll, typeName, methodName, args);
-        else
-            return execEntryPoint(entryDll, entryDll, typeName, methodName);
+        if (args.length > 0) {
+            int result = execEntryPointWithArgs(entryDll, entryDll, typeName, methodName, args);
+            Log.i(TAG, "[DEBUG-coreclr-init-v2] entry end rv=" + result + " elapsedMs="
+                    + (android.os.SystemClock.elapsedRealtime() - startedAt));
+            return result;
+        } else {
+            int result = execEntryPoint(entryDll, entryDll, typeName, methodName);
+            Log.i(TAG, "[DEBUG-coreclr-init-v2] entry end rv=" + result + " elapsedMs="
+                    + (android.os.SystemClock.elapsedRealtime() - startedAt));
+            return result;
+        }
     }
 
     public static void stop() {

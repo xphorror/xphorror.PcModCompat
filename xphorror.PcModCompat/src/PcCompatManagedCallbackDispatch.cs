@@ -167,6 +167,13 @@ public sealed class PcCompatManagedEventRuleInfo
     public required string CallbackType { get; init; }
     public required string CallbackMethod { get; init; }
     public PcCompatPatchKind PatchKind { get; init; } = PcCompatPatchKind.Postfix;
+
+    /// <summary>
+    /// Set for a render-component rule. These have no Harmony shim registration to bind to - the
+    /// dispatch target is a per-instance managed component resolved at hook time from the instance
+    /// pointer, not a static callback resolved once at build time.
+    /// </summary>
+    public bool IsRenderCallback { get; init; }
 }
 
 /// <summary>
@@ -200,8 +207,10 @@ public static class PcCompatManagedEventRecipeReader
     private const int RuleRecordSize = 36;
     private const uint ManagedEventOpCode = 21; // PcCompatRuleOp.ManagedEventCallback
     private const uint ManagedPrefixOpCode = 23; // PcCompatRuleOp.ManagedSynchronousPrefix
+    private const uint ManagedRenderOpCode = 24; // PcCompatRuleOp.ManagedRenderCallback
     private const string RuleIdPrefix = "managed_event:";
     private const string PrefixRuleIdPrefix = "managed_prefix:";
+    private const string RenderRuleIdPrefix = "managed_render:";
     private static readonly byte[] Magic = "XPHUIRCP"u8.ToArray();
 
     public static PcCompatManagedEventRuleInfo[] Read(string recipePath)
@@ -277,16 +286,22 @@ public static class PcCompatManagedEventRecipeReader
             {
                 var ruleCursor = checked((int)(rules.Offset + (ruleStart + ruleIndex) * RuleRecordSize));
                 var opCode = BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(ruleCursor + 16));
-                if (opCode is not (ManagedEventOpCode or ManagedPrefixOpCode))
+                if (opCode is not (ManagedEventOpCode or ManagedPrefixOpCode or ManagedRenderOpCode))
                     continue;
 
                 var ruleId = ReadString(BinaryPrimitives.ReadUInt32LittleEndian(data.AsSpan(ruleCursor)));
-                var patchKind = opCode == ManagedPrefixOpCode
+                var patchKind = opCode is ManagedPrefixOpCode or ManagedRenderOpCode
                     ? PcCompatPatchKind.Prefix
                     : PcCompatPatchKind.Postfix;
+                var idPrefix = opCode switch
+                {
+                    ManagedRenderOpCode => RenderRuleIdPrefix,
+                    ManagedPrefixOpCode => PrefixRuleIdPrefix,
+                    _ => RuleIdPrefix
+                };
                 if (!TryParseRuleId(
                         ruleId,
-                        patchKind == PcCompatPatchKind.Prefix ? PrefixRuleIdPrefix : RuleIdPrefix,
+                        idPrefix,
                         out var patchId,
                         out var callbackType,
                         out var callbackMethod))
@@ -302,7 +317,8 @@ public static class PcCompatManagedEventRecipeReader
                     ParameterTypes = parameterTypes,
                     CallbackType = callbackType,
                     CallbackMethod = callbackMethod,
-                    PatchKind = patchKind
+                    PatchKind = patchKind,
+                    IsRenderCallback = opCode == ManagedRenderOpCode
                 });
             }
         }
@@ -374,6 +390,7 @@ public sealed class PcCompatManagedCallbackDispatcher
     private readonly PcCompatManagedStateStore _stateStore;
     private readonly PcCompatManagedPrefixOrderEntry[] _prefixOrderPlan;
     private readonly PcCompatManagedPostfixOrderEntry[] _postfixOrderPlan;
+    private readonly HashSet<uint> _renderPatchIds;
     private readonly List<string> _skipReasons = new();
     private int _drainFailureCount;
     private int _parsedRuleCount;
@@ -396,7 +413,8 @@ public sealed class PcCompatManagedCallbackDispatcher
         Dictionary<uint, CallbackBinding> bindings,
         Dictionary<uint, CallbackBinding> prefixBindings,
         PcCompatManagedPrefixOrderEntry[] prefixOrderPlan,
-        PcCompatManagedPostfixOrderEntry[] postfixOrderPlan)
+        PcCompatManagedPostfixOrderEntry[] postfixOrderPlan,
+        HashSet<uint> renderPatchIds)
     {
         _modId = modId;
         _bindings = bindings;
@@ -405,11 +423,12 @@ public sealed class PcCompatManagedCallbackDispatcher
             bindings.Values.SelectMany(binding => binding.StateKeys));
         _prefixOrderPlan = prefixOrderPlan;
         _postfixOrderPlan = postfixOrderPlan;
+        _renderPatchIds = renderPatchIds;
     }
 
-    public int RuleCount => _bindings.Count + _prefixBindings.Count;
+    public int RuleCount => _bindings.Count + _prefixBindings.Count + _renderPatchIds.Count;
 
-    public int PrefixRuleCount => _prefixBindings.Count;
+    public int PrefixRuleCount => _prefixBindings.Count + _renderPatchIds.Count;
 
     public IReadOnlyList<PcCompatManagedPrefixOrderEntry> PrefixOrderPlan => _prefixOrderPlan;
 
@@ -448,6 +467,7 @@ public sealed class PcCompatManagedCallbackDispatcher
         var rules = PcCompatManagedEventRecipeReader.Read(recipePath);
         var bindings = new Dictionary<uint, CallbackBinding>();
         var prefixBindings = new Dictionary<uint, CallbackBinding>();
+        var renderPatchIds = new HashSet<uint>();
         var prefixOrderPlan = new List<PcCompatManagedPrefixOrderEntry>();
         var postfixOrderPlan = new List<PcCompatManagedPostfixOrderEntry>();
         var skipReasons = new List<string>();
@@ -458,6 +478,15 @@ public sealed class PcCompatManagedCallbackDispatcher
                 : bindings;
             if (destination.ContainsKey(rule.PatchId))
                 continue;
+
+            // A render rule has no shim registration and no static callback, so it skips the whole
+            // binding construction below. It is recorded as a patch id the dispatcher recognizes; the
+            // actual receiver is looked up per call from the instance pointer by the component bridge.
+            if (rule.IsRenderCallback)
+            {
+                renderPatchIds.Add(rule.PatchId);
+                continue;
+            }
 
             var registration = registrations
                 .Where(candidate =>
@@ -539,7 +568,8 @@ public sealed class PcCompatManagedCallbackDispatcher
             bindings,
             prefixBindings,
             prefixOrderPlan.ToArray(),
-            postfixOrderPlan.ToArray())
+            postfixOrderPlan.ToArray(),
+            renderPatchIds)
         {
             _parsedRuleCount = rules.Length
         };
@@ -556,13 +586,38 @@ public sealed class PcCompatManagedCallbackDispatcher
         runOriginal = invocation.RunOriginal != 0;
         if (!invocation.HasValidLayout)
             return false;
+
+        // Render callbacks route to the component bridge instead of a CallbackBinding: the receiver
+        // is an instance resolved from the invocation's own instance pointer, so there is nothing to
+        // bind at build time. Success means the managed override consumed the callback, which by the
+        // design's complete-replacement rule also means the host's own mesh build must be skipped.
+        if (_renderPatchIds.Contains(patchId))
+        {
+            if (!PcCompatManagedComponentBridge.TryDispatchRenderCallback(
+                    unchecked((long)invocation.Instance),
+                    checked((nint)invocation.Argument0)))
+            {
+                Interlocked.Increment(ref _failedCallbacks);
+                return false;
+            }
+            invocation.RunOriginal = 0;
+            runOriginal = false;
+            Interlocked.Increment(ref _dispatchedCallbacks);
+            return true;
+        }
+
         if (!_prefixBindings.TryGetValue(patchId, out var binding) || binding.Disabled)
             return false;
 
         var before = invocation;
         try
         {
-            binding.InvokePrefix(ref invocation, boxedValueReader, _stateStore);
+            if (!binding.InvokePrefix(ref invocation, boxedValueReader, _stateStore))
+            {
+                invocation = before;
+                runOriginal = before.RunOriginal != 0;
+                return false;
+            }
             runOriginal = invocation.RunOriginal != 0;
             Interlocked.Increment(ref _dispatchedCallbacks);
             return true;
@@ -676,14 +731,15 @@ public sealed class PcCompatManagedCallbackDispatcher
 
         try
         {
-            binding.Invoke(
+            if (!binding.Invoke(
                 instance,
                 buffer,
                 cursor + 16,
                 argCount,
                 boxedValueReader,
                 postfixInvocation,
-                _stateStore);
+                _stateStore))
+                return;
             Interlocked.Increment(ref _dispatchedCallbacks);
         }
         catch (Exception exception)
@@ -851,17 +907,22 @@ public sealed class PcCompatManagedCallbackDispatcher
             }
             if (name == "__args")
             {
-                if (!synchronousPrefix)
-                {
-                    invalidReason = "Postfix __args cannot write back after the native invocation returned";
-                    return false;
-                }
                 if (parameter.ParameterType != typeof(object[]) || parameter.IsOut)
                 {
                     invalidReason = "__args must be object[]";
                     return false;
                 }
-                if (!TryCreateArgsBinding(rule, targetParameters, out var argsBinding, out invalidReason))
+                if (!synchronousPrefix && HasByRefTargetParameter(rule, targetParameters))
+                {
+                    invalidReason = "deferred Postfix __args cannot expose ref/out target parameters";
+                    return false;
+                }
+                if (!TryCreateArgsBinding(
+                        rule,
+                        targetParameters,
+                        writeBack: synchronousPrefix,
+                        out var argsBinding,
+                        out invalidReason))
                     return false;
                 bindings.Add(argsBinding);
                 continue;
@@ -896,9 +957,9 @@ public sealed class PcCompatManagedCallbackDispatcher
             }
             if (name == "__result")
             {
-                if (!synchronousPrefix)
+                if (!synchronousPrefix && (parameter.ParameterType.IsByRef || parameter.IsOut))
                 {
-                    invalidReason = "Postfix __result requires the synchronous result event bridge";
+                    invalidReason = "deferred Postfix cannot write back ref/out __result";
                     return false;
                 }
                 if (!TryCreateResultBinding(parameter, rule, out var resultBinding, out invalidReason))
@@ -931,9 +992,15 @@ public sealed class PcCompatManagedCallbackDispatcher
             }
             if (name == "__instance")
             {
-                if (parameter.ParameterType.IsByRef || parameter.IsOut)
+                var writeBackInstance = parameter.ParameterType.IsByRef || parameter.IsOut;
+                if (writeBackInstance && !synchronousPrefix)
                 {
-                    invalidReason = "ref/out __instance is not supported by the current invocation ABI";
+                    invalidReason = "deferred Postfix cannot write back ref/out __instance";
+                    return false;
+                }
+                if (writeBackInstance && rule.TargetIsStatic)
+                {
+                    invalidReason = "ref/out __instance cannot bind to a static target";
                     return false;
                 }
                 if (targetProxyType == null)
@@ -941,16 +1008,33 @@ public sealed class PcCompatManagedCallbackDispatcher
                     invalidReason = "target proxy type not found: " + rule.TargetType;
                     return false;
                 }
-                var wrapType = parameter.ParameterType == typeof(object)
+                var declaredType = UnwrapByRef(parameter.ParameterType);
+                var wrapType = declaredType == typeof(object)
                     ? targetProxyType
-                    : parameter.ParameterType;
+                    : declaredType;
                 var ctor = FindPointerConstructor(wrapType);
                 if (ctor == null)
                 {
                     invalidReason = $"__instance wrap type {wrapType.FullName} has no (IntPtr) constructor";
                     return false;
                 }
-                bindings.Add(new InstanceParamBinding(ctor));
+                PropertyInfo? pointerProperty = null;
+                if (writeBackInstance)
+                {
+                    pointerProperty = wrapType.GetProperty(
+                        "Pointer",
+                        BindingFlags.Public | BindingFlags.Instance);
+                    if (pointerProperty?.PropertyType != typeof(IntPtr) || pointerProperty.GetMethod == null)
+                    {
+                        invalidReason = $"ref/out __instance type {wrapType.FullName} has no readable IntPtr Pointer";
+                        return false;
+                    }
+                }
+                bindings.Add(new InstanceParamBinding(
+                    ctor,
+                    pointerProperty,
+                    writeBackInstance,
+                    parameter.IsOut));
                 continue;
             }
 
@@ -1055,6 +1139,7 @@ public sealed class PcCompatManagedCallbackDispatcher
     private static bool TryCreateArgsBinding(
         PcCompatManagedEventRuleInfo rule,
         ParameterInfo[]? targetParameters,
+        bool writeBack,
         out ParamBinding binding,
         out string error)
     {
@@ -1083,7 +1168,7 @@ public sealed class PcCompatManagedCallbackDispatcher
                 error = $"__args slot {index}: {conversionError}";
                 return false;
             }
-            if (!conversion.CanWriteBackFromArgs)
+            if (writeBack && !conversion.CanWriteBackFromArgs)
             {
                 error = $"__args slot {index} type {parameterType.FullName} has no safe native write-back";
                 return false;
@@ -1091,8 +1176,23 @@ public sealed class PcCompatManagedCallbackDispatcher
             conversions[index] = conversion;
         }
 
-        binding = new ArgsParamBinding(conversions);
+        binding = new ArgsParamBinding(conversions, writeBack);
         return true;
+    }
+
+    private static bool HasByRefTargetParameter(
+        PcCompatManagedEventRuleInfo rule,
+        ParameterInfo[]? targetParameters)
+    {
+        if (targetParameters != null && targetParameters.Any(parameter =>
+                parameter.ParameterType.IsByRef || parameter.IsOut))
+        {
+            return true;
+        }
+
+        // A trimmed proxy may not expose the target MethodInfo. The recipe still retains
+        // the metadata signature, where ECMA-335 byref parameters are spelled with '&'.
+        return rule.ParameterTypes.Any(typeName => typeName.EndsWith("&", StringComparison.Ordinal));
     }
 
     private static Type UnwrapByRef(Type type)
@@ -1476,8 +1576,23 @@ public sealed class PcCompatManagedCallbackDispatcher
     private sealed class InstanceParamBinding : ParamBinding
     {
         private readonly Func<IntPtr, object> _construct;
+        private readonly Func<object, IntPtr>? _readPointer;
+        private readonly bool _writeBack;
+        private readonly bool _isOut;
 
-        public InstanceParamBinding(ConstructorInfo ctor) => _construct = CompilePointerConstructor(ctor);
+        public InstanceParamBinding(
+            ConstructorInfo ctor,
+            PropertyInfo? pointerProperty,
+            bool writeBack,
+            bool isOut)
+        {
+            _construct = CompilePointerConstructor(ctor);
+            _readPointer = pointerProperty == null ? null : CompilePointerReader(pointerProperty);
+            _writeBack = writeBack;
+            _isOut = isOut;
+        }
+
+        public override bool AffectsOriginal => _writeBack;
 
         public override object? Resolve(
             ulong instance,
@@ -1495,9 +1610,22 @@ public sealed class PcCompatManagedCallbackDispatcher
             ref PcCompatManagedPrefixInvocationV2 invocation,
             PcCompatManagedBoxedValueHandler boxedValueReader,
             PcCompatManagedStateStore stateStore)
-            => invocation.Instance == 0
+            => _isOut || invocation.Instance == 0
                 ? null
                 : _construct((IntPtr)invocation.Instance);
+
+        public override void WriteBackPrefix(
+            object? value,
+            ref PcCompatManagedPrefixInvocationV2 invocation,
+            PcCompatManagedStateStore stateStore)
+        {
+            if (!_writeBack)
+                return;
+            invocation.Instance = value == null
+                ? 0
+                : unchecked((ulong)(_readPointer
+                    ?? throw new InvalidOperationException("ref/out __instance has no pointer reader"))(value).ToInt64());
+        }
     }
 
     private sealed class FieldParamBinding : ParamBinding
@@ -1649,6 +1777,21 @@ public sealed class PcCompatManagedCallbackDispatcher
             return _conversion.Convert(invocation.ResultValue, boxedValueReader);
         }
 
+        public override object? ResolvePostfix(
+            ulong instance,
+            byte[] buffer,
+            int argsOffset,
+            uint argCount,
+            PcCompatManagedBoxedValueHandler boxedValueReader,
+            in PcCompatManagedPostfixInvocation invocation,
+            PcCompatManagedStateStore stateStore)
+        {
+            ValidateKind(invocation.ResultKind);
+            if (invocation.ResultValid == 0)
+                throw new InvalidOperationException("managed Postfix result is unavailable");
+            return _conversion.Convert(invocation.ResultValue, boxedValueReader);
+        }
+
         public override void WriteBackPrefix(
             object? value,
             ref PcCompatManagedPrefixInvocationV2 invocation,
@@ -1665,7 +1808,7 @@ public sealed class PcCompatManagedCallbackDispatcher
         {
             if (actual != _resultKind)
                 throw new InvalidOperationException(
-                    $"managed Prefix result kind mismatch expected={_resultKind} actual={actual}");
+                    $"managed result kind mismatch expected={_resultKind} actual={actual}");
         }
     }
 
@@ -1725,10 +1868,15 @@ public sealed class PcCompatManagedCallbackDispatcher
     private sealed class ArgsParamBinding : ParamBinding
     {
         private readonly SlotConversion[] _conversions;
+        private readonly bool _writeBack;
 
-        public ArgsParamBinding(SlotConversion[] conversions) => _conversions = conversions;
+        public ArgsParamBinding(SlotConversion[] conversions, bool writeBack)
+        {
+            _conversions = conversions;
+            _writeBack = writeBack;
+        }
 
-        public override bool AffectsOriginal => true;
+        public override bool AffectsOriginal => _writeBack;
 
         public override object? Resolve(
             ulong instance,
@@ -1736,7 +1884,21 @@ public sealed class PcCompatManagedCallbackDispatcher
             int argsOffset,
             uint argCount,
             PcCompatManagedBoxedValueHandler boxedValueReader)
-            => throw new InvalidOperationException("__args requires a synchronous Prefix invocation.");
+        {
+            if (_writeBack)
+                throw new InvalidOperationException("__args write-back requires a synchronous Prefix invocation.");
+            if (argCount != _conversions.Length)
+                throw new InvalidOperationException("__args invocation arity does not match the bound target.");
+
+            var args = new object?[_conversions.Length];
+            for (var index = 0; index < args.Length; ++index)
+            {
+                var raw = BinaryPrimitives.ReadUInt64LittleEndian(
+                    buffer.AsSpan(argsOffset + index * sizeof(ulong)));
+                args[index] = _conversions[index].Convert(raw, boxedValueReader);
+            }
+            return args;
+        }
 
         public override object ResolvePrefix(
             ref PcCompatManagedPrefixInvocationV2 invocation,
@@ -1833,6 +1995,8 @@ public sealed class PcCompatManagedCallbackDispatcher
 
         public virtual ulong ConvertBackFromArgs(object? value) => ConvertBack(value);
     }
+
+    private static readonly object CallbackNotApplicable = new();
 
     private sealed class PrimitiveSlotConversion : SlotConversion
     {
@@ -2025,8 +2189,14 @@ public sealed class PcCompatManagedCallbackDispatcher
             if (!boxedValueReader((IntPtr)raw, out var typeName, out var value) || string.IsNullOrEmpty(typeName))
                 throw new InvalidOperationException("boxed enum read failed");
             var enumType = ResolveProxyType(typeName!);
-            if (enumType == null || !enumType.IsEnum)
+            if (enumType == null)
                 throw new InvalidOperationException("boxed enum proxy type not found: " + typeName);
+            if (!enumType.IsEnum)
+            {
+                // One generic-shared IL2CPP method pointer can serve multiple closed
+                // value-type instantiations. This System.Enum rule does not own them.
+                return CallbackNotApplicable;
+            }
             return Enum.ToObject(enumType, value);
         }
     }
@@ -2183,7 +2353,7 @@ public sealed class PcCompatManagedCallbackDispatcher
 
         public IReadOnlyList<string> StateKeys => _stateKeys;
 
-        public void Invoke(
+        public bool Invoke(
             ulong instance,
             byte[] buffer,
             int argsOffset,
@@ -2206,6 +2376,7 @@ public sealed class PcCompatManagedCallbackDispatcher
                 else
                 {
                     for (var index = 0; index < _parameters.Length; ++index)
+                    {
                         _invokeArgs[index] = _parameters[index].ResolvePostfix(
                             instance,
                             buffer,
@@ -2214,6 +2385,9 @@ public sealed class PcCompatManagedCallbackDispatcher
                             boxedValueReader,
                             invocation,
                             stateStore);
+                        if (ReferenceEquals(_invokeArgs[index], CallbackNotApplicable))
+                            return false;
+                    }
 
                     try
                     {
@@ -2230,6 +2404,7 @@ public sealed class PcCompatManagedCallbackDispatcher
                 Interlocked.Increment(ref _successCount);
                 Volatile.Write(ref _failureCount, 0);
                 Volatile.Write(ref _retryAfterTimestamp, 0);
+                return true;
             }
             finally
             {
@@ -2238,7 +2413,7 @@ public sealed class PcCompatManagedCallbackDispatcher
             }
         }
 
-        public void InvokePrefix(
+        public bool InvokePrefix(
             ref PcCompatManagedPrefixInvocationV2 invocation,
             PcCompatManagedBoxedValueHandler boxedValueReader,
             PcCompatManagedStateStore stateStore)
@@ -2246,7 +2421,7 @@ public sealed class PcCompatManagedCallbackDispatcher
             if (!_synchronousPrefix)
                 throw new InvalidOperationException("Callback binding is not a synchronous Prefix.");
             if (invocation.RunOriginal == 0 && _affectsOriginal)
-                return;
+                return true;
 
             var started = Stopwatch.GetTimestamp();
             object? result = null;
@@ -2277,6 +2452,8 @@ public sealed class PcCompatManagedCallbackDispatcher
                             ref invocation,
                             boxedValueReader,
                             stateStore);
+                        if (ReferenceEquals(invokeArgs[index], CallbackNotApplicable))
+                            return false;
                     }
 
                     result = _compiledResultInvoker != null
@@ -2293,6 +2470,7 @@ public sealed class PcCompatManagedCallbackDispatcher
                 Interlocked.Increment(ref _successCount);
                 Volatile.Write(ref _failureCount, 0);
                 Volatile.Write(ref _retryAfterTimestamp, 0);
+                return true;
             }
             finally
             {
@@ -2456,15 +2634,34 @@ internal sealed class PcCompatManagedEventDispatchCollector
     private static readonly EntryComparer Comparer = new();
     private byte[] _records = new byte[InitialCapacity * PcCompatManagedCallbackDispatcher.EventRecordSize];
     private Entry[] _entries = new Entry[InitialCapacity];
+    private readonly List<IDisposable> _sessionLeases = [];
+    private readonly HashSet<PcCompatManagedModSession> _leasedSessions =
+        new(ReferenceEqualityComparer.Instance);
     private int _count;
     private long _ordinal;
 
     public void Reset()
     {
+        ReleaseSessionLeases();
         if (_count != 0)
             Array.Clear(_entries, 0, _count);
         _count = 0;
         _ordinal = 0;
+    }
+
+    public void RetainSessionLease(
+        PcCompatManagedModSession session,
+        IDisposable? lease)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+        if (lease == null)
+            return;
+        if (!_leasedSessions.Add(session))
+        {
+            lease.Dispose();
+            return;
+        }
+        _sessionLeases.Add(lease);
     }
 
     public void Enqueue(
@@ -2490,23 +2687,38 @@ internal sealed class PcCompatManagedEventDispatchCollector
             _ordinal++);
     }
 
-    public bool DispatchAll(PcCompatManagedBoxedValueHandler boxedValueReader)
+    public bool DispatchAll(PcCompatManagedBoxedValueHandler? boxedValueReader)
     {
-        if (_count == 0)
-            return true;
-
-        Array.Sort(_entries, 0, _count, Comparer);
-        var success = true;
-        for (var index = 0; index < _count; ++index)
+        try
         {
-            ref readonly var entry = ref _entries[index];
-            success &= entry.Session.DispatchCollectedManagedCallback(
-                entry.Dispatcher,
-                _records,
-                entry.RecordOffset,
-                boxedValueReader);
+            if (_count == 0 || boxedValueReader == null)
+                return true;
+
+            Array.Sort(_entries, 0, _count, Comparer);
+            var success = true;
+            for (var index = 0; index < _count; ++index)
+            {
+                ref readonly var entry = ref _entries[index];
+                success &= entry.Session.DispatchCollectedManagedCallbackUnderLease(
+                    entry.Dispatcher,
+                    _records,
+                    entry.RecordOffset,
+                    boxedValueReader);
+            }
+            return success;
         }
-        return success;
+        finally
+        {
+            ReleaseSessionLeases();
+        }
+    }
+
+    private void ReleaseSessionLeases()
+    {
+        for (var index = _sessionLeases.Count - 1; index >= 0; --index)
+            _sessionLeases[index].Dispose();
+        _sessionLeases.Clear();
+        _leasedSessions.Clear();
     }
 
     private void EnsureCapacity(int capacity)

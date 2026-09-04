@@ -55,10 +55,19 @@ public unsafe class Il2CppString : Il2CppObject
 {
     public Il2CppString(nint ptr) : base(ptr) { }
 
-    public int Length => Il2CppFunctions.il2cpp_string_length(Ptr);
-    public char* Chars => Il2CppFunctions.il2cpp_string_chars(Ptr);
+    public int Length => OperatingSystem.IsAndroid()
+        ? Il2CppStringReader.TryReadLength(Ptr, out var length) ? length : 0
+        : Il2CppFunctions.il2cpp_string_length(Ptr);
+    public char* Chars => OperatingSystem.IsAndroid()
+        ? Il2CppStringReader.TryGetCharsAddress(Ptr, out var chars) ? (char*)chars : null
+        : Il2CppFunctions.il2cpp_string_chars(Ptr);
 
-    public override string ToString() => Marshal.PtrToStringUni((nint)Chars, Length) ?? "";
+    public override string ToString()
+    {
+        if (OperatingSystem.IsAndroid())
+            return Il2CppStringReader.TryRead(Ptr, out var value) ? value : string.Empty;
+        return Marshal.PtrToStringUni((nint)Chars, Length) ?? "";
+    }
 
     public static Il2CppString New(string str) =>
         new(Il2CppFunctions.il2cpp_string_new(str));
@@ -71,13 +80,23 @@ public unsafe class Il2CppArray<T> : Il2CppObject where T : Il2CppObject
 {
     public Il2CppArray(nint ptr) : base(ptr) { }
 
-    public uint Length => Il2CppFunctions.il2cpp_array_length(Ptr);
+    public uint Length => OperatingSystem.IsAndroid()
+        ? Il2CppArrayReader.TryReadLength(Ptr, out var length) ? (uint)length : 0
+        : Il2CppFunctions.il2cpp_array_length(Ptr);
 
     public T? this[int index]
     {
         get
         {
-            if (index < 0 || index >= Length) return null;
+            var length = Length;
+            if (index < 0 || index >= length) return null;
+            if (OperatingSystem.IsAndroid())
+            {
+                return Il2CppArrayReader.TryReadPointerElement(Ptr, index, out var value) &&
+                       value != nint.Zero
+                    ? (T)Activator.CreateInstance(typeof(T), value)!
+                    : null;
+            }
             var data = Il2CppRuntimeApi.GetArrayDataPointer(Ptr);
             if (data == 0) return null;
             var elemPtr = data + index * nint.Size;
@@ -88,15 +107,17 @@ public unsafe class Il2CppArray<T> : Il2CppObject where T : Il2CppObject
 
     public T[] ToArray()
     {
-        var arr = new T[Length];
-        for (int i = 0; i < Length; i++) arr[i] = this[i]!;
+        var length = Length;
+        var arr = new T[length];
+        for (var i = 0; i < length; i++) arr[i] = this[i]!;
         return arr;
     }
 
     public List<T> ToList()
     {
-        var list = new List<T>((int)Length);
-        for (int i = 0; i < Length; i++) list.Add(this[i]!);
+        var length = Length;
+        var list = new List<T>((int)length);
+        for (var i = 0; i < length; i++) list.Add(this[i]!);
         return list;
     }
 }

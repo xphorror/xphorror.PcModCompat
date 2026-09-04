@@ -5,6 +5,8 @@ namespace Xphorror.PcModCompat.Resources;
 
 public static class ResourceCompiler
 {
+    public const string CompilerRevision = "resource-compiler-v3-proven-load-requests";
+
     public static ResourceCompileReport CompileModFolder(
         string modId,
         string modFolder,
@@ -25,12 +27,40 @@ public static class ResourceCompiler
         ArgumentNullException.ThrowIfNull(candidates);
         flow ??= new AssetLoadFlowReport();
 
-        var ordered = candidates
+        var indexedOrder = candidates
             .OrderBy(candidate => PlatformRank(candidate.PlatformHint))
             .ThenBy(candidate => candidate.FileName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(candidate => candidate.SourcePath, StringComparer.OrdinalIgnoreCase)
             .ToArray();
 
-        var warnings = ordered.SelectMany(candidate => candidate.Warnings).Distinct(StringComparer.Ordinal).ToList();
+        var warnings = indexedOrder
+            .SelectMany(candidate => candidate.Warnings)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+        var ordered = indexedOrder
+            .GroupBy(candidate => candidate.Sha256Hex, StringComparer.OrdinalIgnoreCase)
+            .Select(group =>
+            {
+                var canonical = group
+                    .OrderByDescending(ScoreCandidate)
+                    .ThenBy(candidate => candidate.FileName, StringComparer.OrdinalIgnoreCase)
+                    .ThenBy(candidate => candidate.SourcePath, StringComparer.OrdinalIgnoreCase)
+                    .First();
+                if (group.Skip(1).Any())
+                {
+                    var aliases = string.Join(",", group
+                        .Select(candidate => candidate.FileName)
+                        .OrderBy(name => name, StringComparer.OrdinalIgnoreCase));
+                    warnings.Add(
+                        $"duplicate candidate content collapsed sha={group.Key} " +
+                        $"canonical={canonical.FileName} aliases={aliases}");
+                }
+                return canonical;
+            })
+            .OrderBy(candidate => PlatformRank(candidate.PlatformHint))
+            .ThenBy(candidate => candidate.FileName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(candidate => candidate.SourcePath, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
         warnings.AddRange(flow.Issues);
         var unsupported = new List<string>();
         var groups = new List<ResourceFeatureGroup>();
@@ -74,6 +104,66 @@ public static class ResourceCompiler
                 SourceFieldIdentity = proven.DeclaringType + "." + proven.FieldName,
                 Reason = $"IL {proven.DeclaringType}.{proven.MethodName} asset '{proven.AssetName}' -> field {proven.FieldName} (name/type proven) @ 0x{proven.IlOffset:X4}"
             });
+        }
+
+        // A direct AssetBundle request is proof of runtime demand even when its result is stored in
+        // an instance field, a local, or consumed immediately. Do not make materialization depend on
+        // the older static-field recovery heuristic.
+        foreach (var request in flow.ProvenRequests)
+        {
+            IReadOnlyList<ResourceAssetEntry> requestedAssets;
+            if (request.Kind == AssetLoadFlowRequestKind.LoadAssetByName)
+            {
+                if (!TryFindAsset(selected, request.AssetName, request.ExpectedTypeHint, out var asset))
+                {
+                    warnings.Add(
+                        $"Proven IL LoadAsset request '{request.AssetName}' ({request.ExpectedTypeHint}) " +
+                        $"was not found in selected candidate {selected.FileName}.");
+                    continue;
+                }
+                requestedAssets = [asset];
+            }
+            else
+            {
+                requestedAssets = selected.Assets
+                    .Where(asset => !string.IsNullOrWhiteSpace(asset.Name))
+                    .Where(asset => AssetTypeMatches(asset, request.ExpectedTypeHint))
+                    .GroupBy(asset => asset.Name + "\0" + asset.TypeName, StringComparer.Ordinal)
+                    .Select(group => group.First())
+                    .OrderBy(asset => asset.Name, StringComparer.Ordinal)
+                    .ToArray();
+                if (requestedAssets.Count == 0)
+                {
+                    warnings.Add(
+                        $"Proven IL LoadAllAssets<{request.ExpectedTypeHint}> request matched no assets " +
+                        $"in selected candidate {selected.FileName}.");
+                    continue;
+                }
+            }
+
+            foreach (var asset in requestedAssets)
+            {
+                var expectedType = request.ExpectedTypeHint.Equals("Object", StringComparison.OrdinalIgnoreCase)
+                    ? asset.TypeName
+                    : request.ExpectedTypeHint;
+                if (bindings.Any(binding =>
+                        binding.AssetName.Equals(asset.Name, StringComparison.Ordinal) &&
+                        binding.ExpectedType.Equals(expectedType, StringComparison.OrdinalIgnoreCase) &&
+                        binding.Confidence == AssetBindConfidence.Proven))
+                    continue;
+                bindings.Add(new ResourceBinding
+                {
+                    FeatureGroupId = FeatureGroupIdFor(expectedType, asset.Name),
+                    AssetName = asset.Name,
+                    ExpectedType = expectedType,
+                    Confidence = AssetBindConfidence.Proven,
+                    Reason = request.Kind == AssetLoadFlowRequestKind.LoadAssetByName
+                        ? $"IL {request.DeclaringType}.{request.MethodName} directly requests " +
+                          $"LoadAsset<{expectedType}>('{asset.Name}') @ 0x{request.IlOffset:X4}"
+                        : $"IL {request.DeclaringType}.{request.MethodName} directly requests " +
+                          $"LoadAllAssets<{expectedType}>() @ 0x{request.IlOffset:X4}"
+                });
+            }
         }
 
         // UniqueType fallback only for types not already proven.
@@ -128,7 +218,8 @@ public static class ResourceCompiler
                 $"unity={selected.UnityVersion}",
                 $"assets={selected.Assets.Count}",
                 selected.HasEmbeddedTypeTree ? "typeTree=embedded" : "typeTree=missing",
-                $"provenBindings={flow.ProvenBindings.Count}"
+                $"provenBindings={flow.ProvenBindings.Count}",
+                $"provenRequests={flow.ProvenRequests.Count}"
             ]
         });
 
@@ -154,8 +245,8 @@ public static class ResourceCompiler
         if (!groups.Any(group => group.Id == "overlay.font"))
             unsupported.Add("No Font/TMP_FontAsset binding was recovered.");
 
-        if (flow.ProvenBindings.Count == 0)
-            warnings.Add("No proven LoadAsset/LoadAllAssets field stores were recovered from MOD IL.");
+        if (flow.ProvenBindings.Count == 0 && flow.ProvenRequests.Count == 0)
+            warnings.Add("No proven LoadAsset/LoadAllAssets requests were recovered from MOD IL.");
 
         var compatibility = !selected.IndexSucceeded || selected.LoadPolicy == BundleLoadPolicy.Rejected
             ? "unsupported"
@@ -306,40 +397,40 @@ public static class ResourceCompiler
 
     private static ResourceCandidateIndex? SelectPrimaryCandidate(IReadOnlyList<ResourceCandidateIndex> candidates)
     {
-        static int Score(ResourceCandidateIndex candidate)
-        {
-            var score = 0;
-            score += candidate.IndexSucceeded ? 1000 : 0;
-            score += candidate.LoadPolicy switch
-            {
-                BundleLoadPolicy.AutoLoad => 400,
-                BundleLoadPolicy.ControlledLoad => 300,
-                BundleLoadPolicy.ForceRequired => 100,
-                BundleLoadPolicy.IndexOnly => 50,
-                _ => 0
-            };
-            score += candidate.PlatformHint switch
-            {
-                BundlePlatformHint.Android => 40,
-                BundlePlatformHint.Linux => 30,
-                BundlePlatformHint.Windows => 20,
-                BundlePlatformHint.Mac => 10,
-                _ => 0
-            };
-            if (candidate.UnityVersion.StartsWith("6000.3.", StringComparison.Ordinal))
-                score += 50;
-            else if (candidate.UnityVersion.StartsWith("6000.", StringComparison.Ordinal))
-                score += 20;
-            if (candidate.FileName.Contains("2022", StringComparison.OrdinalIgnoreCase))
-                score -= 15;
-            score += Math.Min(candidate.Assets.Count, 200);
-            return score;
-        }
-
         return candidates
-            .OrderByDescending(Score)
+            .OrderByDescending(ScoreCandidate)
             .ThenBy(candidate => candidate.FileName, StringComparer.OrdinalIgnoreCase)
             .FirstOrDefault();
+    }
+
+    private static int ScoreCandidate(ResourceCandidateIndex candidate)
+    {
+        var score = 0;
+        score += candidate.IndexSucceeded ? 1000 : 0;
+        score += candidate.LoadPolicy switch
+        {
+            BundleLoadPolicy.AutoLoad => 400,
+            BundleLoadPolicy.ControlledLoad => 300,
+            BundleLoadPolicy.ForceRequired => 100,
+            BundleLoadPolicy.IndexOnly => 50,
+            _ => 0
+        };
+        score += candidate.PlatformHint switch
+        {
+            BundlePlatformHint.Android => 40,
+            BundlePlatformHint.Linux => 30,
+            BundlePlatformHint.Windows => 20,
+            BundlePlatformHint.Mac => 10,
+            _ => 0
+        };
+        if (candidate.UnityVersion.StartsWith("6000.3.", StringComparison.Ordinal))
+            score += 50;
+        else if (candidate.UnityVersion.StartsWith("6000.", StringComparison.Ordinal))
+            score += 20;
+        if (candidate.FileName.Contains("2022", StringComparison.OrdinalIgnoreCase))
+            score -= 15;
+        score += Math.Min(candidate.Assets.Count, 200);
+        return score;
     }
 
     private static int PlatformRank(BundlePlatformHint hint)

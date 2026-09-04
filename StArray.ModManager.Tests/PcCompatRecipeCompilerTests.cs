@@ -5,6 +5,78 @@ namespace StArray.ModManager.Tests;
 public class PcCompatRecipeCompilerTests
 {
     [Test]
+    public void ReversePatchStateConsumerGetsSharedTelemetryWithoutOwnerOverlay()
+    {
+        var manifest = new PcModManifest
+        {
+            Id = "ReversePatchStateConsumer",
+            DisplayName = "ReversePatchStateConsumer",
+            Version = "1.0.0",
+            EntryMethod = "Test.Entry.Load",
+            FolderPath = TestContext.CurrentContext.WorkDirectory
+        };
+        var translation = new PcCompatCallbackTranslationReport
+        {
+            ModId = manifest.Id,
+            TargetGameRevision = 143,
+            Rules = new[]
+            {
+                new PcCompatCompiledRule
+                {
+                    Id = "state-consumer.anchor",
+                    FeatureId = "state_consumer",
+                    TargetType = "scrController",
+                    TargetMethod = "StartLoadingScene",
+                    ParamCount = 0,
+                    TargetIsStatic = false,
+                    TargetReturnType = "System.Void",
+                    TargetParameterTypes = Array.Empty<string>(),
+                    Stage = PcCompatRuleStage.AfterOriginal,
+                    Op = PcCompatRuleOp.ManagedEventCallback,
+                    RequiredCapabilities = PcCompatCapability.AfterOriginalObserve
+                }
+            },
+            Items = new[]
+            {
+                new PcCompatCallbackTranslationItem
+                {
+                    TargetType = "scrController",
+                    TargetMethod = "GetProgress",
+                    CallbackType = "Test.State",
+                    CallbackMethod = "GetProgress",
+                    PatchKind = PcCompatPatchKind.ReversePatch,
+                    Status = PcCompatCallbackTranslationStatus.Skipped,
+                    Reason = "ReversePatch is handled by the dedicated state bridge."
+                }
+            }
+        };
+
+        var ok = PcCompatRecipeCompiler.TryCompile(
+            manifest,
+            translation,
+            out var report,
+            out var error);
+
+        Assert.That(ok, Is.True, error);
+        var telemetry = report.Rules.Single(rule =>
+            rule.Op == PcCompatRuleOp.OverlayPollTelemetry &&
+            rule.TargetType == "scrController" &&
+            rule.TargetMethod == "PlayerControl_Update");
+        Assert.Multiple(() =>
+        {
+            Assert.That(
+                telemetry.RequiredCapabilities.HasFlag(PcCompatCapability.UiOverlay),
+                Is.False);
+            Assert.That(
+                telemetry.RequiredCapabilities.HasFlag(PcCompatCapability.ReadIl2CppField),
+                Is.True);
+            Assert.That(
+                telemetry.RequiredCapabilities.HasFlag(PcCompatCapability.CallIl2CppGetter),
+                Is.True);
+        });
+    }
+
+    [Test]
     public void CompilesVerifiedFixedOpRecipeWithoutIdentitySelection()
     {
         var source = ReadSampleManifest();
@@ -556,7 +628,7 @@ public class PcCompatRecipeCompilerTests
         {
             Environment.SetEnvironmentVariable(recipeOnlyVariable, "1");
             var ex = Assert.Throws<NotSupportedException>(() => PcCompatRuntime.RegisterMod(manifest));
-            Assert.That(ex!.Message, Does.Contain("No verified fixed-op callback rules"));
+            Assert.That(ex!.Message, Does.Contain("No verified fixed-op or managed callback rules"));
             Assert.That(PcCompatRuntime.GetRecipeReport("UnknownMod"), Is.Null);
             Assert.That(PcCompatRuntime.SnapshotSessions(), Is.Empty);
         }

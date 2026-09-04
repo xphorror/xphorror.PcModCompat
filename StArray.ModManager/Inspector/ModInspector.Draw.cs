@@ -50,6 +50,10 @@ partial class ModInspector
     {
         newValue = value;
         var type = e.ValueType;
+        L10n.RegisterDynamicGlyphText(
+            e.Label,
+            value as string,
+            value is Enum enumValue ? enumValue.ToString() : null);
 
         // ---- 颜色（优先于 Vector4 / uint 的默认绘制）----
         if (e.IsColor && TryDrawColor(e, value, out newValue)) return true;
@@ -452,6 +456,7 @@ partial class ModInspector
     {
         var capturing = CapturingHotkeys.Contains(label);
         var text = capturing ? L10n.Get("Inspector_HotkeyPress") : hk.ToString();
+        L10n.RegisterDynamicGlyphText(text, label);
 
         if (ImGui.Button($"{text}{label}", new Vector2(ImGui.CalcItemWidth(), 0)))
         {
@@ -511,6 +516,9 @@ partial class ModInspector
 
         for (var i = 0; i < list.Count; i++)
         {
+            L10n.RegisterDynamicGlyphText(
+                list[i] as string,
+                list[i] is Enum enumValue ? enumValue.ToString() : null);
             ImGui.PushID(i);
             ImGui.SetNextItemWidth(Math.Max(80, ImGui.GetContentRegionAvail().X - 60));
 
@@ -552,6 +560,7 @@ partial class ModInspector
     private static bool TryDrawEnum(string label, Type type, object value, out object? newValue)
     {
         var names = System.Enum.GetNames(type);
+        L10n.RegisterDynamicGlyphText(names);
         var idx = Math.Max(0, Array.IndexOf(names, value.ToString() ?? ""));
         if (ImGui.Combo(label, ref idx, names, names.Length))
         {
@@ -572,10 +581,18 @@ partial class ModInspector
         if (!ImGui.TreeNode(e.Label)) return type.IsValueType;
 
         var currentJson = System.Text.Json.JsonSerializer.Serialize(value, SettingsJson);
-        var editText = JsonEditCache.GetOrAdd(key, currentJson);
+        if (!JsonEditCache.TryGetValue(key, out var editText))
+        {
+            editText = currentJson;
+            JsonEditCache[key] = editText;
+            L10n.RegisterDynamicGlyphText(currentJson);
+        }
 
         if (editText != currentJson && !ImGui.IsItemActive())
+        {
             editText = JsonEditCache[key] = currentJson;
+            L10n.RegisterDynamicGlyphText(currentJson);
+        }
 
         var lines = Math.Max(3, editText.Split('\n').Length);
         var width = Math.Max(300, ImGui.GetContentRegionAvail().X - 20);
@@ -585,6 +602,7 @@ partial class ModInspector
         if (changed)
         {
             JsonEditCache[key] = editText;
+            L10n.RegisterDynamicGlyphText(editText);
             try
             {
                 var deserialized = System.Text.Json.JsonSerializer.Deserialize(editText, type, SettingsJson);

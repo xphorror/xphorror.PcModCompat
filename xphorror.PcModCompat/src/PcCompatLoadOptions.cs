@@ -1,5 +1,7 @@
 namespace Xphorror.PcModCompat;
 
+using StArray.ModManager.Runtime;
+
 public sealed class PcCompatLoadOptions
 {
     public string? ShimFolder { get; init; }
@@ -10,4 +12,7 @@ public sealed class PcCompatLoadOptions
     public bool AllowLegacyStubExecution { get; init; }
     public bool TryBootstrap { get; init; } = true;
     public bool Enable { get; init; }
+    internal ModRuntimeSession? RuntimeSession { get; init; }
+    internal ModRuntimeKey RuntimeKey { get; init; }
+    internal PcCompatModSessionLease? PcModSession { get; init; }
 }

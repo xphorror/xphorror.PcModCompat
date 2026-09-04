@@ -67,7 +67,12 @@ public enum PcCompatRuleOp
     GameplayAcceptedObserve = 22,
     // Hook-thread synchronous reverse-P/Invoke. A void Prefix continues; a bool
     // Prefix returning false skips the original. Keep in sync with native.
-    ManagedSynchronousPrefix = 23
+    ManagedSynchronousPrefix = 23,
+    // A synchronous prefix restricted to MOD-owned host component instances, used to forward a
+    // Unity render callback to a managed component absent from the IL2CPP class table. The hook
+    // target is a game-used component too, so native prefilters on a registered instance-pointer
+    // set before crossing the boundary. Keep in sync with kRuleOpManagedRenderCallback.
+    ManagedRenderCallback = 24
 }
 
 public sealed class PcCompatCompiledRule

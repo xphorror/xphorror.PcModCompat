@@ -115,18 +115,22 @@ public static class PcCompatResourceChangerRuntime
     public static bool TryDisable(string modId)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(modId);
-        PcCompatResourceChangerState state;
         lock (Gate)
         {
-            if (!Latest.TryGetValue(modId, out state!))
+            if (!Latest.TryGetValue(modId, out var state))
                 return false;
+            var disabled = state with
+            {
+                ChangeRabbit = false,
+                ChangeBallColor = false,
+                ChangeTileColor = false
+            };
+            Latest[modId] = disabled;
+            if (s_settingsSink == null)
+                return false;
+            s_settingsSink(disabled);
+            return true;
         }
-        return TryPublish(state with
-        {
-            ChangeRabbit = false,
-            ChangeBallColor = false,
-            ChangeTileColor = false
-        });
     }
 
     public static void Remove(string modId)

@@ -95,7 +95,7 @@ public sealed class PcCompatSimpleReflectTests
         var directory = new DirectoryInfo(TestContext.CurrentContext.TestDirectory);
         while (directory is not null)
         {
-            if (File.Exists(Path.Combine(directory.FullName, "build.ps1")) &&
+            if (File.Exists(Path.Combine(directory.FullName, "build_android_single.ps1")) &&
                 Directory.Exists(Path.Combine(directory.FullName, "xphorror.PcModCompat")))
             {
                 return directory.FullName;

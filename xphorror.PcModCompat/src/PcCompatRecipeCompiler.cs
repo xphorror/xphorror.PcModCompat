@@ -47,14 +47,18 @@ public static class PcCompatRecipeCompiler
             .OrderBy(rule => rule.Id, StringComparer.Ordinal)
             .ToList();
 
+        var managedEventMisses = EmitManagedEventRules(rules, callbackTranslation);
+        EmitManagedRenderCallbackRules(
+            rules,
+            staticScan?.ManagedRenderComponents ??
+            Array.Empty<PcCompatManagedRenderComponentDescriptor>());
         if (rules.Count == 0)
         {
-            error = $"No verified fixed-op callback rules are available for mod id={manifest.Id}";
+            error = $"No verified fixed-op or managed callback rules are available for mod id={manifest.Id}";
             return false;
         }
 
-        AddPlatformRules(rules);
-        var managedEventMisses = EmitManagedEventRules(rules, callbackTranslation);
+        AddPlatformRules(rules, callbackTranslation);
 
         var unsupported = callbackTranslation.Items
             .Where(item => item.Status is PcCompatCallbackTranslationStatus.NotMapped or
@@ -298,12 +302,95 @@ public static class PcCompatRecipeCompiler
         return misses.ToArray();
     }
 
-    private static void AddPlatformRules(List<PcCompatCompiledRule> rules)
+    /// <summary>
+    /// Emits one hook rule per distinct host render callback the MOD's registered components need.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// These rules do not come from a Harmony patch, which is why they are emitted from the catalog
+    /// rather than from the callback translation. JipperKeyViewer references no 0Harmony at all, so
+    /// its <c>RainGraphic</c> hook has no patch descriptor, no shim registration and no translation
+    /// item to be derived from.
+    /// </para>
+    /// <para>
+    /// One rule per <c>(host type, method)</c>, not per component type: two registered components
+    /// sharing a host share one physical hook, and emitting a second rule for the same target would
+    /// dispatch the callback twice.
+    /// </para>
+    /// </remarks>
+    private static void EmitManagedRenderCallbackRules(
+        List<PcCompatCompiledRule> rules,
+        IReadOnlyList<PcCompatManagedRenderComponentDescriptor> descriptors)
     {
-        if (!rules.Any(rule => rule.RequiredCapabilities.HasFlag(PcCompatCapability.UiOverlay)))
+        var targets = PcCompatManagedRenderComponentCatalog.DistinctHostTargets(descriptors);
+        if (targets.Count == 0)
             return;
 
-        if (!rules.Any(rule =>
+        var patchId = 0;
+        foreach (var target in targets)
+        {
+            ++patchId;
+            rules.Add(new PcCompatCompiledRule
+            {
+                // Its own id prefix, parsed by parse_managed_render_rule_id on the native side. A
+                // "managed_prefix:" id would be accepted by the ordinary prefix parser and lose the
+                // owner prefilter, turning every one of the game's own calls into a boundary crossing.
+                Id = $"managed_render:{patchId}:{target.ComponentType}:{target.RenderMethod}",
+                FeatureId = "managed_render_component",
+                TargetAssemblyName = target.HostAssembly,
+                TargetNamespace = HostNamespace(target.HostType),
+                TargetType = HostTypeName(target.HostType),
+                TargetMethod = target.RenderMethod,
+                ParamCount = 1,
+                TargetIsStatic = false,
+                TargetGenericArity = 0,
+                TargetReturnType = "System.Void",
+                TargetParameterTypes = [target.RenderParameterType],
+                Stage = PcCompatRuleStage.BeforeOriginal,
+                Op = PcCompatRuleOp.ManagedRenderCallback,
+                // Complete replacement: the managed override starts with vh.Clear(), so running the
+                // host's own mesh build first would only be discarded.
+                RequiredCapabilities = PcCompatCapability.SkipOriginal,
+                DefaultEnabled = true,
+                Source = "managed_render:" + target.Reason
+            });
+        }
+
+        rules.Sort((left, right) => StringComparer.Ordinal.Compare(left.Id, right.Id));
+    }
+
+    private static string HostNamespace(string hostType)
+    {
+        var lastDot = hostType.LastIndexOf('.');
+        return lastDot < 0 ? string.Empty : hostType[..lastDot];
+    }
+
+    private static string HostTypeName(string hostType)
+    {
+        var lastDot = hostType.LastIndexOf('.');
+        return lastDot < 0 ? hostType : hostType[(lastDot + 1)..];
+    }
+
+    private static void AddPlatformRules(
+        List<PcCompatCompiledRule> rules,
+        PcCompatCallbackTranslationReport callbackTranslation)
+    {
+        var hasOwnerOverlay = rules.Any(rule =>
+            rule.RequiredCapabilities.HasFlag(PcCompatCapability.UiOverlay));
+        var hasSharedStateReversePatch = callbackTranslation.Items.Any(item =>
+            item.PatchKind == PcCompatPatchKind.ReversePatch &&
+            PcCompatReversePatchBridge.TryFindHandler(
+                item.TargetType,
+                item.TargetMethod,
+                out _));
+        if (!hasOwnerOverlay && !hasSharedStateReversePatch)
+            return;
+
+        var lifecycleCapabilities = PcCompatCapability.AfterOriginalObserve;
+        if (hasOwnerOverlay)
+            lifecycleCapabilities |= PcCompatCapability.UiOverlay;
+
+        if (hasOwnerOverlay && !rules.Any(rule =>
                 rule.TargetType == "scrPlayer" &&
                 rule.TargetMethod == "HitInputEvent" &&
                 rule.Op == PcCompatRuleOp.GameplayAcceptedObserve))
@@ -342,7 +429,7 @@ public static class PcCompatRecipeCompiler
                 TargetParameterTypes = Array.Empty<string>(),
                 Stage = PcCompatRuleStage.AfterOriginal,
                 Op = PcCompatRuleOp.OverlayHide,
-                RequiredCapabilities = PcCompatCapability.UiOverlay | PcCompatCapability.AfterOriginalObserve,
+                RequiredCapabilities = lifecycleCapabilities,
                 Source = "platform:overlay-lifecycle-v1"
             });
         }
@@ -364,7 +451,7 @@ public static class PcCompatRecipeCompiler
                 TargetParameterTypes = new[] { "System.Boolean" },
                 Stage = PcCompatRuleStage.AfterOriginal,
                 Op = PcCompatRuleOp.OverlayHide,
-                RequiredCapabilities = PcCompatCapability.UiOverlay | PcCompatCapability.AfterOriginalObserve,
+                RequiredCapabilities = lifecycleCapabilities,
                 Source = "platform:overlay-lifecycle-v2"
             });
         }
@@ -386,8 +473,7 @@ public static class PcCompatRecipeCompiler
                 TargetParameterTypes = Array.Empty<string>(),
                 Stage = PcCompatRuleStage.AfterOriginal,
                 Op = PcCompatRuleOp.OverlayPollTelemetry,
-                RequiredCapabilities = PcCompatCapability.UiOverlay |
-                                       PcCompatCapability.AfterOriginalObserve |
+                RequiredCapabilities = PcCompatCapability.AfterOriginalObserve |
                                        PcCompatCapability.ReadIl2CppField |
                                        PcCompatCapability.CallIl2CppGetter,
                 Source = "platform:overlay-telemetry-v1"

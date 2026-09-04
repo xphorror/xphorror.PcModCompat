@@ -1,9 +1,10 @@
 using System.Collections;
 using StArray.ModManager.Il2Cpp;
+using StArray.ModManager.Mono;
 
 namespace StArray.ModManager.RuntimeAbstractions;
 
-/// <summary>把 IL2CPP IEnumerable 包装为 RuntimeObject 序列。</summary>
+/// <summary>把 managed IEnumerable 包装为 RuntimeObject 序列。</summary>
 public unsafe class UnmanagedEnumerable : IEnumerable<RuntimeObject>
 {
     private readonly nint _ptr;
@@ -34,9 +35,14 @@ public unsafe class UnmanagedEnumerable : IEnumerable<RuntimeObject>
 
     private static TValue Unbox<TValue>(nint boxed) where TValue : unmanaged
     {
-        if (!RuntimeManager.IsIl2Cpp || boxed == 0)
+        if (boxed == 0)
             return default;
-        var value = Il2CppRuntimeApi.Current.ObjectUnbox(boxed);
+        var value = RuntimeManager.Backend switch
+        {
+            RuntimeBackend.Il2Cpp => Il2CppRuntimeApi.Current.ObjectUnbox(boxed),
+            RuntimeBackend.Mono => MonoFunctions.MonoObjectUnbox(boxed),
+            _ => 0
+        };
         return value != 0 ? *(TValue*)value : default;
     }
 
@@ -90,7 +96,7 @@ public unsafe class UnmanagedEnumerable : IEnumerable<RuntimeObject>
     }
 }
 
-/// <summary>把 IL2CPP IEnumerable 包装为 MOD定义的 stub 类型序列。</summary>
+/// <summary>把 managed IEnumerable 包装为 MOD定义的 stub 类型序列。</summary>
 public unsafe class UnmanagedEnumerable<T> : IEnumerable<T> where T : UnmanagedObject
 {
     private readonly nint _ptr;

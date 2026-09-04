@@ -5,6 +5,22 @@ using System.Runtime.InteropServices;
 
 namespace Xphorror.PcModCompat;
 
+public sealed record PcCompatLegacyInputDiagnosticSnapshot(
+    int ThreadCount,
+    IReadOnlyList<int> ThreadIds,
+    long UnityHeldCount,
+    long WindowsHeldCount,
+    long UnityEdgeCount,
+    long AnyKeyEdgeCount,
+    long MatchedCount,
+    long TrueCount,
+    long LastSourceSequence,
+    long LastRegistrationGeneration)
+{
+    public long QueryCount =>
+        UnityHeldCount + WindowsHeldCount + UnityEdgeCount + AnyKeyEdgeCount;
+}
+
 public static unsafe class PcCompatLegacyInputBridge
 {
     private const string BindingDiagnosticPrefix = "[DEBUG-kv-binding-v2]";
@@ -103,6 +119,12 @@ public static unsafe class PcCompatLegacyInputBridge
             $"modalNative={ReadNativeModalInputActiveForDiagnostics()}");
     }
 
+    internal static void SuppressSettingsInputAfterDeferredButton()
+    {
+        if (t_settingsGuiFrameDepth > 0)
+            t_settingsButtonActivated = true;
+    }
+
     public static void EndSettingsGuiFrame()
     {
         if (t_settingsGuiFrameDepth <= 0)
@@ -136,7 +158,15 @@ public static unsafe class PcCompatLegacyInputBridge
 
     public static bool GetKeyOwned<TKey>(TKey keyCode, int callsiteToken, string modId)
         where TKey : unmanaged, Enum
-        => IsUnityKeyHeld(EnumToInt32(keyCode), callsiteToken, modId);
+    {
+        var key = EnumToInt32(keyCode);
+        return TraceOwnedUnityQuery(
+            "GetKey",
+            key,
+            callsiteToken,
+            modId,
+            IsUnityKeyHeld(key, callsiteToken, modId));
+    }
 
     public static bool GetKeyDown<TKey>(TKey keyCode, int callsiteToken)
         where TKey : unmanaged, Enum
@@ -144,7 +174,15 @@ public static unsafe class PcCompatLegacyInputBridge
 
     public static bool GetKeyDownOwned<TKey>(TKey keyCode, int callsiteToken, string modId)
         where TKey : unmanaged, Enum
-        => ReadEdge(EnumToInt32(keyCode), callsiteToken, down: true, modId);
+    {
+        var key = EnumToInt32(keyCode);
+        return TraceOwnedUnityQuery(
+            "GetKeyDown",
+            key,
+            callsiteToken,
+            modId,
+            ReadEdge(key, callsiteToken, down: true, modId));
+    }
 
     public static bool GetKeyUp<TKey>(TKey keyCode, int callsiteToken)
         where TKey : unmanaged, Enum
@@ -152,13 +190,24 @@ public static unsafe class PcCompatLegacyInputBridge
 
     public static bool GetKeyUpOwned<TKey>(TKey keyCode, int callsiteToken, string modId)
         where TKey : unmanaged, Enum
-        => ReadEdge(EnumToInt32(keyCode), callsiteToken, down: false, modId);
+    {
+        var key = EnumToInt32(keyCode);
+        return TraceOwnedUnityQuery(
+            "GetKeyUp",
+            key,
+            callsiteToken,
+            modId,
+            ReadEdge(key, callsiteToken, down: false, modId));
+    }
 
     public static bool GetAnyKeyDown(int callsiteToken)
         => GetAnyKeyDownCore(callsiteToken, null);
 
     public static bool GetAnyKeyDownOwned(int callsiteToken, string modId)
-        => GetAnyKeyDownCore(callsiteToken, modId);
+        => TraceOwnedAnyQuery(
+            callsiteToken,
+            modId,
+            GetAnyKeyDownCore(callsiteToken, modId));
 
     private static bool GetAnyKeyDownCore(int callsiteToken, string? explicitModId)
     {
@@ -298,7 +347,11 @@ public static unsafe class PcCompatLegacyInputBridge
         int virtualKey,
         int callsiteToken,
         string modId)
-        => GetAsyncKeyStateCore(virtualKey, callsiteToken, modId);
+        => TraceOwnedWindowsQuery(
+            virtualKey,
+            callsiteToken,
+            modId,
+            GetAsyncKeyStateCore(virtualKey, callsiteToken, modId));
 
     private static short GetAsyncKeyStateCore(
         int virtualKey,
@@ -780,6 +833,105 @@ public static unsafe class PcCompatLegacyInputBridge
         return TryGetCurrentModId(out modId);
     }
 
+    private static bool TraceOwnedUnityQuery(
+        string query,
+        int key,
+        int callsiteToken,
+        string modId,
+        bool result)
+    {
+        var matched = PcCompatKeyViewerConsumerRuntime.TryGetUnityKeyState(
+            modId,
+            key,
+            out var consumer);
+        var threadState = GetThreadState();
+        var modal = threadState.IsModalInputCaptureActive();
+        var settingsSuppressed = IsSettingsButtonActivationSuppressed();
+        PcCompatDeepDebug.WriteSampled(
+            "input-query",
+            modId + "\0" + query + "\0" + callsiteToken,
+            count =>
+                $"count={count} query={query} owner={modId} callsite=0x{callsiteToken:X8} " +
+                $"keyKind=UnityKeyCode key={key} matched={matched} result={result} " +
+                $"mode={(matched ? consumer.Mode : PcCompatKeyViewerInputMode.External)} " +
+                $"consumerHeld={(matched && consumer.Held)} " +
+                $"down={(matched ? consumer.DownOrdinal : 0)} up={(matched ? consumer.UpOrdinal : 0)} " +
+                $"sourceSequence={(matched ? consumer.SourceSequence : 0)} " +
+                $"sessionGeneration={(matched ? consumer.SessionGeneration : 0)} " +
+                $"producerEpoch={(matched ? consumer.ProducerEpoch : 0)} " +
+                $"registrationGeneration={(matched ? consumer.RegistrationGeneration : 0)} " +
+                $"nativeAvailable={threadState.Available} nativeHeld={IsNativeUnityKeyHeld(key)} " +
+                $"modal={modal} settingsSuppressed={settingsSuppressed} " +
+                $"surface=[{PcCompatKeyViewerConsumerRuntime.GetQuerySurfaceStatus(modId)}] " +
+                PcCompatDeepDebug.ExecutionIdentity(),
+            first: 2,
+            periodic: 8192);
+        return result;
+    }
+
+    private static bool TraceOwnedAnyQuery(int callsiteToken, string modId, bool result)
+    {
+        var matched = PcCompatKeyViewerConsumerRuntime.TryGetAnyUnityKeyDownState(
+            modId,
+            out var mode,
+            out var downOrdinal,
+            out var registrationGeneration);
+        var threadState = GetThreadState();
+        var modal = threadState.IsModalInputCaptureActive();
+        var settingsSuppressed = IsSettingsButtonActivationSuppressed();
+        PcCompatDeepDebug.WriteSampled(
+            "input-query",
+            modId + "\0GetAnyKeyDown\0" + callsiteToken,
+            count =>
+                $"count={count} query=GetAnyKeyDown owner={modId} callsite=0x{callsiteToken:X8} " +
+                $"keyKind=AnyUnityKey key=-1 matched={matched} result={result} mode={mode} " +
+                $"down={downOrdinal} registrationGeneration={registrationGeneration} " +
+                $"nativeAvailable={threadState.Available} modal={modal} " +
+                $"settingsSuppressed={settingsSuppressed} " +
+                $"surface=[{PcCompatKeyViewerConsumerRuntime.GetQuerySurfaceStatus(modId)}] " +
+                PcCompatDeepDebug.ExecutionIdentity(),
+            first: 2,
+            periodic: 8192);
+        return result;
+    }
+
+    private static short TraceOwnedWindowsQuery(
+        int virtualKey,
+        int callsiteToken,
+        string modId,
+        short result)
+    {
+        var matched = PcCompatKeyViewerConsumerRuntime.TryGetWindowsVirtualKeyState(
+            modId,
+            virtualKey,
+            out var consumer);
+        var threadState = GetThreadState();
+        var modal = threadState.IsModalInputCaptureActive();
+        var settingsSuppressed = IsSettingsButtonActivationSuppressed();
+        var unityKey = WindowsVirtualKeyToUnityKey(virtualKey);
+        PcCompatDeepDebug.WriteSampled(
+            "input-query",
+            modId + "\0GetAsyncKeyState\0" + callsiteToken,
+            count =>
+                $"count={count} query=GetAsyncKeyState owner={modId} callsite=0x{callsiteToken:X8} " +
+                $"keyKind=WindowsVirtualKey key={virtualKey} mappedUnityKey={unityKey} " +
+                $"matched={matched} result=0x{unchecked((ushort)result):X4} " +
+                $"mode={(matched ? consumer.Mode : PcCompatKeyViewerInputMode.External)} " +
+                $"consumerHeld={(matched && consumer.Held)} " +
+                $"down={(matched ? consumer.DownOrdinal : 0)} up={(matched ? consumer.UpOrdinal : 0)} " +
+                $"sourceSequence={(matched ? consumer.SourceSequence : 0)} " +
+                $"sessionGeneration={(matched ? consumer.SessionGeneration : 0)} " +
+                $"producerEpoch={(matched ? consumer.ProducerEpoch : 0)} " +
+                $"registrationGeneration={(matched ? consumer.RegistrationGeneration : 0)} " +
+                $"nativeAvailable={threadState.Available} nativeHeld={IsNativeUnityKeyHeld(unityKey)} " +
+                $"modal={modal} settingsSuppressed={settingsSuppressed} " +
+                $"surface=[{PcCompatKeyViewerConsumerRuntime.GetQuerySurfaceStatus(modId)}] " +
+                PcCompatDeepDebug.ExecutionIdentity(),
+            first: 2,
+            periodic: 8192);
+        return result;
+    }
+
     private static long ComposeCursorKey(int callsiteToken, int keyCode, bool down)
         => ((long)(uint)callsiteToken << 32) |
            ((long)(down ? 1u : 0u) << 31) |
@@ -890,21 +1042,55 @@ public static unsafe class PcCompatLegacyInputBridge
             $" settingsLastKind={(LegacyQueryKind)Volatile.Read(ref s_lastSettingsQueryKind)}" +
             $" settingsLastKey={Volatile.Read(ref s_lastSettingsQueryKey)}" +
             $" settingsLastThread={Volatile.Read(ref s_lastSettingsQueryThread)}";
-        if (string.IsNullOrWhiteSpace(modId) || !QueryAudits.TryGetValue(modId, out var audits))
+        var diagnostic = GetDiagnosticSnapshot(modId);
+        if (diagnostic.ThreadCount == 0)
             return modalPrefix +
                    " threads=0 unityHeld=0 windowsHeld=0 unityEdge=0 anyEdge=0 matched=0 true=0 lastSequence=0 registration=0";
-        var snapshot = audits.ToArray();
         return modalPrefix +
-               $" threads={snapshot.Length}" +
-               $" threadIds={string.Join(',', snapshot.Select(audit => audit.ThreadId).Distinct().Order())}" +
-               $" unityHeld={snapshot.Sum(audit => Interlocked.Read(ref audit.UnityHeldCount))}" +
-               $" windowsHeld={snapshot.Sum(audit => Interlocked.Read(ref audit.WindowsHeldCount))}" +
-               $" unityEdge={snapshot.Sum(audit => Interlocked.Read(ref audit.UnityEdgeCount))}" +
-               $" anyEdge={snapshot.Sum(audit => Interlocked.Read(ref audit.AnyKeyEdgeCount))}" +
-               $" matched={snapshot.Sum(audit => Interlocked.Read(ref audit.MatchedCount))}" +
-               $" true={snapshot.Sum(audit => Interlocked.Read(ref audit.TrueCount))}" +
-               $" lastSequence={snapshot.Max(audit => Interlocked.Read(ref audit.LastSourceSequence))}" +
-               $" registration={snapshot.Max(audit => Interlocked.Read(ref audit.LastRegistrationGeneration))}";
+               $" threads={diagnostic.ThreadCount}" +
+               $" threadIds={string.Join(',', diagnostic.ThreadIds)}" +
+               $" unityHeld={diagnostic.UnityHeldCount}" +
+               $" windowsHeld={diagnostic.WindowsHeldCount}" +
+               $" unityEdge={diagnostic.UnityEdgeCount}" +
+               $" anyEdge={diagnostic.AnyKeyEdgeCount}" +
+               $" matched={diagnostic.MatchedCount}" +
+               $" true={diagnostic.TrueCount}" +
+               $" lastSequence={diagnostic.LastSourceSequence}" +
+               $" registration={diagnostic.LastRegistrationGeneration}";
+    }
+
+    public static PcCompatLegacyInputDiagnosticSnapshot GetDiagnosticSnapshot(string modId)
+    {
+        if (string.IsNullOrWhiteSpace(modId) || !QueryAudits.TryGetValue(modId, out var audits))
+            return new PcCompatLegacyInputDiagnosticSnapshot(
+                0,
+                Array.Empty<int>(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0);
+        var snapshot = audits.ToArray();
+        return new PcCompatLegacyInputDiagnosticSnapshot(
+            snapshot.Length,
+            snapshot.Select(audit => audit.ThreadId).Distinct().Order().ToArray(),
+            snapshot.Sum(audit => Interlocked.Read(ref audit.UnityHeldCount)),
+            snapshot.Sum(audit => Interlocked.Read(ref audit.WindowsHeldCount)),
+            snapshot.Sum(audit => Interlocked.Read(ref audit.UnityEdgeCount)),
+            snapshot.Sum(audit => Interlocked.Read(ref audit.AnyKeyEdgeCount)),
+            snapshot.Sum(audit => Interlocked.Read(ref audit.MatchedCount)),
+            snapshot.Sum(audit => Interlocked.Read(ref audit.TrueCount)),
+            snapshot.Max(audit => Interlocked.Read(ref audit.LastSourceSequence)),
+            snapshot.Max(audit => Interlocked.Read(ref audit.LastRegistrationGeneration)));
+    }
+
+    public static void ClearDiagnostics(string modId)
+    {
+        if (!string.IsNullOrWhiteSpace(modId))
+            QueryAudits.TryRemove(modId, out _);
     }
 
     private static int ReadNativeModalInputActiveForDiagnostics()
@@ -1195,20 +1381,23 @@ public static unsafe class PcCompatLegacyInputBridge
             ulong sourceSequence,
             long registrationGeneration)
         {
-            QueryAudit audit;
+            var audit = GetAudit(modId);
+            audit.Record(kind, matched, observedTrue, sourceSequence, registrationGeneration);
+        }
+
+        private QueryAudit GetAudit(string modId)
+        {
             if (_lastAudit != null &&
                 string.Equals(_lastAuditModId, modId, StringComparison.OrdinalIgnoreCase))
             {
-                audit = _lastAudit;
+                return _lastAudit;
             }
-            else
-            {
-                audit = new QueryAudit(Environment.CurrentManagedThreadId);
-                QueryAudits.GetOrAdd(modId, static _ => new ConcurrentBag<QueryAudit>()).Add(audit);
-                _lastAuditModId = modId;
-                _lastAudit = audit;
-            }
-            audit.Record(kind, matched, observedTrue, sourceSequence, registrationGeneration);
+
+            var audit = new QueryAudit(Environment.CurrentManagedThreadId);
+            QueryAudits.GetOrAdd(modId, static _ => new ConcurrentBag<QueryAudit>()).Add(audit);
+            _lastAuditModId = modId;
+            _lastAudit = audit;
+            return audit;
         }
     }
 
@@ -1231,7 +1420,6 @@ public static unsafe class PcCompatLegacyInputBridge
         public long TrueCount;
         public long LastSourceSequence;
         public long LastRegistrationGeneration;
-
         public void Record(
             LegacyQueryKind kind,
             bool matched,
@@ -1253,6 +1441,7 @@ public static unsafe class PcCompatLegacyInputBridge
             LastSourceSequence = unchecked((long)sourceSequence);
             LastRegistrationGeneration = registrationGeneration;
         }
+
     }
 
     private readonly record struct ConsumerCursorKey(

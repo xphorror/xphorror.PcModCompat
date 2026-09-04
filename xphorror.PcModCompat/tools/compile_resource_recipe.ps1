@@ -25,7 +25,8 @@ if ([string]::IsNullOrWhiteSpace($ModId)) {
     $infoPath = Join-Path $ModFolder "Info.json"
     if (Test-Path -LiteralPath $infoPath) {
         try {
-            $info = Get-Content -LiteralPath $infoPath -Raw | ConvertFrom-Json
+            $info = Get-Content -LiteralPath $infoPath -Encoding UTF8 -Raw |
+                ConvertFrom-Json
             if ($info.Id) {
                 $ModId = [string]$info.Id
             }
@@ -70,9 +71,15 @@ if (!(Test-Path -LiteralPath $published)) {
 if (!(Test-Path -LiteralPath $publishedIr)) {
     throw "Expected published Resource IR missing: $publishedIr"
 }
-if (!(Test-Path -LiteralPath $publishedCompiler) -or
-    (Get-Content -LiteralPath $publishedCompiler -Raw).Trim() -ne "resource-ir-compiler-v4-alpha8-atlas") {
+if (!(Test-Path -LiteralPath $publishedCompiler)) {
     throw "Expected Resource IR compiler marker missing or stale: $publishedCompiler"
+}
+$compilerMarker = @(Get-Content -LiteralPath $publishedCompiler -Encoding UTF8)
+if ($compilerMarker.Count -ne 3 -or
+    $compilerMarker[0] -ne "pccompat-resource-compile-cache-v1" -or
+    $compilerMarker[1] -ne "resource-ir-compiler-v5-font-file" -or
+    $compilerMarker[2] -notmatch '^[0-9a-f]{64}$') {
+    throw "Expected content-addressed Resource IR compiler marker is invalid: $publishedCompiler"
 }
 
 Write-Host "[resource] published $published"

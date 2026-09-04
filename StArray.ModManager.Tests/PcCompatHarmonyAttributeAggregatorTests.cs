@@ -429,10 +429,10 @@ public class PcCompatHarmonyAttributeAggregatorTests
     }
 
     [Test]
-    public void HarmonyDescriptorsSurviveJsonRoundTripUnderTheV2Schema()
+    public void HarmonyDescriptorsSurviveJsonRoundTripUnderTheCurrentSchema()
     {
         var json = Report.ToJson();
-        Assert.That(Report.FormatVersion, Is.EqualTo("static-patch-scan-v2"));
+        Assert.That(Report.FormatVersion, Is.EqualTo("static-patch-scan-v4-render-components"));
         Assert.That(json, Does.Contain("\"source\": \"harmony_attribute\""));
     }
 }

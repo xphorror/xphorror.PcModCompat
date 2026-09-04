@@ -1,5 +1,17 @@
 namespace Xphorror.PcModCompat;
 
+/// <summary>
+/// The raw sequence the selected BindingProvider returned while a plan was being lowered, kept so
+/// the configuration change watcher can baseline it without calling into MOD code a second time.
+/// </summary>
+public sealed class PcCompatKeyViewerResolvedProviderSequence
+{
+    public required string FeatureId { get; init; }
+    public required PcCompatKeyViewerRoleOverride Role { get; init; }
+    public required int RequiredCount { get; init; }
+    public IReadOnlyList<int> Values { get; init; } = Array.Empty<int>();
+}
+
 public sealed class PcCompatKeyViewerBindingPlanLoweringResult
 {
     public IReadOnlyList<PcCompatKeyViewerLoweredConsumerPlan> Plans { get; init; } =
@@ -8,6 +20,13 @@ public sealed class PcCompatKeyViewerBindingPlanLoweringResult
     public IReadOnlyList<PcCompatKeyViewerLoweredConsumerPlan> PresentationPlans { get; init; } =
         Array.Empty<PcCompatKeyViewerLoweredConsumerPlan>();
     public IReadOnlyList<string> PresentationIssues { get; init; } = Array.Empty<string>();
+
+    /// <summary>
+    /// One entry per feature that produced a plan, covering presentation-only features as well:
+    /// their labels are rendered from the same sequence and go stale the same way.
+    /// </summary>
+    public IReadOnlyList<PcCompatKeyViewerResolvedProviderSequence> ResolvedProviders { get; init; } =
+        Array.Empty<PcCompatKeyViewerResolvedProviderSequence>();
 }
 
 /// <summary>
@@ -24,7 +43,7 @@ public static class PcCompatKeyViewerBindingPlanLowerer
     public static PcCompatKeyViewerBindingPlanLoweringResult Lower(
         PcCompatKeyViewerAdapterDocument adapter,
         PcCompatKeyViewerOverrideDocument overrides,
-        Func<PcCompatKeyViewerRoleOverride, (bool Success, int[] Values, string? Error)>
+        Func<PcCompatKeyViewerRoleOverride, int, (bool Success, int[] Values, string? Error)>
             resolveProvider)
     {
         ArgumentNullException.ThrowIfNull(adapter);
@@ -43,6 +62,7 @@ public static class PcCompatKeyViewerBindingPlanLowerer
 
         var plans = new List<PcCompatKeyViewerLoweredConsumerPlan>();
         var presentationPlans = new List<PcCompatKeyViewerLoweredConsumerPlan>();
+        var resolvedProviders = new List<PcCompatKeyViewerResolvedProviderSequence>();
         var issues = new List<string>();
         var presentationIssues = new List<string>();
         foreach (var featureOverride in overrides.Features.Where(feature => feature.Enabled))
@@ -76,38 +96,50 @@ public static class PcCompatKeyViewerBindingPlanLowerer
 
             var providerCandidates = feature.Roles
                 .Where(role => role.Role == "BindingProvider")
-                .Select(ToRoleOverride)
-                .DistinctBy(role => role.CandidateKey)
+                .Select(role => new ProviderCandidate(
+                    ToRoleOverride(role),
+                    role.ConsumerLaneBase))
+                .DistinctBy(candidate => candidate.Role.CandidateKey)
                 .ToArray();
             var selectedProvider = featureOverride.Roles.SingleOrDefault(role =>
                 role.Role == "BindingProvider");
             PcCompatKeyViewerRoleOverride provider;
             IReadOnlyList<PcCompatKeyViewerLoweredLaneBinding> lanes;
+            int[] providerValues;
             if (selectedProvider == null)
             {
                 var usableCandidates = providerCandidates
-                    .Select(role =>
+                    .Select(candidate =>
                     {
                         var usable = TryBuildLanes(
-                            role,
+                            candidate.Role,
                             transforms[0],
                             featureOverride.TouchLaneCount,
                             resolveProvider,
                             out var candidateLanes,
+                            out var candidateValues,
                             out var error);
-                        return new { Role = role, Usable = usable, Lanes = candidateLanes };
+                        return new UsableProviderCandidate(
+                            candidate.Role,
+                            candidate.ConsumerLaneBase,
+                            usable,
+                            candidateLanes,
+                            candidateValues,
+                            error);
                     })
                     .Where(candidate => candidate.Usable)
                     .ToArray();
-                if (usableCandidates.Length != 1)
+                if (!TrySelectProvider(usableCandidates, out var selectedCandidate))
                 {
                     featureIssues.Add(
                         $"feature '{feature.Id}': no confirmed BindingProvider; " +
-                        $"found {usableCandidates.Length} usable candidates");
+                        $"found {usableCandidates.Length} usable candidates and no unique " +
+                        "proven lane-base 0 provider");
                     continue;
                 }
-                provider = usableCandidates[0].Role;
-                lanes = usableCandidates[0].Lanes;
+                provider = selectedCandidate.Role;
+                lanes = selectedCandidate.Lanes;
+                providerValues = selectedCandidate.Values;
             }
             else
             {
@@ -118,35 +150,45 @@ public static class PcCompatKeyViewerBindingPlanLowerer
                         featureOverride.TouchLaneCount,
                         resolveProvider,
                         out lanes,
+                        out providerValues,
                         out var providerError))
                 {
                     var alternatives = providerCandidates
-                        .Where(role => !string.Equals(
-                            role.CandidateKey,
+                        .Where(candidate => !string.Equals(
+                            candidate.Role.CandidateKey,
                             selectedProvider.CandidateKey,
                             StringComparison.Ordinal))
-                        .Select(role =>
+                        .Select(candidate =>
                         {
                             var usable = TryBuildLanes(
-                                role,
+                                candidate.Role,
                                 transforms[0],
                                 featureOverride.TouchLaneCount,
                                 resolveProvider,
                                 out var candidateLanes,
+                                out var candidateValues,
                                 out var error);
-                            return new { Role = role, Usable = usable, Lanes = candidateLanes, Error = error };
+                            return new UsableProviderCandidate(
+                                candidate.Role,
+                                candidate.ConsumerLaneBase,
+                                usable,
+                                candidateLanes,
+                                candidateValues,
+                                error);
                         })
                         .Where(candidate => candidate.Usable)
                         .ToArray();
-                    if (alternatives.Length != 1)
+                    if (!TrySelectProvider(alternatives, out var recoveredCandidate))
                     {
                         featureIssues.Add(
                             $"feature '{feature.Id}': selected BindingProvider is unusable " +
-                            $"({providerError}); found {alternatives.Length} usable alternatives");
+                            $"({providerError}); found {alternatives.Length} usable alternatives " +
+                            "and no unique proven lane-base 0 provider");
                         continue;
                     }
-                    provider = alternatives[0].Role;
-                    lanes = alternatives[0].Lanes;
+                    provider = recoveredCandidate.Role;
+                    lanes = recoveredCandidate.Lanes;
+                    providerValues = recoveredCandidate.Values;
                     featureIssues.Add(
                         $"feature '{feature.Id}': selected BindingProvider is unusable " +
                         $"({providerError}); recovered with {provider.CandidateKey}");
@@ -164,6 +206,13 @@ public static class PcCompatKeyViewerBindingPlanLowerer
                 Lanes = lanes
             };
             presentationPlans.Add(plan);
+            resolvedProviders.Add(new PcCompatKeyViewerResolvedProviderSequence
+            {
+                FeatureId = feature.Id,
+                Role = provider,
+                RequiredCount = featureOverride.TouchLaneCount,
+                Values = providerValues
+            });
             if (consumerRequired)
                 plans.Add(plan);
         }
@@ -173,7 +222,8 @@ public static class PcCompatKeyViewerBindingPlanLowerer
             Plans = plans,
             Issues = issues,
             PresentationPlans = presentationPlans,
-            PresentationIssues = presentationIssues
+            PresentationIssues = presentationIssues,
+            ResolvedProviders = resolvedProviders
         };
     }
 
@@ -181,29 +231,31 @@ public static class PcCompatKeyViewerBindingPlanLowerer
         PcCompatKeyViewerRoleOverride provider,
         PcCompatKeyViewerIdentityTransform transform,
         int laneCount,
-        Func<PcCompatKeyViewerRoleOverride, (bool Success, int[] Values, string? Error)>
+        Func<PcCompatKeyViewerRoleOverride, int, (bool Success, int[] Values, string? Error)>
             resolveProvider,
         out IReadOnlyList<PcCompatKeyViewerLoweredLaneBinding> lanes,
+        out int[] values,
         out string? error)
     {
-        var resolved = resolveProvider(provider);
+        var resolved = resolveProvider(provider, laneCount);
+        values = resolved.Values ?? Array.Empty<int>();
         if (!resolved.Success)
         {
             lanes = Array.Empty<PcCompatKeyViewerLoweredLaneBinding>();
             error = "provider failed: " + (resolved.Error ?? "unknown error");
             return false;
         }
-        if (resolved.Values.Length < laneCount)
+        if (values.Length < laneCount)
         {
             lanes = Array.Empty<PcCompatKeyViewerLoweredLaneBinding>();
-            error = $"provider returned {resolved.Values.Length} keys for {laneCount} touch lanes";
+            error = $"provider returned {values.Length} keys for {laneCount} touch lanes";
             return false;
         }
 
         var lowered = new List<PcCompatKeyViewerLoweredLaneBinding>(laneCount);
         for (var lane = 0; lane < laneCount; ++lane)
         {
-            if (!TryLowerIdentity(transform, resolved.Values[lane], out var identity, out error))
+            if (!TryLowerIdentity(transform, values[lane], out var identity, out error))
             {
                 lanes = Array.Empty<PcCompatKeyViewerLoweredLaneBinding>();
                 error = $"lane {lane + 1}: {error}";
@@ -226,6 +278,41 @@ public static class PcCompatKeyViewerBindingPlanLowerer
         error = null;
         return true;
     }
+
+    private static bool TrySelectProvider(
+        IReadOnlyList<UsableProviderCandidate> candidates,
+        out UsableProviderCandidate selected)
+    {
+        if (candidates.Count == 1)
+        {
+            selected = candidates[0];
+            return true;
+        }
+
+        var primary = candidates
+            .Where(candidate => candidate.ConsumerLaneBase == 0)
+            .ToArray();
+        if (primary.Length == 1)
+        {
+            selected = primary[0];
+            return true;
+        }
+
+        selected = null!;
+        return false;
+    }
+
+    private sealed record ProviderCandidate(
+        PcCompatKeyViewerRoleOverride Role,
+        int? ConsumerLaneBase);
+
+    private sealed record UsableProviderCandidate(
+        PcCompatKeyViewerRoleOverride Role,
+        int? ConsumerLaneBase,
+        bool Usable,
+        IReadOnlyList<PcCompatKeyViewerLoweredLaneBinding> Lanes,
+        int[] Values,
+        string? Error);
 
     private static PcCompatKeyViewerRoleOverride ToRoleOverride(
         PcCompatKeyViewerRoleBinding role)

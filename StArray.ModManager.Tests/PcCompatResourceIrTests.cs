@@ -592,12 +592,8 @@ public sealed class PcCompatResourceIrTests
         var directory = new DirectoryInfo(TestContext.CurrentContext.TestDirectory);
         while (directory != null)
         {
-            if (File.Exists(Path.Combine(directory.FullName, "StArray.ModManager.slnx")))
-            {
-                var sample = Path.Combine(directory.FullName, "JipperResourcePack_release");
-                Assume.That(Directory.Exists(sample), Is.True, $"missing sample mod dir: {sample}");
+            if (Directory.Exists(Path.Combine(directory.FullName, "JipperResourcePack_release")))
                 return directory.FullName;
-            }
             directory = directory.Parent;
         }
         throw new DirectoryNotFoundException("StArray.ModManager repository root not found.");

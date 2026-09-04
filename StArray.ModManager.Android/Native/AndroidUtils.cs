@@ -151,6 +151,32 @@ public static class AndroidUtils
         return GetDirFromContext(context, "getExternalFilesDir", "(Ljava/lang/String;)Ljava/io/File;", null);
     }
 
+    /// <summary>Returns the primary shared-storage root reported by Android.</summary>
+    public static string? GetExternalStorageRoot() =>
+        GetEnvironmentDirectory("getExternalStorageDirectory");
+
+    /// <summary>Returns Android's system partition root for shared read-only assets.</summary>
+    public static string? GetSystemRoot() =>
+        GetEnvironmentDirectory("getRootDirectory");
+
+    private static string? GetEnvironmentDirectory(string methodName)
+    {
+        try
+        {
+            using var environment = new JavaClass("android.os.Environment");
+            var method = environment.GetStaticMethodID(methodName, "()Ljava/io/File;");
+            if (method == IntPtr.Zero)
+                return null;
+            var file = environment.CallStaticObjectMethod0(method);
+            return GetAbsoluteFilePath(file);
+        }
+        catch (Exception ex)
+        {
+            Error("AndroidUtils", $"GetEnvironmentDirectory({methodName}): {ex}");
+            return null;
+        }
+    }
+
     private static string? GetDirFromContext(IntPtr context, string methodName, string sig, string? arg = null)
     {
         try
@@ -171,17 +197,33 @@ public static class AndroidUtils
                 file = ctxObj.CallObjectMethod0(methodId);
             }
 
-            if (file == IntPtr.Zero) return null;
-
-            using var fileObj = new JavaObject(file);
-            using var fileCls = fileObj.GetClass();
-            var getPath = JniHelperNative.GetMethodID(fileCls.Handle, "getAbsolutePath", "()Ljava/lang/String;");
-            var pathStr = fileObj.CallObjectMethod0(getPath);
-
-            var result = JniHelperNative.GetString(pathStr);
-            JniHelperNative.DeleteLocalRef(pathStr);
-            return result;
+            return GetAbsoluteFilePath(file);
         }
         catch (Exception ex) { Error("AndroidUtils", $"GetDirFromContext({methodName}): {ex}"); return null; }
+    }
+
+    private static string? GetAbsoluteFilePath(IntPtr file)
+    {
+        if (file == IntPtr.Zero)
+            return null;
+        using var fileObj = new JavaObject(file);
+        using var fileCls = fileObj.GetClass();
+        var getPath = JniHelperNative.GetMethodID(
+            fileCls.Handle,
+            "getAbsolutePath",
+            "()Ljava/lang/String;");
+        if (getPath == IntPtr.Zero)
+            return null;
+        var pathString = fileObj.CallObjectMethod0(getPath);
+        if (pathString == IntPtr.Zero)
+            return null;
+        try
+        {
+            return JniHelperNative.GetString(pathString);
+        }
+        finally
+        {
+            JniHelperNative.DeleteLocalRef(pathString);
+        }
     }
 }

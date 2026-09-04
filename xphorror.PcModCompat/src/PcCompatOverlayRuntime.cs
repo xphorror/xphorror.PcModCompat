@@ -181,6 +181,16 @@ public sealed class PcCompatOverlaySnapshot
 
     public bool ProviderAvailable { get; init; }
     public uint Generation { get; init; }
+    public uint SessionEpoch { get; init; }
+    public bool HasExplicitGameSnapshotValidity { get; init; }
+    public PcCompatGameSnapshotFields ValidGameSnapshotFields { get; init; }
+    public long ControllerPointer { get; init; }
+    public long ConductorPointer { get; init; }
+    public long LevelMakerPointer { get; init; }
+    public long CurrentFloorPointer { get; init; }
+    public long FirstFloorPointer { get; init; }
+    public long SongPointer { get; init; }
+    public long PlanetarySystemPointer { get; init; }
     public bool Visible { get; init; }
     public bool Practice { get; init; }
     public uint ShowCount { get; init; }
@@ -232,6 +242,15 @@ public sealed class PcCompatOverlaySnapshot
     public float SpeedMultiplier { get; init; } = 1f;
     public float PlanetSpeed { get; init; } = 1f;
     public bool SessionAuto { get; init; }
+    public bool IsAuto { get; init; }
+    public bool IsNoFail { get; init; }
+    public bool IsPaused { get; init; }
+    public bool IsGameWorld { get; init; }
+    public bool IsScnGame { get; init; }
+    public bool IsGameReady { get; init; }
+    public float SongPitch { get; init; } = 1f;
+    public double ConductorAddOffset { get; init; }
+    public double ConductorSongPositionMinusi { get; init; }
     public uint InputStateGeneration { get; init; }
     public uint InputHeldMask { get; init; }
     public uint InputLastDownMask { get; init; }
@@ -364,26 +383,43 @@ public static class PcCompatLevelIdentityRuntime
 
 public static class PcCompatOverlayRuntime
 {
+    private sealed class OwnerProjection
+    {
+        public PcCompatOverlaySnapshot Snapshot { get; set; } = PcCompatOverlaySnapshot.Unavailable;
+    }
+
     private sealed class ProviderRegistration(
         Func<PcCompatOverlaySnapshot> provider,
-        Func<bool>? visibilityProvider)
+        Func<bool>? visibilityProvider,
+        Func<string, PcCompatOverlaySnapshot>? ownerProvider)
     {
         public Func<PcCompatOverlaySnapshot> Provider { get; } = provider;
         public Func<bool>? VisibilityProvider { get; } = visibilityProvider;
+        public Func<string, PcCompatOverlaySnapshot>? OwnerProvider { get; } = ownerProvider;
     }
 
     private static ProviderRegistration? s_registration;
+    private static readonly object OwnerLock = new();
+    private static readonly Dictionary<string, OwnerProjection> OwnerProjections =
+        new(StringComparer.OrdinalIgnoreCase);
 
     public static void RegisterProvider(
         Func<PcCompatOverlaySnapshot> provider,
-        Func<bool>? visibilityProvider = null)
+        Func<bool>? visibilityProvider = null,
+        Func<string, PcCompatOverlaySnapshot>? ownerProvider = null)
     {
         ArgumentNullException.ThrowIfNull(provider);
-        Volatile.Write(ref s_registration, new ProviderRegistration(provider, visibilityProvider));
+        Volatile.Write(
+            ref s_registration,
+            new ProviderRegistration(provider, visibilityProvider, ownerProvider));
     }
 
     public static void ClearProvider()
-        => Volatile.Write(ref s_registration, null);
+    {
+        Volatile.Write(ref s_registration, null);
+        lock (OwnerLock)
+            OwnerProjections.Clear();
+    }
 
     public static bool IsVisible()
     {
@@ -418,4 +454,131 @@ public static class PcCompatOverlayRuntime
             return PcCompatOverlaySnapshot.Unavailable;
         }
     }
+
+    public static PcCompatOverlaySnapshot Snapshot(string ownerId)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(ownerId);
+        var registration = Volatile.Read(ref s_registration);
+        if (registration == null)
+            return PcCompatOverlaySnapshot.Unavailable;
+        PcCompatOverlaySnapshot shared;
+        try
+        {
+            shared = registration.OwnerProvider != null
+                ? registration.OwnerProvider(ownerId) ?? PcCompatOverlaySnapshot.Unavailable
+                : registration.Provider() ?? PcCompatOverlaySnapshot.Unavailable;
+        }
+        catch
+        {
+            shared = PcCompatOverlaySnapshot.Unavailable;
+        }
+        var isolated = shared.ProviderAvailable
+            ? CloneSnapshot(shared)
+            : PcCompatOverlaySnapshot.Unavailable;
+        lock (OwnerLock)
+        {
+            if (!OwnerProjections.TryGetValue(ownerId, out var projection))
+            {
+                projection = new OwnerProjection();
+                OwnerProjections.Add(ownerId, projection);
+            }
+            projection.Snapshot = isolated;
+            return projection.Snapshot;
+        }
+    }
+
+    public static void RemoveOwner(string ownerId)
+    {
+        if (string.IsNullOrWhiteSpace(ownerId))
+            return;
+        lock (OwnerLock)
+            OwnerProjections.Remove(ownerId);
+    }
+
+    private static PcCompatOverlaySnapshot CloneSnapshot(PcCompatOverlaySnapshot value)
+        => new()
+        {
+            ProviderAvailable = value.ProviderAvailable,
+            Generation = value.Generation,
+            SessionEpoch = value.SessionEpoch,
+            HasExplicitGameSnapshotValidity = value.HasExplicitGameSnapshotValidity,
+            ValidGameSnapshotFields = value.ValidGameSnapshotFields,
+            ControllerPointer = value.ControllerPointer,
+            ConductorPointer = value.ConductorPointer,
+            LevelMakerPointer = value.LevelMakerPointer,
+            CurrentFloorPointer = value.CurrentFloorPointer,
+            FirstFloorPointer = value.FirstFloorPointer,
+            SongPointer = value.SongPointer,
+            PlanetarySystemPointer = value.PlanetarySystemPointer,
+            Visible = value.Visible,
+            Practice = value.Practice,
+            ShowCount = value.ShowCount,
+            HideCount = value.HideCount,
+            PlayerUpdateCount = value.PlayerUpdateCount,
+            StateChangeCount = value.StateChangeCount,
+            LastOpCode = value.LastOpCode,
+            LastTargetKind = value.LastTargetKind,
+            PlayerCount = value.PlayerCount,
+            LastSeqId = value.LastSeqId,
+            LastIsRestart = value.LastIsRestart,
+            LastWipeDirection = value.LastWipeDirection,
+            LastResetToEditor = value.LastResetToEditor,
+            JudgementHitCount = value.JudgementHitCount,
+            JudgementResetCount = value.JudgementResetCount,
+            LastHitMargin = value.LastHitMargin,
+            FloorMoveCount = value.FloorMoveCount,
+            LastFloorExitAngle = value.LastFloorExitAngle,
+            LastFloorMoveHitMargin = value.LastFloorMoveHitMargin,
+            PlayerHitCount = value.PlayerHitCount,
+            LastPlayerHitIsAuto = value.LastPlayerHitIsAuto,
+            DeathCount = value.DeathCount,
+            LastDeathOverload = value.LastDeathOverload,
+            LastDeathMultipress = value.LastDeathMultipress,
+            LastDeathHitbox = value.LastDeathHitbox,
+            HitTimingCount = value.HitTimingCount,
+            LastHitTimingMs = value.LastHitTimingMs,
+            LastHitTimingMargin = value.LastHitTimingMargin,
+            AccuracySnapshotCount = value.AccuracySnapshotCount,
+            PercentAcc = value.PercentAcc,
+            PercentXAcc = value.PercentXAcc,
+            Progress = value.Progress,
+            ComboCount = value.ComboCount,
+            AttemptCount = value.AttemptCount,
+            BpmSnapshotCount = value.BpmSnapshotCount,
+            TileBpm = value.TileBpm,
+            Kps = value.Kps,
+            TimelineSnapshotCount = value.TimelineSnapshotCount,
+            MusicTime = value.MusicTime,
+            MusicTotalTime = value.MusicTotalTime,
+            MapTime = value.MapTime,
+            MapTotalTime = value.MapTotalTime,
+            CheckpointsUsed = value.CheckpointsUsed,
+            CurrentCheckpoint = value.CurrentCheckpoint,
+            TotalCheckpoints = value.TotalCheckpoints,
+            CurrentSeqId = value.CurrentSeqId,
+            FloorCount = value.FloorCount,
+            StartProgress = value.StartProgress,
+            SpeedMultiplier = value.SpeedMultiplier,
+            PlanetSpeed = value.PlanetSpeed,
+            SessionAuto = value.SessionAuto,
+            IsAuto = value.IsAuto,
+            IsNoFail = value.IsNoFail,
+            IsPaused = value.IsPaused,
+            IsGameWorld = value.IsGameWorld,
+            IsScnGame = value.IsScnGame,
+            IsGameReady = value.IsGameReady,
+            SongPitch = value.SongPitch,
+            ConductorAddOffset = value.ConductorAddOffset,
+            ConductorSongPositionMinusi = value.ConductorSongPositionMinusi,
+            InputStateGeneration = value.InputStateGeneration,
+            InputHeldMask = value.InputHeldMask,
+            InputLastDownMask = value.InputLastDownMask,
+            InputLastUpMask = value.InputLastUpMask,
+            InputTotalCount = value.InputTotalCount,
+            InputKps = value.InputKps,
+            InstalledSlots = value.InstalledSlots,
+            BoundDispatcherSlots = value.BoundDispatcherSlots,
+            DispatcherReadySlots = value.DispatcherReadySlots,
+            DispatcherCapacity = value.DispatcherCapacity
+        };
 }

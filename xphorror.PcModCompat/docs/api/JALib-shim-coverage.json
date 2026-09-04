@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "candidateSha256": "DA87772495AAD29BB39E292FA01611146066EAA79CC4D93E891F7283EA70A157",
+  "referenceVersions": [
+    "1.0.0.42",
+    "1.0.0.44"
+  ],
+  "requiredTypeCount": 61,
+  "presentTypeCount": 61,
+  "requiredMemberCount": 872,
+  "presentMemberCount": 871,
+  "missingTypes": [],
+  "missingMembers": [
+    "F|JALib.Core.Patch.ReversePatchType|AllCombine|static=True|type=JALib.Core.Patch.ReversePatchType|literal=127|attrs="
+  ],
+  "typeCoverage": 1,
+  "memberCoverage": 0.9988532110091743
+}

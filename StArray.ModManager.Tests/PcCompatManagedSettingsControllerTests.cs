@@ -2,12 +2,30 @@ using System.Reflection;
 using System.Reflection.Emit;
 using System.Runtime.CompilerServices;
 using System.Runtime.Loader;
+using System.Text;
 using Xphorror.PcModCompat;
 
 namespace StArray.ModManager.Tests;
 
 public sealed class PcCompatManagedSettingsControllerTests
 {
+    [TestCase(667f, 48f, 84f, 128f)]
+    [TestCase(320f, 48f, 84f, 84f)]
+    [TestCase(1600f, 64f, 112f, 128f)]
+    public void FooterButtonsReserveAUsableExplicitWidth(
+        float contentWidth,
+        float touchHeight,
+        float minimumWidth,
+        float maximumWidth)
+    {
+        var width = PcCompatManagedSettingsUnityBackend.ComputeFooterButtonWidth(
+            contentWidth,
+            touchHeight);
+
+        Assert.That(width, Is.InRange(minimumWidth, maximumWidth));
+        Assert.That(width, Is.GreaterThanOrEqualTo(touchHeight * 1.75f));
+    }
+
     [Test]
     public void OptionalSettingsDelegateBridgePreservesNullAndCachesLiveReceiver()
     {
@@ -159,6 +177,264 @@ public sealed class PcCompatManagedSettingsControllerTests
             Assert.That(snapshot.State, Is.EqualTo(PcCompatManagedSettingsState.Faulted));
             Assert.That(snapshot.Fault, Does.Contain("settings draw failed"));
             Assert.That(target.Calls, Is.EqualTo(new[] { "open", "draw", "close" }));
+        });
+    }
+
+    [Test]
+    public void RepaintLayoutMismatchRetriesWithoutClosingOriginalSettingsSurface()
+    {
+        var target = new SettingsTarget { LayoutMismatchFailuresRemaining = 1 };
+        Assert.That(PcCompatManagedSettingsController.TryCreate(
+            target,
+            null,
+            out var controller,
+            out var error), Is.True, error);
+        Assert.That(controller!.RequestOpen(out error), Is.True, error);
+
+        Assert.That(controller.Dispatch(), Is.True);
+        Assert.Multiple(() =>
+        {
+            Assert.That(controller.Snapshot().State,
+                Is.EqualTo(PcCompatManagedSettingsState.Opening));
+            Assert.That(controller.Snapshot().Fault, Is.Null);
+            Assert.That(target.CompatSettingsVisible, Is.True);
+            Assert.That(target.Calls, Is.EqualTo(new[] { "open", "draw" }));
+        });
+
+        Assert.That(controller.Dispatch(), Is.True);
+        Assert.Multiple(() =>
+        {
+            Assert.That(controller.Snapshot().State,
+                Is.EqualTo(PcCompatManagedSettingsState.Open));
+            Assert.That(controller.Snapshot().Fault, Is.Null);
+            Assert.That(target.Calls, Is.EqualTo(new[] { "open", "draw", "draw" }));
+        });
+    }
+
+    [Test]
+    public void RepeatedRepaintLayoutMismatchFaultsAfterBoundedRetries()
+    {
+        var target = new SettingsTarget { LayoutMismatchFailuresRemaining = 3 };
+        Assert.That(PcCompatManagedSettingsController.TryCreate(
+            target,
+            null,
+            out var controller,
+            out var error), Is.True, error);
+        Assert.That(controller!.RequestOpen(out error), Is.True, error);
+
+        Assert.That(controller.Dispatch(), Is.True);
+        Assert.That(controller.Dispatch(), Is.True);
+        Assert.That(controller.Dispatch(), Is.False);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(controller.Snapshot().State,
+                Is.EqualTo(PcCompatManagedSettingsState.Faulted));
+            Assert.That(controller.Snapshot().Fault, Does.Contain("Getting control 2's position"));
+            Assert.That(target.CompatSettingsVisible, Is.False);
+            Assert.That(target.Calls,
+                Is.EqualTo(new[] { "open", "draw", "draw", "draw", "close" }));
+        });
+    }
+
+    [Test]
+    public void LayoutGroupIgnoreMismatchRetriesWithoutClosingOriginalSettingsSurface()
+    {
+        var target = new SettingsTarget { LayoutGroupMismatchFailuresRemaining = 1 };
+        Assert.That(PcCompatManagedSettingsController.TryCreate(
+            target,
+            null,
+            out var controller,
+            out var error), Is.True, error);
+        Assert.That(controller!.RequestOpen(out error), Is.True, error);
+
+        Assert.That(controller.Dispatch(), Is.True);
+        Assert.Multiple(() =>
+        {
+            Assert.That(controller.Snapshot().State,
+                Is.EqualTo(PcCompatManagedSettingsState.Opening));
+            Assert.That(controller.Snapshot().Fault, Is.Null);
+            Assert.That(target.CompatSettingsVisible, Is.True);
+        });
+
+        Assert.That(controller.Dispatch(), Is.True);
+        Assert.That(controller.Snapshot().State,
+            Is.EqualTo(PcCompatManagedSettingsState.Open));
+    }
+
+    [Test]
+    public void SettingsControllerSkipsOriginalImGuiUntilTransactionAllowsRebuild()
+    {
+        var target = new SettingsTarget();
+        var transaction = new ImGuiTransactionProbe { AllowDispatch = false };
+        Assert.That(PcCompatManagedSettingsController.TryCreate(
+            target,
+            null,
+            transaction,
+            () => Array.Empty<object>(),
+            out var controller,
+            out var error), Is.True, error);
+        Assert.That(controller!.RequestOpen(out error), Is.True, error);
+
+        Assert.That(controller.Dispatch(), Is.True);
+        Assert.Multiple(() =>
+        {
+            Assert.That(controller.Snapshot().State,
+                Is.EqualTo(PcCompatManagedSettingsState.Opening));
+            Assert.That(target.Calls, Is.EqualTo(new[] { "open" }));
+        });
+
+        transaction.AllowDispatch = true;
+        Assert.That(controller.Dispatch(), Is.True);
+        Assert.That(controller.Snapshot().State,
+            Is.EqualTo(PcCompatManagedSettingsState.Open));
+
+        transaction.AllowDispatch = false;
+        Assert.That(controller.Dispatch(), Is.True);
+        Assert.That(target.Calls, Is.EqualTo(new[] { "open", "draw" }));
+
+        transaction.AllowDispatch = true;
+        Assert.That(controller.Dispatch(), Is.True);
+        Assert.That(target.Calls, Is.EqualTo(new[] { "open", "draw", "draw" }));
+    }
+
+    [Test]
+    public void SettingsControllerTeardownClosesTheSurfaceAndReleasesItsTransaction()
+    {
+        var target = new SettingsTarget();
+        var transaction = new ImGuiTransactionProbe { AllowDispatch = true };
+        Assert.That(PcCompatManagedSettingsController.TryCreate(
+            target,
+            null,
+            transaction,
+            () => Array.Empty<object>(),
+            out var controller,
+            out var error), Is.True, error);
+        Assert.That(controller!.RequestOpen(out error), Is.True, error);
+        Assert.That(controller.Dispatch(), Is.True);
+
+        controller.ReleaseForSessionTeardown();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(controller.Snapshot().State,
+                Is.EqualTo(PcCompatManagedSettingsState.Closed));
+            Assert.That(target.Calls, Is.EqualTo(new[] { "open", "draw", "close" }));
+            Assert.That(transaction.ReleaseCount, Is.EqualTo(1));
+        });
+    }
+
+    [Test]
+    public void SettingsControllerStopsTheActiveDispatchAfterReentrantSessionTeardown()
+    {
+        var target = new SettingsTarget();
+        var transaction = new ImGuiTransactionProbe { AllowDispatch = true };
+        PcCompatManagedSettingsController? controller = null;
+        target.OnDraw = () => controller!.ReleaseForSessionTeardown();
+        Assert.That(PcCompatManagedSettingsController.TryCreate(
+            target,
+            null,
+            transaction,
+            () => Array.Empty<object>(),
+            out controller,
+            out var error), Is.True, error);
+        Assert.That(controller!.RequestOpen(out error), Is.True, error);
+
+        Assert.That(controller.Dispatch(), Is.True);
+        Assert.That(controller.Dispatch(), Is.True);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(controller.Snapshot().State,
+                Is.EqualTo(PcCompatManagedSettingsState.Closed));
+            Assert.That(target.Calls, Is.EqualTo(new[] { "open", "draw", "close" }));
+            Assert.That(transaction.ReleaseCount, Is.EqualTo(1));
+        });
+    }
+
+    [Test]
+    public void SettingsControllerTeardownWinsOverAnOnGuiExceptionFromTheRetiredSurface()
+    {
+        var target = new SettingsTarget { ThrowOnDraw = true };
+        var transaction = new ImGuiTransactionProbe { AllowDispatch = true };
+        PcCompatManagedSettingsController? controller = null;
+        target.OnDraw = () => controller!.ReleaseForSessionTeardown();
+        Assert.That(PcCompatManagedSettingsController.TryCreate(
+            target,
+            null,
+            transaction,
+            () => Array.Empty<object>(),
+            out controller,
+            out var error), Is.True, error);
+        Assert.That(controller!.RequestOpen(out error), Is.True, error);
+
+        Assert.That(controller.Dispatch(), Is.True);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(controller.Snapshot().State,
+                Is.EqualTo(PcCompatManagedSettingsState.Closed));
+            Assert.That(controller.Snapshot().Fault, Is.Null);
+            Assert.That(target.Calls, Is.EqualTo(new[] { "open", "draw", "close" }));
+            Assert.That(transaction.ReleaseCount, Is.EqualTo(1));
+        });
+    }
+
+    [Test]
+    public void SettingsControllerTeardownDoesNotReenterAnActiveCloseCallback()
+    {
+        var target = new SettingsTarget();
+        var transaction = new ImGuiTransactionProbe { AllowDispatch = true };
+        PcCompatManagedSettingsController? controller = null;
+        target.OnClose = () => controller!.ReleaseForSessionTeardown();
+        Assert.That(PcCompatManagedSettingsController.TryCreate(
+            target,
+            null,
+            transaction,
+            () => Array.Empty<object>(),
+            out controller,
+            out var error), Is.True, error);
+        Assert.That(controller!.RequestOpen(out error), Is.True, error);
+        Assert.That(controller.Dispatch(), Is.True);
+
+        controller.RequestClose();
+        Assert.That(controller.Dispatch(), Is.True);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(controller.Snapshot().State,
+                Is.EqualTo(PcCompatManagedSettingsState.Closed));
+            Assert.That(target.Calls, Is.EqualTo(new[] { "open", "draw", "close" }));
+            Assert.That(transaction.ReleaseCount, Is.EqualTo(1));
+        });
+    }
+
+    [Test]
+    public void SettingsControllerTeardownClearsAnAlreadyFaultedSurfaceWithoutClosingTwice()
+    {
+        var target = new SettingsTarget { ThrowOnDraw = true };
+        var transaction = new ImGuiTransactionProbe { AllowDispatch = true };
+        Assert.That(PcCompatManagedSettingsController.TryCreate(
+            target,
+            null,
+            transaction,
+            () => Array.Empty<object>(),
+            out var controller,
+            out var error), Is.True, error);
+        Assert.That(controller!.RequestOpen(out error), Is.True, error);
+        Assert.That(controller.Dispatch(), Is.False);
+        Assert.That(controller.Snapshot().State,
+            Is.EqualTo(PcCompatManagedSettingsState.Faulted));
+
+        controller.ReleaseForSessionTeardown();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(controller.Snapshot().State,
+                Is.EqualTo(PcCompatManagedSettingsState.Closed));
+            Assert.That(target.Calls, Is.EqualTo(new[] { "open", "draw", "close" }));
+            Assert.That(transaction.ReleaseCount, Is.EqualTo(2),
+                "fault cleanup releases the surface once, and session teardown releases the terminal transaction once");
         });
     }
 
@@ -394,6 +670,446 @@ public sealed class PcCompatManagedSettingsControllerTests
     }
 
     [Test]
+    public void ImGuiInteractionFenceCommitsAtLayoutThenWaitsForRebuildBeforeNonLayout()
+    {
+        var fence = new PcCompatManagedImGuiInteractionFence();
+        const int buttonToken = 101;
+        const int toggleToken = 102;
+        const int textToken = 103;
+
+        fence.BeginFrame(PcCompatManagedImGuiEventKind.Input);
+        Assert.Multiple(() =>
+        {
+            Assert.That(fence.ResolveRawToggle(false, true, toggleToken), Is.False);
+            Assert.That(fence.ResolveRawButton(true, buttonToken), Is.False);
+            Assert.That(fence.ResolveRawText("old", "new", textToken), Is.EqualTo("old"));
+        });
+        fence.EndFrame();
+        Assert.Multiple(() =>
+        {
+            Assert.That(fence.State, Is.EqualTo(PcCompatManagedImGuiTransactionState.InputPending));
+            Assert.That(fence.ShouldDispatch(PcCompatManagedImGuiEventKind.Repaint), Is.True);
+        });
+
+        fence.BeginFrame(PcCompatManagedImGuiEventKind.Layout);
+        Assert.Multiple(() =>
+        {
+            Assert.That(fence.ResolveRawToggle(false, false, toggleToken), Is.True);
+            Assert.That(fence.ResolveRawButton(false, buttonToken), Is.True);
+            Assert.That(fence.ResolveRawText("old", "old", textToken), Is.EqualTo("new"));
+        });
+        fence.EndFrame();
+        Assert.Multiple(() =>
+        {
+            Assert.That(fence.State,
+                Is.EqualTo(PcCompatManagedImGuiTransactionState.AwaitingRebuildLayout));
+            Assert.That(fence.ShouldDispatch(PcCompatManagedImGuiEventKind.Input), Is.False);
+            Assert.That(fence.ShouldDispatch(PcCompatManagedImGuiEventKind.Repaint), Is.False);
+            Assert.That(fence.ShouldDispatch(PcCompatManagedImGuiEventKind.Layout), Is.True);
+        });
+
+        fence.BeginFrame(PcCompatManagedImGuiEventKind.Layout);
+        Assert.That(fence.ResolveRawButton(false, buttonToken), Is.False);
+        fence.EndFrame();
+        Assert.That(fence.State,
+            Is.EqualTo(PcCompatManagedImGuiTransactionState.StableVerification));
+
+        fence.BeginFrame(PcCompatManagedImGuiEventKind.Repaint);
+        Assert.That(fence.ResolveRawButton(false, buttonToken), Is.False);
+        fence.EndFrame();
+        Assert.That(fence.State, Is.EqualTo(PcCompatManagedImGuiTransactionState.Stable));
+    }
+
+    [Test]
+    public void ImGuiInteractionFenceKeepsJipperCreditsTopologyStableAcrossCommitAndRebuild()
+    {
+        var fence = new PcCompatManagedImGuiInteractionFence();
+        var fixture = new JipperCreditsFixture();
+
+        RunFrame(fence, PcCompatManagedImGuiEventKind.Layout, () => fixture.Draw(fence, false));
+        RunFrame(fence, PcCompatManagedImGuiEventKind.Input, () => fixture.Draw(fence, true));
+        RunFrame(fence, PcCompatManagedImGuiEventKind.Repaint, () => fixture.Draw(fence, false));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(fixture.Trees, Is.EqualTo(new[] { "button", "button", "button" }));
+            Assert.That(fixture.CreditsShown, Is.False);
+        });
+
+        RunFrame(fence, PcCompatManagedImGuiEventKind.Layout, () => fixture.Draw(fence, false));
+        Assert.Multiple(() =>
+        {
+            Assert.That(fixture.Trees[^1], Is.EqualTo("button"));
+            Assert.That(fixture.CreditsShown, Is.True);
+            Assert.That(fence.ShouldDispatch(PcCompatManagedImGuiEventKind.Repaint), Is.False);
+        });
+
+        Assert.That(RunFrameIfAllowed(
+            fence,
+            PcCompatManagedImGuiEventKind.Repaint,
+            () => fixture.Draw(fence, false)), Is.False);
+
+        RunFrame(fence, PcCompatManagedImGuiEventKind.Layout, () => fixture.Draw(fence, false));
+        RunFrame(fence, PcCompatManagedImGuiEventKind.Repaint, () => fixture.Draw(fence, false));
+
+        Assert.That(fixture.Trees[^2..], Is.EqualTo(new[] { "credits/horizontal", "credits/horizontal" }));
+    }
+
+    [Test]
+    public void ImGuiInteractionFenceKeepsJipperOverlayerExpansionTopologyStableAcrossCommitAndRebuild()
+    {
+        var fence = new PcCompatManagedImGuiInteractionFence();
+        var fixture = new JipperOverlayerAlignmentFixture();
+
+        RunFrame(fence, PcCompatManagedImGuiEventKind.Layout, () => fixture.Draw(fence, false));
+        RunFrame(fence, PcCompatManagedImGuiEventKind.Input, () => fixture.Draw(fence, true));
+        RunFrame(fence, PcCompatManagedImGuiEventKind.Repaint, () => fixture.Draw(fence, false));
+        RunFrame(fence, PcCompatManagedImGuiEventKind.Layout, () => fixture.Draw(fence, false));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(fixture.Trees, Is.EqualTo(new[]
+            {
+                "alignment/horizontal",
+                "alignment/horizontal",
+                "alignment/horizontal",
+                "alignment/horizontal"
+            }));
+            Assert.That(fixture.Expanded, Is.True);
+            Assert.That(fence.ShouldDispatch(PcCompatManagedImGuiEventKind.Repaint), Is.False);
+        });
+
+        RunFrame(fence, PcCompatManagedImGuiEventKind.Layout, () => fixture.Draw(fence, false));
+        RunFrame(fence, PcCompatManagedImGuiEventKind.Repaint, () => fixture.Draw(fence, false));
+
+        Assert.That(fixture.Trees[^2..], Is.EqualTo(new[]
+        {
+            "alignment/horizontal/selection-horizontal",
+            "alignment/horizontal/selection-horizontal"
+        }));
+    }
+
+    [Test]
+    public void ImGuiInteractionFenceRoutesReorderedControlsByCallsiteInsteadOfCursor()
+    {
+        var fence = new PcCompatManagedImGuiInteractionFence();
+        const int firstToken = 201;
+        const int secondToken = 202;
+
+        fence.BeginFrame(PcCompatManagedImGuiEventKind.Input);
+        Assert.That(fence.ResolveRawText("first", "first-next", firstToken), Is.EqualTo("first"));
+        Assert.That(fence.ResolveRawText("second", "second-next", secondToken), Is.EqualTo("second"));
+        fence.EndFrame();
+
+        fence.BeginFrame(PcCompatManagedImGuiEventKind.Layout);
+        Assert.That(fence.ResolveRawText("second", "second", secondToken), Is.EqualTo("second-next"));
+        Assert.That(fence.ResolveRawText("first", "first", firstToken), Is.EqualTo("first-next"));
+        fence.EndFrame();
+    }
+
+    [Test]
+    public void ImGuiInteractionFenceKeepsTheLatestContinuousValueBeforeCommit()
+    {
+        var fence = new PcCompatManagedImGuiInteractionFence();
+        const int textToken = 205;
+        const int sliderToken = 206;
+
+        fence.BeginFrame(PcCompatManagedImGuiEventKind.Input);
+        Assert.That(fence.ResolveRawText("old", "middle", textToken), Is.EqualTo("old"));
+        Assert.That(fence.ResolveRawValue(1f, 2f, sliderToken), Is.EqualTo(1f));
+        fence.EndFrame();
+
+        fence.BeginFrame(PcCompatManagedImGuiEventKind.Input);
+        Assert.That(fence.ResolveRawText("old", "latest", textToken), Is.EqualTo("old"));
+        Assert.That(fence.ResolveRawValue(1f, 3.5f, sliderToken), Is.EqualTo(1f));
+        fence.EndFrame();
+
+        fence.BeginFrame(PcCompatManagedImGuiEventKind.Layout);
+        Assert.Multiple(() =>
+        {
+            Assert.That(fence.ResolveRawText("old", "old", textToken), Is.EqualTo("latest"));
+            Assert.That(fence.ResolveRawValue(1f, 1f, sliderToken), Is.EqualTo(3.5f));
+        });
+        fence.EndFrame();
+        Assert.That(fence.State,
+            Is.EqualTo(PcCompatManagedImGuiTransactionState.AwaitingRebuildLayout));
+    }
+
+    [Test]
+    public void ImGuiInteractionFenceDropsPendingControlsThatDisappearAfterACommit()
+    {
+        var fence = new PcCompatManagedImGuiInteractionFence();
+        const int collapseToken = 207;
+        const int hiddenTextToken = 208;
+
+        fence.BeginFrame(PcCompatManagedImGuiEventKind.Input);
+        Assert.That(fence.ResolveRawButton(true, collapseToken), Is.False);
+        Assert.That(fence.ResolveRawText("old", "stale", hiddenTextToken), Is.EqualTo("old"));
+        fence.EndFrame();
+        Assert.That(fence.PendingCount, Is.EqualTo(2));
+
+        fence.BeginFrame(PcCompatManagedImGuiEventKind.Layout);
+        Assert.That(fence.ResolveRawButton(false, collapseToken), Is.True);
+        // The conditional text field has disappeared from the new branch and is
+        // intentionally not resolved by this Layout.
+        fence.EndFrame();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(fence.PendingCount, Is.Zero);
+            Assert.That(fence.State,
+                Is.EqualTo(PcCompatManagedImGuiTransactionState.AwaitingRebuildLayout));
+        });
+
+        fence.BeginFrame(PcCompatManagedImGuiEventKind.Layout);
+        Assert.That(fence.ResolveRawText("replacement", "replacement", hiddenTextToken),
+            Is.EqualTo("replacement"));
+        fence.EndFrame();
+    }
+
+    [Test]
+    public void ImGuiInteractionFenceSeparatesRepeatedCallsiteOccurrences()
+    {
+        var fence = new PcCompatManagedImGuiInteractionFence();
+        const int loopToken = 209;
+
+        fence.BeginFrame(PcCompatManagedImGuiEventKind.Input);
+        Assert.That(fence.ResolveRawText("first", "first-next", loopToken), Is.EqualTo("first"));
+        Assert.That(fence.ResolveRawText("second", "second-next", loopToken), Is.EqualTo("second"));
+        fence.EndFrame();
+
+        fence.BeginFrame(PcCompatManagedImGuiEventKind.Layout);
+        Assert.Multiple(() =>
+        {
+            Assert.That(fence.ResolveRawText("first", "first", loopToken), Is.EqualTo("first-next"));
+            Assert.That(fence.ResolveRawText("second", "second", loopToken), Is.EqualTo("second-next"));
+        });
+        fence.EndFrame();
+    }
+
+    [Test]
+    public void ImGuiInteractionFenceRecoversKnownLayoutMismatchOnlyThroughLayout()
+    {
+        var fence = new PcCompatManagedImGuiInteractionFence();
+
+        fence.MarkRecoverableLayoutFailure();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(fence.State, Is.EqualTo(PcCompatManagedImGuiTransactionState.Recovering));
+            Assert.That(fence.ShouldDispatch(PcCompatManagedImGuiEventKind.Input), Is.False);
+            Assert.That(fence.ShouldDispatch(PcCompatManagedImGuiEventKind.Repaint), Is.False);
+            Assert.That(fence.ShouldDispatch(PcCompatManagedImGuiEventKind.Layout), Is.True);
+        });
+
+        fence.BeginFrame(PcCompatManagedImGuiEventKind.Layout);
+        fence.EndFrame();
+        Assert.That(fence.State,
+            Is.EqualTo(PcCompatManagedImGuiTransactionState.StableVerification));
+    }
+
+    [Test]
+    public void ImGuiInteractionFenceBoundsPendingControlsAndDropsTheOldestValue()
+    {
+        var fence = new PcCompatManagedImGuiInteractionFence();
+
+        fence.BeginFrame(PcCompatManagedImGuiEventKind.Input);
+        for (var index = 0; index <= 256; index++)
+        {
+            Assert.That(
+                fence.ResolveRawText($"old-{index}", $"new-{index}", 4000 + index),
+                Is.EqualTo($"old-{index}"));
+        }
+        fence.EndFrame();
+
+        Assert.That(fence.PendingCount, Is.EqualTo(256));
+
+        fence.BeginFrame(PcCompatManagedImGuiEventKind.Layout);
+        Assert.Multiple(() =>
+        {
+            Assert.That(fence.ResolveRawText("old-0", "old-0", 4000), Is.EqualTo("old-0"));
+            Assert.That(fence.ResolveRawText("old-1", "old-1", 4001), Is.EqualTo("new-1"));
+        });
+        fence.EndFrame();
+    }
+
+    [Test]
+    public void ImGuiInteractionFenceResetDoesNotLeakPendingInputAcrossGenerations()
+    {
+        var fence = new PcCompatManagedImGuiInteractionFence();
+
+        fence.BeginFrame(PcCompatManagedImGuiEventKind.Input);
+        Assert.That(fence.ResolveRawText("old", "new", 4101), Is.EqualTo("old"));
+        fence.EndFrame();
+        fence.Reset();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(fence.PendingCount, Is.Zero);
+            Assert.That(fence.State, Is.EqualTo(PcCompatManagedImGuiTransactionState.Stable));
+        });
+
+        fence.BeginFrame(PcCompatManagedImGuiEventKind.Layout);
+        Assert.That(fence.ResolveRawText("replacement", "replacement", 4101), Is.EqualTo("replacement"));
+        fence.EndFrame();
+    }
+
+    [Test]
+    public void ImGuiInteractionFenceResetClearsEveryInactiveTeardownState()
+    {
+        var inputPending = new PcCompatManagedImGuiInteractionFence();
+        inputPending.BeginFrame(PcCompatManagedImGuiEventKind.Input);
+        _ = inputPending.ResolveRawText("old", "new", 4301);
+        inputPending.EndFrame();
+
+        var awaitingRebuild = new PcCompatManagedImGuiInteractionFence();
+        awaitingRebuild.BeginFrame(PcCompatManagedImGuiEventKind.Input);
+        _ = awaitingRebuild.ResolveRawButton(true, 4302);
+        awaitingRebuild.EndFrame();
+        awaitingRebuild.BeginFrame(PcCompatManagedImGuiEventKind.Layout);
+        _ = awaitingRebuild.ResolveRawButton(false, 4302);
+        awaitingRebuild.EndFrame();
+
+        var recovering = new PcCompatManagedImGuiInteractionFence();
+        recovering.MarkRecoverableLayoutFailure();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(inputPending.State,
+                Is.EqualTo(PcCompatManagedImGuiTransactionState.InputPending));
+            Assert.That(awaitingRebuild.State,
+                Is.EqualTo(PcCompatManagedImGuiTransactionState.AwaitingRebuildLayout));
+            Assert.That(recovering.State,
+                Is.EqualTo(PcCompatManagedImGuiTransactionState.Recovering));
+        });
+
+        inputPending.Reset();
+        awaitingRebuild.Reset();
+        recovering.Reset();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(inputPending.PendingCount, Is.Zero);
+            Assert.That(inputPending.LayoutEpoch, Is.Zero);
+            Assert.That(inputPending.State, Is.EqualTo(PcCompatManagedImGuiTransactionState.Stable));
+            Assert.That(awaitingRebuild.PendingCount, Is.Zero);
+            Assert.That(awaitingRebuild.LayoutEpoch, Is.Zero);
+            Assert.That(awaitingRebuild.State, Is.EqualTo(PcCompatManagedImGuiTransactionState.Stable));
+            Assert.That(recovering.PendingCount, Is.Zero);
+            Assert.That(recovering.LayoutEpoch, Is.Zero);
+            Assert.That(recovering.State, Is.EqualTo(PcCompatManagedImGuiTransactionState.Stable));
+        });
+    }
+
+    [Test]
+    public void SettingsBackendDefersInteractionFenceResetUntilAnActiveFrameCloses()
+    {
+        var type = typeof(PcCompatManagedSettingsUnityBackend);
+        var backend = (PcCompatManagedSettingsUnityBackend)
+            RuntimeHelpers.GetUninitializedObject(type);
+        var fence = new PcCompatManagedImGuiInteractionFence();
+        fence.BeginFrame(PcCompatManagedImGuiEventKind.Input);
+        _ = fence.ResolveRawText("old", "new", 4303);
+        fence.EndFrame();
+        PcCompatManagedImGuiBridge.BeginSettingsInteractionFrame(
+            fence,
+            PcCompatManagedImGuiEventKind.Layout);
+
+        try
+        {
+            SetPrivateField(backend, "_canvasBaseline", new HashSet<int>());
+            SetPrivateField(backend, "_canvasOwnerIds", new HashSet<int>());
+            SetPrivateField(backend, "_claimedCanvasIds", new HashSet<int>());
+            SetPrivateField(backend, "_interactionFence", fence);
+            var snapshotsField = type.GetField(
+                "_mobileStyleSnapshots",
+                BindingFlags.Instance | BindingFlags.NonPublic)
+                ?? throw new MissingFieldException(type.FullName, "_mobileStyleSnapshots");
+            SetPrivateField(backend, "_mobileStyleSnapshots",
+                Activator.CreateInstance(snapshotsField.FieldType)!);
+            SetPrivateField(backend, "_frameOpen", true);
+            SetPrivateField(backend, "_interactionFenceFrameOpen", true);
+
+            backend.ReleaseCanvasSurface();
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(fence.State,
+                    Is.EqualTo(PcCompatManagedImGuiTransactionState.CommitLayout));
+                Assert.That(GetPrivateField<bool>(backend, "_resetInteractionFenceAfterFrame"), Is.True);
+            });
+
+            var closeFrame = type.GetMethod(
+                "CloseFrame",
+                BindingFlags.Instance | BindingFlags.NonPublic)
+                ?? throw new MissingMethodException("CloseFrame");
+            closeFrame.Invoke(backend, [false]);
+        }
+        finally
+        {
+            // The production CloseFrame path normally clears this thread-static
+            // scope. Keep the test isolated even when an assertion fails first.
+            PcCompatManagedImGuiBridge.EndSettingsInteractionFrame(fence, completed: false);
+        }
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(fence.PendingCount, Is.Zero);
+            Assert.That(fence.LayoutEpoch, Is.Zero);
+            Assert.That(fence.State, Is.EqualTo(PcCompatManagedImGuiTransactionState.Stable));
+            Assert.That(GetPrivateField<bool>(backend, "_resetInteractionFenceAfterFrame"), Is.False);
+        });
+    }
+
+    [Test]
+    public void ImGuiInteractionFenceHasNoSteadyStateAllocations()
+    {
+        var fence = new PcCompatManagedImGuiInteractionFence();
+        const int token = 4201;
+
+        fence.BeginFrame(PcCompatManagedImGuiEventKind.Layout);
+        _ = fence.ResolveRawToggle(false, false, token);
+        fence.EndFrame();
+        fence.BeginFrame(PcCompatManagedImGuiEventKind.Repaint);
+        _ = fence.ResolveRawToggle(false, false, token);
+        fence.EndFrame();
+
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        for (var index = 0; index < 128; index++)
+        {
+            fence.BeginFrame(PcCompatManagedImGuiEventKind.Layout);
+            _ = fence.ResolveRawToggle(false, false, token);
+            fence.EndFrame();
+            fence.BeginFrame(PcCompatManagedImGuiEventKind.Repaint);
+            _ = fence.ResolveRawToggle(false, false, token);
+            fence.EndFrame();
+        }
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.That(allocated, Is.Zero);
+    }
+
+    [Test]
+    public void UnclassifiedExitGuiFailureStillFaultsTheSettingsSurface()
+    {
+        var target = new SettingsTarget { ThrowExitGuiOnDraw = true };
+        Assert.That(PcCompatManagedSettingsController.TryCreate(
+            target,
+            null,
+            out var controller,
+            out var error), Is.True, error);
+        Assert.That(controller!.RequestOpen(out error), Is.True, error);
+
+        Assert.That(controller.Dispatch(), Is.False);
+        Assert.Multiple(() =>
+        {
+            Assert.That(controller.Snapshot().State,
+                Is.EqualTo(PcCompatManagedSettingsState.Faulted));
+            Assert.That(controller.Snapshot().Fault, Does.Contain("ordinary GUI exit"));
+        });
+    }
+
+    [Test]
     public void MobileSettingsHeaderUsesCenteredTitleAndSquareCloseButton()
     {
         var type = typeof(PcCompatManagedSettingsUnityBackend);
@@ -405,7 +1121,7 @@ public sealed class PcCompatManagedSettingsControllerTests
             FindModManagerRoot(),
             "xphorror.PcModCompat",
             "src",
-            "PcCompatManagedSettingsUnityBackend.cs"));
+            "PcCompatManagedSettingsUnityBackend.cs"), Encoding.UTF8);
 
         Assert.Multiple(() =>
         {
@@ -420,29 +1136,87 @@ public sealed class PcCompatManagedSettingsControllerTests
     }
 
     [Test]
-    public void MobileSettingsLayoutAppliesRealTouchHeightAndPerStyleWrapping()
+    public void MobileSettingsLayoutKeepsThirdPartyControlsSingleLineUntilTheResponsiveBridgeProvesWrapping()
     {
         var root = FindModManagerRoot();
         var backend = File.ReadAllText(Path.Combine(
             root,
             "xphorror.PcModCompat",
             "src",
-            "PcCompatManagedSettingsUnityBackend.cs"));
+            "PcCompatManagedSettingsUnityBackend.cs"), Encoding.UTF8);
         var bridge = File.ReadAllText(Path.Combine(
             root,
             "xphorror.PcModCompat",
             "src",
-            "PcCompatManagedImGuiBridge.cs"));
+            "PcCompatManagedImGuiBridge.cs"), Encoding.UTF8);
 
         Assert.Multiple(() =>
         {
             Assert.That(backend, Does.Contain("SetFixedHeight"));
             Assert.That(backend, Does.Contain("WordWrap: true"));
             Assert.That(backend, Does.Contain("WordWrap: false"));
+            Assert.That(
+                backend,
+                Does.Contain("new StylePolicy(_skinButton.Invoke(skin, null), WordWrap: false, FixedHeight: interactiveVisualHeight)"));
+            Assert.That(
+                backend,
+                Does.Contain("new StylePolicy(_skinToggle.Invoke(skin, null), WordWrap: false, FixedHeight: interactiveVisualHeight)"));
+            Assert.That(
+                backend,
+                Does.Contain("new StylePolicy(_skinLabel.Invoke(skin, null), WordWrap: false, FixedHeight: 0f)"));
             Assert.That(backend, Does.Contain("_stackControlRows"));
+            Assert.That(backend, Does.Contain("FooterButton"));
+            Assert.That(backend, Does.Contain("ComputeFooterButtonWidth"));
             Assert.That(backend, Does.Contain("DrawEnumRows"));
             Assert.That(bridge, Does.Contain("RegisterFixedHeightSetter"));
+            Assert.That(bridge, Does.Contain("t_mobileContentWidth"));
+            Assert.That(bridge, Does.Contain("PcCompatManagedResponsiveImGuiLayout.BeginFrame"));
+            Assert.That(bridge, Does.Contain("ApplyResponsiveTextLayout"));
+            Assert.That(bridge, Does.Contain("bool? wrapText"));
+            Assert.That(bridge, Does.Contain("wrapText ?? previousWordWrap"));
+            Assert.That(bridge, Does.Contain("NormalizeTextOptions"));
+            Assert.That(bridge, Does.Contain("Math.Max(previousHeight, baselineHeight)"));
+            Assert.That(bridge, Does.Contain("if (previousWordWrap)"));
+            Assert.That(backend, Does.Contain("_toggleStyled.Invoke"));
+            Assert.That(backend, Does.Contain("_buttonContentStyled.Invoke"));
+            Assert.That(backend, Does.Contain("_guiLabelRectContentStyled.Invoke"));
+            Assert.That(backend, Does.Contain("v19-style-fingerprint"));
+            Assert.That(bridge, Does.Contain("TextMeasurementCacheCapacity"));
+            Assert.That(bridge, Does.Contain("RequiresMeasurement"));
+            Assert.That(bridge, Does.Contain("measurementStyleFingerprint: GetMobileMeasurementFingerprint()"));
+            Assert.That(bridge, Does.Not.Contain("ApplyMinimumTouchHeight"));
+            Assert.That(bridge, Does.Not.Contain("EstimateMobileTextWidth"));
         });
+    }
+
+    [Test]
+    public void MobileSettingsScaleRetainsCurrentLogicalContentWidthForResponsiveLayout()
+    {
+        const BindingFlags flags = BindingFlags.NonPublic | BindingFlags.Static;
+        var bridge = typeof(PcCompatManagedImGuiBridge);
+        var enter = bridge.GetMethod(
+            "EnterMobileSettingsScale",
+            flags,
+            binder: null,
+            types: [typeof(float), typeof(float), typeof(float), typeof(float)],
+            modifiers: null)!;
+        var exit = bridge.GetMethod("ExitMobileSettingsScale", flags)!;
+        var getContentWidth = bridge.GetMethod("GetMobileContentWidth", flags)!;
+        var previous = enter.Invoke(null, [1f, 1f, 48f, 352f]);
+
+        try
+        {
+            Assert.Multiple(() =>
+            {
+                Assert.That(Convert.ToSingle(getContentWidth.Invoke(null, null)), Is.EqualTo(352f));
+            });
+        }
+        finally
+        {
+            exit.Invoke(null, [previous]);
+        }
+
+        Assert.That(Convert.ToSingle(getContentWidth.Invoke(null, null)), Is.Zero);
     }
 
     [Test]
@@ -558,7 +1332,7 @@ public sealed class PcCompatManagedSettingsControllerTests
             "tools",
             "ProxyInputClosure",
             "proxy_surface_members.txt");
-        var surface = File.ReadAllText(path);
+        var surface = File.ReadAllText(path, Encoding.UTF8);
 
         Assert.Multiple(() =>
         {
@@ -775,7 +1549,7 @@ public sealed class PcCompatManagedSettingsControllerTests
             };
             var constructor = typeof(PcCompatManagedModSession).GetConstructors(
                     BindingFlags.Instance | BindingFlags.NonPublic)
-                .Single(candidate => candidate.GetParameters().Length == 12);
+                .Single(candidate => candidate.GetParameters().Length == 13);
             session = (PcCompatManagedModSession)constructor.Invoke(
             [
                 manifest,
@@ -788,7 +1562,8 @@ public sealed class PcCompatManagedSettingsControllerTests
                 false,
                 false,
                 false,
-                0L,
+                1L,
+                false,
                 false
             ]);
             Assert.That(PcCompatManagedSettingsController.TryCreate(
@@ -852,10 +1627,91 @@ public sealed class PcCompatManagedSettingsControllerTests
         }
     }
 
+    private static void RunFrame(
+        PcCompatManagedImGuiInteractionFence fence,
+        PcCompatManagedImGuiEventKind eventKind,
+        Action draw)
+    {
+        Assert.That(fence.ShouldDispatch(eventKind), Is.True);
+        fence.BeginFrame(eventKind);
+        try
+        {
+            draw();
+        }
+        finally
+        {
+            fence.EndFrame();
+        }
+    }
+
+    private static bool RunFrameIfAllowed(
+        PcCompatManagedImGuiInteractionFence fence,
+        PcCompatManagedImGuiEventKind eventKind,
+        Action draw)
+    {
+        if (!fence.ShouldDispatch(eventKind))
+            return false;
+        RunFrame(fence, eventKind, draw);
+        return true;
+    }
+
+    private sealed class JipperCreditsFixture
+    {
+        private const int CreditsButtonToken = 3101;
+
+        public List<string> Trees { get; } = [];
+        public bool CreditsShown { get; private set; }
+
+        public void Draw(PcCompatManagedImGuiInteractionFence fence, bool observedButton)
+        {
+            // Mirrors JRP: the branch is evaluated before the button and the
+            // old branch always returns after the click changes state.
+            if (!CreditsShown)
+            {
+                Trees.Add("button");
+                if (fence.ResolveRawButton(observedButton, CreditsButtonToken))
+                    CreditsShown = true;
+                return;
+            }
+
+            Trees.Add("credits/horizontal");
+        }
+    }
+
+    private sealed class JipperOverlayerAlignmentFixture
+    {
+        private const int ExpandButtonToken = 3201;
+        private const int GridToken = 3202;
+
+        public List<string> Trees { get; } = [];
+        public bool Expanded { get; private set; }
+
+        public void Draw(PcCompatManagedImGuiInteractionFence fence, bool observedButton)
+        {
+            // Mirrors JPOV: expanded is captured before the button and the
+            // conditional selection group uses that old local value.
+            var expanded = Expanded;
+            var tree = "alignment/horizontal";
+            if (fence.ResolveRawButton(observedButton, ExpandButtonToken))
+                Expanded = !Expanded;
+            if (expanded)
+            {
+                tree += "/selection-horizontal";
+                _ = fence.ResolveRawValue(0, 0, GridToken);
+            }
+            Trees.Add(tree);
+        }
+    }
+
     private sealed class SettingsTarget
     {
         public List<string> Calls { get; } = new();
         public bool ThrowOnDraw { get; set; }
+        public bool ThrowExitGuiOnDraw { get; set; }
+        public int LayoutMismatchFailuresRemaining { get; set; }
+        public int LayoutGroupMismatchFailuresRemaining { get; set; }
+        public Action? OnDraw { get; set; }
+        public Action? OnClose { get; set; }
         public bool CompatSettingsVisible { get; private set; }
 
         public void CompatOpenGUI()
@@ -867,6 +1723,22 @@ public sealed class PcCompatManagedSettingsControllerTests
         public void CompatOnGUI()
         {
             Calls.Add("draw");
+            OnDraw?.Invoke();
+            if (LayoutMismatchFailuresRemaining > 0)
+            {
+                LayoutMismatchFailuresRemaining--;
+                throw new ArgumentException(
+                    "Getting control 2's position in a group with only 2 controls " +
+                    "when doing repaint\nAborting");
+            }
+            if (LayoutGroupMismatchFailuresRemaining > 0)
+            {
+                LayoutGroupMismatchFailuresRemaining--;
+                throw new InvalidOperationException(
+                    "UnityEngine.ExitGUIException: GUILayout: Mismatched LayoutGroup.Ignore");
+            }
+            if (ThrowExitGuiOnDraw)
+                throw new InvalidOperationException("UnityEngine.ExitGUIException: ordinary GUI exit");
             if (ThrowOnDraw)
                 throw new InvalidOperationException("settings draw failed");
         }
@@ -877,6 +1749,7 @@ public sealed class PcCompatManagedSettingsControllerTests
         public void CompatCloseGUI()
         {
             Calls.Add("close");
+            OnClose?.Invoke();
             CompatSettingsVisible = false;
         }
     }
@@ -895,6 +1768,31 @@ public sealed class PcCompatManagedSettingsControllerTests
         public bool IsClaimedCanvasSurfaceVisible() => Visible;
 
         public void ReleaseCanvasSurface() => ReleaseCount++;
+    }
+
+    private sealed class ImGuiTransactionProbe :
+        IPcCompatManagedSettingsCanvasProbe,
+        IPcCompatManagedSettingsImGuiTransaction
+    {
+        public bool AllowDispatch { get; set; }
+        public bool IsStable => AllowDispatch;
+        public int RecoverableFailureCount { get; private set; }
+        public int ReleaseCount { get; private set; }
+
+        public void BeginCanvasProbe(IReadOnlyList<object> ownerGameObjects)
+        {
+        }
+
+        public bool TryClaimCanvasSurface() => false;
+
+        public bool IsClaimedCanvasSurfaceVisible() => false;
+
+        public void ReleaseCanvasSurface()
+            => ReleaseCount++;
+
+        public bool ShouldDispatchCurrentEvent() => AllowDispatch;
+
+        public void MarkRecoverableLayoutFailure() => RecoverableFailureCount++;
     }
 
     private sealed class MethodOnlyProxy
@@ -965,12 +1863,30 @@ public sealed class PcCompatManagedSettingsControllerTests
         var directory = new DirectoryInfo(TestContext.CurrentContext.TestDirectory);
         while (directory != null)
         {
-            if (File.Exists(Path.Combine(directory.FullName, "build.ps1")) &&
+            if (File.Exists(Path.Combine(directory.FullName, "build_android_single.ps1")) &&
                 Directory.Exists(Path.Combine(directory.FullName, "xphorror.PcModCompat")))
                 return directory.FullName;
             directory = directory.Parent;
         }
         throw new DirectoryNotFoundException("StArray.ModManager root was not found");
+    }
+
+    private static void SetPrivateField(object target, string name, object value)
+    {
+        var field = target.GetType().GetField(
+            name,
+            BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new MissingFieldException(target.GetType().FullName, name);
+        field.SetValue(target, value);
+    }
+
+    private static T GetPrivateField<T>(object target, string name)
+    {
+        var field = target.GetType().GetField(
+            name,
+            BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new MissingFieldException(target.GetType().FullName, name);
+        return (T)field.GetValue(target)!;
     }
 
     private sealed class ProxySettingsLoadContext(

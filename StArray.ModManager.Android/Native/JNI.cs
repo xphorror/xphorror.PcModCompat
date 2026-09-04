@@ -117,6 +117,9 @@ public sealed class JavaClass : IDisposable
     public unsafe int CallStaticIntMethod0(nint m)
         => JniHelperNative.CallStaticIntMethodA(Handle, m, null);
 
+    public unsafe bool CallStaticBooleanMethod0(nint m)
+        => JniHelperNative.CallStaticBooleanMethodA(Handle, m, null);
+
     /// <summary>创建 Java String</summary>
     public nint NewString(string s) => JniHelperNative.NewString(s);
 

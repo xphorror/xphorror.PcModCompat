@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -10,7 +11,7 @@ public static unsafe class PcCompatNativeHookRules
 {
     private const string Lib = "starray_modmanager";
     private const string LogTag = "PcCompatHookRules";
-    private const uint OverlaySnapshotAbiVersion = 4;
+    private const uint OverlaySnapshotAbiVersion = 7;
     private const uint InputHudSnapshotAbiVersion = 1;
     private const uint RawInputReadAbiVersion = 1;
     private const uint ExternalInputDeviceSnapshotAbiVersion = 1;
@@ -26,6 +27,9 @@ public static unsafe class PcCompatNativeHookRules
     private static readonly uint OverlaySnapshotNativeSize =
         checked((uint)Marshal.SizeOf<OverlaySnapshotNative>());
     private static PcCompatOverlaySnapshot s_cachedOverlaySnapshot = PcCompatOverlaySnapshot.Unavailable;
+    private static PcCompatOverlaySnapshot s_cachedSharedGameSnapshot = PcCompatOverlaySnapshot.Unavailable;
+    private static readonly ConcurrentDictionary<string, PcCompatOverlaySnapshot>
+        CachedOverlaySnapshots = new(StringComparer.OrdinalIgnoreCase);
     private static readonly object InputHudSnapshotLock = new();
     private static readonly Dictionary<int, PcCompatInputHudSnapshot> CachedInputHudSnapshots = new();
     private static PcCompatClockAnchorSnapshot s_cachedClockAnchor = PcCompatClockAnchorSnapshot.Unavailable;
@@ -102,6 +106,24 @@ public static unsafe class PcCompatNativeHookRules
         public uint InputTotalCount;
         public float InputKps;
         public float PlanetSpeed;
+        public uint RdcAuto;
+        public uint NoFail;
+        public uint Paused;
+        public uint IsGameWorld;
+        public float SongPitch;
+        public double ConductorAddOffset;
+        public double ConductorSongPositionMinusi;
+        public uint IsScnGame;
+        public uint IsGameReady;
+        public uint SessionEpoch;
+        public ulong ValidGameSnapshotFields;
+        public ulong ControllerPointer;
+        public ulong ConductorPointer;
+        public ulong LevelMakerPointer;
+        public ulong CurrentFloorPointer;
+        public ulong FirstFloorPointer;
+        public ulong SongPointer;
+        public ulong PlanetarySystemPointer;
     }
 
     [StructLayout(LayoutKind.Sequential, Pack = 4)]
@@ -316,8 +338,28 @@ public static unsafe class PcCompatNativeHookRules
     private static readonly uint VmFaultSnapshotNativeSize =
         checked((uint)Marshal.SizeOf<VmFaultSnapshotNative>());
 
+    [DllImport(Lib, EntryPoint = "modmanager_pccompat_prime_il2cpp_metadata")]
+    private static extern int PrimeIl2CppMetadataNative();
+
     [DllImport(Lib, EntryPoint = "modmanager_pccompat_load_hook_rules_json")]
     private static extern int LoadHookRulesJsonNative([MarshalAs(UnmanagedType.LPUTF8Str)] string path);
+
+    public static bool TryPrimeIl2CppMetadata()
+    {
+        try
+        {
+            var result = PrimeIl2CppMetadataNative();
+            if (result == 1)
+                return true;
+            Logger.Error(LogTag, "protected IL2CPP metadata prime failed result=" + result);
+            return false;
+        }
+        catch (Exception exception)
+        {
+            Logger.Error(LogTag, "protected IL2CPP metadata prime failed: " + exception);
+            return false;
+        }
+    }
 
     [DllImport(Lib, EntryPoint = "modmanager_pccompat_load_hook_rules_bin")]
     private static extern int LoadHookRulesBinaryNative([MarshalAs(UnmanagedType.LPUTF8Str)] string path);
@@ -516,6 +558,17 @@ public static unsafe class PcCompatNativeHookRules
 
     [DllImport(Lib, EntryPoint = "modmanager_pccompat_read_overlay_snapshot")]
     private static extern int ReadOverlaySnapshotNative(
+        ref OverlaySnapshotNative snapshot,
+        uint snapshotSize);
+
+    [DllImport(Lib, EntryPoint = "modmanager_pccompat_read_overlay_snapshot_for_mod")]
+    private static extern int ReadOverlaySnapshotForModNative(
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string modId,
+        ref OverlaySnapshotNative snapshot,
+        uint snapshotSize);
+
+    [DllImport(Lib, EntryPoint = "modmanager_pccompat_read_shared_game_snapshot")]
+    private static extern int ReadSharedGameSnapshotNative(
         ref OverlaySnapshotNative snapshot,
         uint snapshotSize);
 
@@ -883,21 +936,54 @@ public static unsafe class PcCompatNativeHookRules
     }
 
     public static PcCompatOverlaySnapshot GetOverlaySnapshot()
+        => GetOverlaySnapshotCore(null);
+
+    // Reverse-patch state is official game telemetry, not an owner HUD projection.
+    // It remains readable when the consumer has no visible overlay of its own.
+    public static PcCompatOverlaySnapshot GetSharedGameSnapshot()
+        => GetOverlaySnapshotCore(null, sharedGameSnapshot: true);
+
+    public static PcCompatOverlaySnapshot GetOverlaySnapshot(string modId)
     {
-        var cached = Volatile.Read(ref s_cachedOverlaySnapshot);
+        ArgumentException.ThrowIfNullOrWhiteSpace(modId);
+        return GetOverlaySnapshotCore(modId);
+    }
+
+    private static PcCompatOverlaySnapshot GetOverlaySnapshotCore(
+        string? modId,
+        bool sharedGameSnapshot = false)
+    {
+        if (sharedGameSnapshot && modId != null)
+            throw new ArgumentException("A shared game snapshot cannot be scoped to a MOD.", nameof(modId));
+
+        var cached = sharedGameSnapshot
+            ? Volatile.Read(ref s_cachedSharedGameSnapshot)
+            : modId == null
+            ? Volatile.Read(ref s_cachedOverlaySnapshot)
+            : CachedOverlaySnapshots.GetValueOrDefault(
+                modId,
+                PcCompatOverlaySnapshot.Unavailable);
         var native = new OverlaySnapshotNative
         {
             StructSize = OverlaySnapshotNativeSize,
             AbiVersion = OverlaySnapshotAbiVersion,
             Generation = cached.ProviderAvailable ? cached.Generation : 0
         };
-        var readResult = ReadOverlaySnapshotNative(ref native, OverlaySnapshotNativeSize);
+        var readResult = sharedGameSnapshot
+            ? ReadSharedGameSnapshotNative(ref native, OverlaySnapshotNativeSize)
+            : modId == null
+            ? ReadOverlaySnapshotNative(ref native, OverlaySnapshotNativeSize)
+            : ReadOverlaySnapshotForModNative(modId, ref native, OverlaySnapshotNativeSize);
         if (readResult == 0 && cached.ProviderAvailable)
             return cached;
         if (readResult < 0 ||
             native.StructSize != OverlaySnapshotNativeSize ||
             native.AbiVersion != OverlaySnapshotAbiVersion)
+        {
+            if (modId != null)
+                CachedOverlaySnapshots.TryRemove(modId, out _);
             return PcCompatOverlaySnapshot.Unavailable;
+        }
 
         if (cached.ProviderAvailable && cached.Generation == native.Generation)
             return cached;
@@ -906,6 +992,16 @@ public static unsafe class PcCompatNativeHookRules
         {
             ProviderAvailable = true,
             Generation = native.Generation,
+            HasExplicitGameSnapshotValidity = true,
+            ValidGameSnapshotFields =
+                (PcCompatGameSnapshotFields)native.ValidGameSnapshotFields,
+            ControllerPointer = checked((long)native.ControllerPointer),
+            ConductorPointer = checked((long)native.ConductorPointer),
+            LevelMakerPointer = checked((long)native.LevelMakerPointer),
+            CurrentFloorPointer = checked((long)native.CurrentFloorPointer),
+            FirstFloorPointer = checked((long)native.FirstFloorPointer),
+            SongPointer = checked((long)native.SongPointer),
+            PlanetarySystemPointer = checked((long)native.PlanetarySystemPointer),
             Visible = native.Visible != 0,
             Practice = native.Practice != 0,
             ShowCount = native.ShowCount,
@@ -956,15 +1052,30 @@ public static unsafe class PcCompatNativeHookRules
             StartProgress = native.StartProgress,
             SpeedMultiplier = native.SpeedMultiplier,
             SessionAuto = native.SessionAuto != 0,
+            IsAuto = native.RdcAuto != 0,
+            IsNoFail = native.NoFail != 0,
+            IsPaused = native.Paused != 0,
+            IsGameWorld = native.IsGameWorld != 0,
+            IsScnGame = native.IsScnGame != 0,
+            IsGameReady = native.IsGameReady != 0,
+            SongPitch = native.SongPitch,
+            ConductorAddOffset = native.ConductorAddOffset,
+            ConductorSongPositionMinusi = native.ConductorSongPositionMinusi,
             InputStateGeneration = native.InputStateGeneration,
             InputHeldMask = native.InputHeldMask,
             InputLastDownMask = native.InputLastDownMask,
             InputLastUpMask = native.InputLastUpMask,
             InputTotalCount = native.InputTotalCount,
             InputKps = native.InputKps,
-            PlanetSpeed = native.PlanetSpeed
+            PlanetSpeed = native.PlanetSpeed,
+            SessionEpoch = native.SessionEpoch
         };
-        Volatile.Write(ref s_cachedOverlaySnapshot, snapshot);
+        if (sharedGameSnapshot)
+            Volatile.Write(ref s_cachedSharedGameSnapshot, snapshot);
+        else if (modId == null)
+            Volatile.Write(ref s_cachedOverlaySnapshot, snapshot);
+        else
+            CachedOverlaySnapshots[modId] = snapshot;
         return snapshot;
     }
 

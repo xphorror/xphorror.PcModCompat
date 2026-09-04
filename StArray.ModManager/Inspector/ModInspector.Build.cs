@@ -1,5 +1,6 @@
 using System.Reflection;
 using System.Reflection.Emit;
+using StArray.ModManager.Resources;
 
 namespace StArray.ModManager.Inspector;
 
@@ -81,6 +82,8 @@ partial class ModInspector
         var color = attrs.OfType<ModSettingColorAttribute>().FirstOrDefault();
         var order = attrs.OfType<ModSettingOrderAttribute>().FirstOrDefault();
         var noSave = attrs.OfType<ModSettingNoSaveAttribute>().Any();
+
+        L10n.RegisterDynamicGlyphText(name, label, tip?.Text, header?.Title);
 
         return new Entry(
             Name: name,

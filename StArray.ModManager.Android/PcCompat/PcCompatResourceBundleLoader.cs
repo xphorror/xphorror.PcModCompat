@@ -81,7 +81,8 @@ public static unsafe class PcCompatResourceBundleLoader
         public required string Sha256Hex { get; init; }
         public required string Path { get; set; }
         public required nint Bundle { get; init; }
-        public required object BundleProxy { get; init; }
+        public required object BundleProxy { get; set; }
+        public required object BundleRoot { get; set; }
         public required long SessionGeneration { get; set; }
         public bool UnloadRequested { get; set; }
         public bool UnloadInProgress { get; set; }
@@ -99,6 +100,7 @@ public static unsafe class PcCompatResourceBundleLoader
         public object? RequestProxy { get; set; }
         public nint Asset { get; set; }
         public object? AssetProxy { get; set; }
+        public object? AssetRoot { get; set; }
         public string? Error { get; set; }
         public long Sequence { get; set; }
     }
@@ -381,6 +383,19 @@ public static unsafe class PcCompatResourceBundleLoader
                         texture,
                         ReleaseWithSession: true);
                 }
+                case PcCompatResourceIrMaterializationKind.FontFromFile:
+                {
+                    if (request.Payload?.Kind != "font-file")
+                        throw new InvalidDataException("Font payload kind is invalid.");
+                    var path = RequireVerifiedPayloadPath(request);
+                    object font;
+                    lock (UnityApiGate)
+                        font = EnsureResourceApi().CreateFontFromFile(request.Asset, path);
+                    return new PcCompatVirtualAssetResolveResult(
+                        PcCompatVirtualAssetResolveStatus.Ready,
+                        font,
+                        ReleaseWithSession: true);
+                }
                 case PcCompatResourceIrMaterializationKind.SpriteFromTexture:
                 {
                     var spriteInfo = request.Asset.Sprite
@@ -634,6 +649,21 @@ public static unsafe class PcCompatResourceBundleLoader
     private static byte[] ReadVerifiedPayload(PcCompatVirtualAssetResolveRequest request)
         => ReadVerifiedPayload(request.ResourceIrRoot, request.Asset, request.Payload);
 
+    private static string RequireVerifiedPayloadPath(PcCompatVirtualAssetResolveRequest request)
+    {
+        var payload = request.Payload
+                      ?? throw new InvalidDataException(
+                          $"Resource payload descriptor is missing: {request.Asset.Id}");
+        var path = ResolvePayloadPath(request.ResourceIrRoot, payload);
+        using var stream = File.OpenRead(path);
+        if (stream.Length != payload.Length)
+            throw new InvalidDataException($"Resource payload length mismatch: {payload.Id}");
+        var sha = Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
+        if (!sha.Equals(payload.Sha256Hex, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidDataException($"Resource payload sha256 mismatch: {payload.Id}");
+        return path;
+    }
+
     private static byte[] ReadVerifiedPayload(
         string resourceIrRoot,
         PcCompatResourceIrAsset asset,
@@ -641,13 +671,7 @@ public static unsafe class PcCompatResourceBundleLoader
     {
         var payload = payloadDescriptor
                       ?? throw new InvalidDataException($"Resource payload descriptor is missing: {asset.Id}");
-        var root = Path.GetFullPath(resourceIrRoot);
-        var path = Path.GetFullPath(Path.Combine(root, payload.RelativePath));
-        var relative = Path.GetRelativePath(root, path);
-        if (Path.IsPathRooted(relative) || relative is "." or ".." ||
-            relative.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal) ||
-            relative.StartsWith(".." + Path.AltDirectorySeparatorChar, StringComparison.Ordinal))
-            throw new InvalidDataException($"Resource payload escapes IR root: {payload.Id}");
+        var path = ResolvePayloadPath(resourceIrRoot, payload);
         var bytes = File.ReadAllBytes(path);
         if (bytes.LongLength != payload.Length)
             throw new InvalidDataException($"Resource payload length mismatch: {payload.Id}");
@@ -657,22 +681,50 @@ public static unsafe class PcCompatResourceBundleLoader
         return bytes;
     }
 
-    private static void ReleaseVirtualAssets(IReadOnlyList<object> assets)
+    private static string ResolvePayloadPath(string resourceIrRoot, PcCompatResourceIrPayload payload)
     {
-        if (assets.Count == 0)
+        var root = Path.GetFullPath(resourceIrRoot);
+        var path = Path.GetFullPath(Path.Combine(root, payload.RelativePath));
+        var relative = Path.GetRelativePath(root, path);
+        if (Path.IsPathRooted(relative) || relative is "." or ".." ||
+            relative.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal) ||
+            relative.StartsWith(".." + Path.AltDirectorySeparatorChar, StringComparison.Ordinal))
+            throw new InvalidDataException($"Resource payload escapes IR root: {payload.Id}");
+        return path;
+    }
+
+    private static void ReleaseVirtualAssets(PcCompatVirtualAssetReleaseBatch batch)
+    {
+        if (batch.Assets.Count == 0)
             return;
         lock (UnityApiGate)
         {
             var api = EnsureResourceApi();
-            foreach (var asset in assets)
+            foreach (var asset in batch.Assets)
             {
                 try
                 {
                     PublishedResourceChangerSprite published;
                     bool resourceChangerSprite;
+                    bool ownershipMismatch = false;
                     lock (Gate)
                     {
                         resourceChangerSprite = PublishedResourceChangerSprites.Remove(asset, out published);
+                        if (resourceChangerSprite)
+                        {
+                            if (!published.ModId.Equals(batch.ModId, StringComparison.OrdinalIgnoreCase) ||
+                                published.SessionGeneration != batch.SessionGeneration)
+                            {
+                                Logger.Warn(
+                                    LogTag,
+                                    $"VirtualBundle release ownership mismatch asset=resource-changer " +
+                                    $"batch={batch.ModId}/{batch.SessionGeneration} " +
+                                    $"published={published.ModId}/{published.SessionGeneration}");
+                                PublishedResourceChangerSprites[asset] = published;
+                                resourceChangerSprite = false;
+                                ownershipMismatch = true;
+                            }
+                        }
                         if (resourceChangerSprite)
                         {
                             PublishedResourceChangerSpriteKeys.Remove(
@@ -693,6 +745,8 @@ public static unsafe class PcCompatResourceBundleLoader
                         }
                         Interlocked.Increment(ref s_resourceChangerSpriteRetired);
                     }
+                    if (ownershipMismatch)
+                        continue;
                     api.Destroy(asset);
                 }
                 catch (Exception ex)
@@ -868,17 +922,25 @@ public static unsafe class PcCompatResourceBundleLoader
                     !candidate.UnloadRequested &&
                     !candidate.UnloadInProgress)
                 .ToArray();
-            bundle = SelectManagedBundle(candidates, request.RequestedPath)
+                bundle = SelectManagedBundle(candidates, request.RequestedPath)
                 ?? throw new InvalidOperationException(
                     $"managed AssetBundle lookup is missing or ambiguous mod={request.ModId} " +
                     $"generation={request.SessionGeneration} path={request.RequestedPath} " +
                     $"loadedCandidates={candidates.Length}");
-            if (bundle.ManagedProxy != null)
+            if (bundle.ManagedProxy != null && !bundle.ManagedReleaseObserved)
             {
-                bundle.ManagedReleaseObserved = false;
+                GC.KeepAlive(bundle.BundleRoot);
                 return bundle.ManagedProxy;
             }
         }
+
+        // Do not hand the MOD the proxy that came from AssetBundleCreateRequest.
+        // That proxy is tied to the request's wrapper lifetime; the owner root keeps
+        // the native object alive, but a stale managed wrapper can still carry a
+        // released GCHandle. Reconstruct a fresh proxy from the owner-held pointer.
+        object managedProxy;
+        lock (UnityApiGate)
+            managedProxy = EnsureApi().WrapAssetBundle(bundle.Bundle);
 
         lock (Gate)
         {
@@ -891,8 +953,11 @@ public static unsafe class PcCompatResourceBundleLoader
                 throw new InvalidOperationException(
                     $"managed AssetBundle ownership changed during proxy creation mod={request.ModId}");
             }
+            bundle.BundleProxy = managedProxy;
+            bundle.ManagedProxy = managedProxy;
             bundle.ManagedReleaseObserved = false;
-            return bundle.ManagedProxy ??= bundle.BundleProxy;
+            GC.KeepAlive(bundle.BundleRoot);
+            return managedProxy;
         }
     }
 
@@ -914,6 +979,7 @@ public static unsafe class PcCompatResourceBundleLoader
             // The MOD relinquishes its view here. The resource session remains
             // authoritative and performs the real Unity unload after Disable.
             bundle.ManagedReleaseObserved = true;
+            bundle.ManagedProxy = null;
         }
     }
 
@@ -1401,13 +1467,32 @@ public static unsafe class PcCompatResourceBundleLoader
         object? bundleProxy;
         lock (UnityApiGate)
             bundleProxy = api.GetAssetBundle(requestProxy);
-        var bundleObject = PcCompatGeneratedUnityBundleApi.GetPointer(bundleProxy);
-        ReleaseBundleRequestHandle(operation);
-        if (bundleObject == nint.Zero)
+        nint bundleObject;
+        object bundleRoot;
+        try
         {
-            CompleteBundleFailure(operation, "AssetBundleCreateRequest completed without an AssetBundle");
+            bundleObject = PcCompatGeneratedUnityBundleApi.GetPointer(bundleProxy);
+            if (bundleObject == nint.Zero)
+            {
+                ReleaseBundleRequestHandle(operation);
+                CompleteBundleFailure(
+                    operation,
+                    "AssetBundleCreateRequest completed without an AssetBundle");
+                return;
+            }
+            lock (UnityApiGate)
+                bundleRoot = api.CreateNativeRoot(bundleObject);
+        }
+        catch (Exception exception)
+        {
+            ReleaseBundleRequestHandle(operation);
+            CompleteBundleFailure(
+                operation,
+                "AssetBundle result could not be rooted: " +
+                exception.GetType().Name + ": " + exception.Message);
             return;
         }
+        ReleaseBundleRequestHandle(operation);
 
         PcCompatResourceLoadRequest completionRequest = null!;
         var registered = false;
@@ -1425,6 +1510,7 @@ public static unsafe class PcCompatResourceBundleLoader
                     Path = completionRequest.Path,
                     Bundle = bundleObject,
                     BundleProxy = bundleProxy!,
+                    BundleRoot = bundleRoot,
                     SessionGeneration = completionRequest.SessionGeneration
                 };
                 registered = true;
@@ -1438,6 +1524,7 @@ public static unsafe class PcCompatResourceBundleLoader
                     api.Unload(bundleProxy!, unloadAllLoadedObjects: true);
             }
             catch { }
+            bundleRoot = null!;
             return;
         }
 
@@ -1586,13 +1673,31 @@ public static unsafe class PcCompatResourceBundleLoader
         object? assetProxy;
         lock (UnityApiGate)
             assetProxy = api.GetAsset(requestProxy);
-        var assetObject = PcCompatGeneratedUnityBundleApi.GetPointer(assetProxy);
-        ReleaseAssetRequestHandle(entry);
-        if (assetObject == nint.Zero)
+        nint assetObject;
+        object assetRoot;
+        try
         {
-            FailAsset(bundle, entry, "AssetBundleRequest completed without an asset");
+            assetObject = PcCompatGeneratedUnityBundleApi.GetPointer(assetProxy);
+            if (assetObject == nint.Zero)
+            {
+                ReleaseAssetRequestHandle(entry);
+                FailAsset(bundle, entry, "AssetBundleRequest completed without an asset");
+                return;
+            }
+            lock (UnityApiGate)
+                assetRoot = api.CreateNativeRoot(assetObject);
+        }
+        catch (Exception exception)
+        {
+            ReleaseAssetRequestHandle(entry);
+            FailAsset(
+                bundle,
+                entry,
+                "Asset result could not be rooted: " +
+                exception.GetType().Name + ": " + exception.Message);
             return;
         }
+        ReleaseAssetRequestHandle(entry);
 
         var accepted = false;
         var unloadAfterCompletion = false;
@@ -1613,6 +1718,7 @@ public static unsafe class PcCompatResourceBundleLoader
                 {
                     entry.Asset = assetObject;
                     entry.AssetProxy = assetProxy;
+                    entry.AssetRoot = assetRoot;
                     entry.Status = PcCompatResourceAssetStatus.Ready;
                     entry.Error = null;
                 }
@@ -1732,9 +1838,11 @@ public static unsafe class PcCompatResourceBundleLoader
         {
             ReleaseAssetRequestHandle(entry);
             entry.AssetProxy = null;
+            entry.AssetRoot = null;
             entry.Asset = nint.Zero;
         }
         bundle.Assets.Clear();
+        bundle.BundleRoot = null!;
         bundle.ManagedProxy = null;
         Logger.Info(
             LogTag,

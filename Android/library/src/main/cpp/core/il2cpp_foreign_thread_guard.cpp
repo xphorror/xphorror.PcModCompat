@@ -1,4 +1,7 @@
 #include "il2cpp_foreign_thread_guard.h"
+#include "pccompat_open_runtime.h"
+#include "dobby_hook_internal.h"
+#include "native_patch_coordinator.h"
 
 #include <android/log.h>
 #include <dlfcn.h>
@@ -45,6 +48,10 @@ std::atomic<uint32_t> g_headroom_skip_count{0};
 // pthread_getattr_np) and allocates the Il2CppThread bookkeeping, which costs
 // several KB of stack. Threads with less than this remaining must not attach.
 constexpr uintptr_t kMinAttachStackHeadroom = 64 * 1024;
+constexpr uint32_t kDomainGetDescriptorSlot = 0x71000001u;
+constexpr uint32_t kThreadCurrentDescriptorSlot = 0x71000002u;
+constexpr uint32_t kThreadAttachDescriptorSlot = 0x71000003u;
+constexpr uint32_t kInstrumentDescriptorSlotBase = 0x71000100u;
 
 // NOTE on thread exit: boehm registers its own pthread-key destructor when a
 // thread is registered, and pthread runs destructors of earlier-created keys
@@ -155,6 +162,7 @@ constexpr GuardTarget kGuardTargets[] = {
     {"il2cpp_format_exception", false},
     {"il2cpp_format_stack_trace", false},
 };
+constexpr size_t kGuardTargetCount = sizeof(kGuardTargets) / sizeof(kGuardTargets[0]);
 
 constexpr uint32_t kArm64BranchMask = 0xFC000000u;
 constexpr uint32_t kArm64BranchOpcode = 0x14000000u;
@@ -338,12 +346,30 @@ void *resolve_instrument_target(void *export_address, int budget = 8) {
 }
 
 template <typename T>
-bool resolve_symbol(void *handle, const char *name, T &destination, std::string &error) {
-    destination = reinterpret_cast<T>(dlsym(handle, name));
-    if (destination == nullptr) {
+bool resolve_symbol(void *handle,
+                    const char *name,
+                    uint32_t descriptor_slot,
+                    T &destination,
+                    std::string &error) {
+    void *candidate = dlsym(handle, name);
+    if (candidate == nullptr) {
         error = std::string("ThreadGuard missing libil2cpp symbol: ") + name;
         return false;
     }
+    uintptr_t protected_address = 0;
+    if (!PC_COMPAT_RESOLVE_ADDRESS(
+            0,
+            0,
+            descriptor_slot,
+            0 |
+                0,
+            reinterpret_cast<uintptr_t>(candidate),
+            &protected_address) ||
+        protected_address != reinterpret_cast<uintptr_t>(candidate)) {
+        error = std::string("ThreadGuard protected symbol descriptor failed: ") + name;
+        return false;
+    }
+    destination = reinterpret_cast<T>(protected_address);
     return true;
 }
 
@@ -354,9 +380,12 @@ bool install_locked(std::string &error) {
         return false;
     }
 
-    if (!resolve_symbol(handle, "il2cpp_domain_get", p_domain_get, error) ||
-        !resolve_symbol(handle, "il2cpp_thread_current", p_thread_current, error) ||
-        !resolve_symbol(handle, "il2cpp_thread_attach", p_thread_attach, error))
+    if (!resolve_symbol(
+            handle, "il2cpp_domain_get", kDomainGetDescriptorSlot, p_domain_get, error) ||
+        !resolve_symbol(
+            handle, "il2cpp_thread_current", kThreadCurrentDescriptorSlot, p_thread_current, error) ||
+        !resolve_symbol(
+            handle, "il2cpp_thread_attach", kThreadAttachDescriptorSlot, p_thread_attach, error))
         return false;
 
     g_domain = p_domain_get();
@@ -375,7 +404,8 @@ bool install_locked(std::string &error) {
     int installed = 0;
     int skipped = 0;
     bool ok = true;
-    for (const GuardTarget &target : kGuardTargets) {
+    for (size_t target_index = 0; target_index < kGuardTargetCount; ++target_index) {
+        const GuardTarget &target = kGuardTargets[target_index];
         void *export_address = dlsym(handle, target.symbol);
         if (export_address == nullptr) {
             LOGW("ThreadGuard: %s not exported", target.symbol);
@@ -399,7 +429,55 @@ bool install_locked(std::string &error) {
         }
         if (!instrumented.insert(impl).second)
             continue;  // two exports resolve to the same implementation
-        if (DobbyInstrument(impl, &guard_preamble) != 0) {
+        uintptr_t protected_impl = 0;
+        if (target_index > UINT32_MAX - kInstrumentDescriptorSlotBase ||
+            !PC_COMPAT_RESOLVE_ADDRESS(
+                0,
+                0,
+                kInstrumentDescriptorSlotBase + static_cast<uint32_t>(target_index),
+                0 |
+                    0,
+                reinterpret_cast<uintptr_t>(impl),
+                &protected_impl) ||
+            protected_impl != reinterpret_cast<uintptr_t>(impl)) {
+            LOGW("ThreadGuard: protected instrument descriptor failed for %s", target.symbol);
+            ++skipped;
+            if (target.required) {
+                error = std::string("ThreadGuard: protected instrument descriptor failed for ") +
+                        target.symbol;
+                ok = false;
+            }
+            continue;
+        }
+        starray::native_patch::Transaction patch_transaction;
+        starray::native_patch::ReservationToken patch_reservation;
+        std::string reservation_error;
+        const auto reservation_result = patch_transaction.Reserve(
+            starray::native_patch::Kind::Instrument,
+            "thread-guard-instrument",
+            target.symbol,
+            0,
+            reinterpret_cast<void *>(protected_impl),
+            starray::native_patch::kConservativeDobbyArm64PatchSize,
+            patch_reservation,
+            reservation_error);
+        if (reservation_result != starray::native_patch::ReserveResult::Acquired ||
+            !starray::code_patch::PrepareHookBrokerWrite(
+                reinterpret_cast<void *>(protected_impl),
+                starray::native_patch::kConservativeDobbyArm64PatchSize,
+                true)) {
+            LOGW("ThreadGuard: physical patch coordinator rejected %s: %s",
+                 target.symbol,
+                 reservation_error.c_str());
+            ++skipped;
+            if (target.required) {
+                error = std::string("ThreadGuard: physical patch conflict for ") +
+                        target.symbol;
+                ok = false;
+            }
+            continue;
+        }
+        if (DobbyInstrument(reinterpret_cast<void *>(protected_impl), &guard_preamble) != 0) {
             LOGW("ThreadGuard: DobbyInstrument failed for %s (impl=%p)", target.symbol, impl);
             ++skipped;
             if (target.required) {
@@ -408,6 +486,10 @@ bool install_locked(std::string &error) {
             }
             continue;
         }
+        patch_transaction.Commit(patch_reservation);
+        starray::code_patch::CommitHookBrokerWrite(
+            reinterpret_cast<void *>(protected_impl),
+            starray::native_patch::kConservativeDobbyArm64PatchSize);
         ++installed;
     }
 

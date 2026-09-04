@@ -1,4 +1,5 @@
 using StArray.ModManager.Manager;
+using StArray.ModManager.Runtime;
 using System.Runtime.ExceptionServices;
 
 namespace Xphorror.PcModCompat;
@@ -35,6 +36,10 @@ public static class PcCompatRuntime
     [ThreadStatic]
     private static int s_managedDispatchDepth;
     private static readonly Dictionary<string, PcCompatManagedModSession> Sessions = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly Dictionary<string, PcCompatModSessionLease> NativeSessions =
+        new(StringComparer.OrdinalIgnoreCase);
+    private static readonly Dictionary<string, OwnedRuntimeBinding> OwnedRuntimeBindings =
+        new(StringComparer.OrdinalIgnoreCase);
     private static readonly Dictionary<string, PcCompatRecipeCompileReport> RecipeReports = new(StringComparer.OrdinalIgnoreCase);
     private static readonly Dictionary<string, PcCompatRecipeBundleInfo> RecipeBundles = new(StringComparer.OrdinalIgnoreCase);
     private static readonly Dictionary<string, PcCompatStaticPatchScanReport> StaticScanReports = new(StringComparer.OrdinalIgnoreCase);
@@ -56,11 +61,23 @@ public static class PcCompatRuntime
     private static int s_managedOnGUIGateState = -1;
     private static int s_managedFrameDispatchActive;
     private static int s_managedOnGUIDispatchActive;
-    private static PcCompatManagedModSession[] s_managedFrameSessions = Array.Empty<PcCompatManagedModSession>();
-    private static PcCompatManagedModSession[] s_managedOnGUISessions = Array.Empty<PcCompatManagedModSession>();
     private static readonly PcCompatManagedEventDispatchCollector ManagedEventCollector = new();
-    private static IReadOnlyDictionary<string, PcCompatManagedModSession> s_managedPrefixSessions =
-        new Dictionary<string, PcCompatManagedModSession>(StringComparer.OrdinalIgnoreCase);
+
+    private sealed class ManagedDispatchSnapshot(
+        PcCompatManagedModSession[] frameSessions,
+        PcCompatManagedModSession[] onGuiSessions,
+        IReadOnlyDictionary<string, PcCompatManagedModSession> prefixSessions)
+    {
+        public PcCompatManagedModSession[] FrameSessions { get; } = frameSessions;
+        public PcCompatManagedModSession[] OnGuiSessions { get; } = onGuiSessions;
+        public IReadOnlyDictionary<string, PcCompatManagedModSession> PrefixSessions { get; } =
+            prefixSessions;
+    }
+
+    private static ManagedDispatchSnapshot s_managedDispatchSnapshot = new(
+        Array.Empty<PcCompatManagedModSession>(),
+        Array.Empty<PcCompatManagedModSession>(),
+        new Dictionary<string, PcCompatManagedModSession>(StringComparer.OrdinalIgnoreCase));
 
     public static PcCompatPatchRegistry PatchRegistry { get; } = new();
     public static event Action? RegistryChanged;
@@ -68,6 +85,7 @@ public static class PcCompatRuntime
     public static bool TryResolveManagedIntSequence(
         string modId,
         PcCompatKeyViewerRoleOverride role,
+        int requiredCount,
         out int[] values,
         out string? error)
     {
@@ -80,7 +98,28 @@ public static class PcCompatRuntime
             error = $"managed session '{modId}' is unavailable";
             return false;
         }
-        return session.TryResolveManagedIntSequence(role, out values, out error);
+        return session.TryResolveManagedIntSequence(role, requiredCount, out values, out error);
+    }
+
+    internal static bool TryBeginKeyViewerStatisticsTransaction(
+        string modId,
+        IReadOnlyList<PcCompatKeyViewerStatisticsFeature> features,
+        out PcCompatKeyViewerStatisticsTransaction? transaction,
+        out string? error)
+    {
+        PcCompatManagedModSession? session;
+        lock (SessionLock)
+            Sessions.TryGetValue(modId, out session);
+        if (session == null)
+        {
+            transaction = null;
+            error = null;
+            return true;
+        }
+        return session.TryBeginKeyViewerStatisticsTransaction(
+            features,
+            out transaction,
+            out error);
     }
 
     public static bool TryProjectManagedKeyViewerLabels(
@@ -131,10 +170,13 @@ public static class PcCompatRuntime
             out error);
     }
 
-    public static void RegisterMod(PcModManifest manifest)
+    internal static void RegisterMod(
+        PcModManifest manifest,
+        ModRuntimeSession? runtimeSession = null,
+        ModRuntimeKey runtimeKey = default)
     {
         var prepared = PrepareMod(manifest);
-        RegisterPreparedMod(prepared);
+        RegisterPreparedMod(prepared, runtimeSession, runtimeKey);
     }
 
     public static PcCompatPreparedMod PrepareMod(
@@ -232,7 +274,10 @@ public static class PcCompatRuntime
         };
     }
 
-    public static void RegisterPreparedMod(PcCompatPreparedMod prepared)
+    internal static void RegisterPreparedMod(
+        PcCompatPreparedMod prepared,
+        ModRuntimeSession? runtimeSession = null,
+        ModRuntimeKey runtimeKey = default)
     {
         ArgumentNullException.ThrowIfNull(prepared);
         EnsureManagedInstallContext();
@@ -321,6 +366,17 @@ public static class PcCompatRuntime
         var hasRecipe = prepared.HasRecipe;
         var recipeReport = prepared.RecipeReport;
         var recipeError = prepared.RecipeError;
+
+        // A render-callback rule exists only to forward a Unity callback into the MOD's own managed
+        // code, so it cannot be served by the verified-fixed-op path. Without this, emitting the rule
+        // would flip hasRecipe true for a MOD that has no other rules - JipperKeyViewer uses no
+        // Harmony at all - and the branch below would report it "loaded from verified rule recipe"
+        // while never running its managed setup.
+        var requiresManagedRenderDispatch = recipeReport?.Rules.Any(rule =>
+            rule.Op == PcCompatRuleOp.ManagedRenderCallback) == true;
+        if (requiresManagedRenderDispatch)
+            requiresManagedSynchronousPrefix = true;
+
         if (hasRecipe)
         {
             if (recipeReport == null)
@@ -363,6 +419,31 @@ public static class PcCompatRuntime
              !EnvEnabled("STARRAY_PCMOD_COMPAT_RECIPE_ONLY", false));
         var useRewrittenAssembly = runRewrittenOracle || runManagedSelfRender;
 
+        if (!hasRecipe && !useRewrittenAssembly)
+        {
+            RegistryChanged?.Invoke();
+            throw new NotSupportedException(recipeError ?? $"No verified rule recipe is available for mod id={manifest.Id}");
+        }
+
+        PcCompatModSessionLease pcModSession;
+        try
+        {
+            pcModSession = OpenPcModSession(manifest, runtimeKey);
+            RegisterOwnedSessionResources(
+                manifest,
+                runtimeSession,
+                runtimeKey,
+                pcModSession);
+        }
+        catch
+        {
+            ClosePcModSession(manifest.Id);
+            PcCompatVirtualBundleRegistry.RemoveMod(manifest.Id);
+            PcCompatResourceRecipeRuntime.Unload(manifest.Id);
+            PcCompatResourceChangerRuntime.Remove(manifest.Id);
+            throw;
+        }
+
         if (hasRecipe && !useRewrittenAssembly)
         {
             Logger.Info(LogTag, $"mod={manifest.Id} loaded from verified rule recipe; managed PC setup skipped");
@@ -370,45 +451,55 @@ public static class PcCompatRuntime
             return;
         }
 
-        if (!hasRecipe && !useRewrittenAssembly)
-        {
-            RegistryChanged?.Invoke();
-            throw new NotSupportedException(recipeError ?? $"No verified rule recipe is available for mod id={manifest.Id}");
-        }
-
         var shimFolder = PcCompatManagedLoader.ResolveShimFolder(manifest);
         if (shimFolder == null)
+        {
+            ClosePcModSession(manifest.Id);
             throw new DirectoryNotFoundException($"PcModCompat shim folder not found for mod {manifest.Id}");
+        }
 
         if (useRewrittenAssembly && prepared.ManagedAssemblyBundle is null)
         {
+            ClosePcModSession(manifest.Id);
             throw new InvalidOperationException(
                 $"Rewritten managed execution requested without a valid rewrite bundle for mod={manifest.Id}: " +
                 (FirstLine(prepared.ManagedAssemblyError) ?? "rewrite provider produced no bundle"));
         }
 
-        var session = PcCompatManagedLoader.Load(manifest, new PcCompatLoadOptions
+        PcCompatManagedModSession session;
+        try
         {
-            ShimFolder = shimFolder,
-            TargetAssemblyPath = useRewrittenAssembly
-                ? prepared.ManagedAssemblyBundle!.RewrittenAssemblyPath
-                : null,
-            BootstrapAssemblyPath = useRewrittenAssembly &&
-                                    prepared.ManagedAssemblyBundle!.BootstrapAssemblyName is { } bootstrapName &&
-                                    prepared.ManagedAssemblyBundle.RewrittenAssemblyPaths.TryGetValue(
-                                        bootstrapName,
-                                        out var bootstrapPath)
-                ? bootstrapPath
-                : null,
-            RewrittenAssemblyPaths = useRewrittenAssembly
-                ? prepared.ManagedAssemblyBundle!.RewrittenAssemblyPaths
-                : null,
-            ProxyFolder = useRewrittenAssembly
-                ? Path.Combine(AppContext.BaseDirectory, "pc_compat_proxies")
-                : null,
-            TryBootstrap = true,
-            Enable = false
-        });
+            session = PcCompatManagedLoader.Load(manifest, new PcCompatLoadOptions
+            {
+                ShimFolder = shimFolder,
+                TargetAssemblyPath = useRewrittenAssembly
+                    ? prepared.ManagedAssemblyBundle!.RewrittenAssemblyPath
+                    : null,
+                BootstrapAssemblyPath = useRewrittenAssembly &&
+                                        prepared.ManagedAssemblyBundle!.BootstrapAssemblyName is { } bootstrapName &&
+                                        prepared.ManagedAssemblyBundle.RewrittenAssemblyPaths.TryGetValue(
+                                            bootstrapName,
+                                            out var bootstrapPath)
+                    ? bootstrapPath
+                    : null,
+                RewrittenAssemblyPaths = useRewrittenAssembly
+                    ? prepared.ManagedAssemblyBundle!.RewrittenAssemblyPaths
+                    : null,
+                ProxyFolder = useRewrittenAssembly
+                    ? Path.Combine(AppContext.BaseDirectory, "pc_compat_proxies")
+                    : null,
+                TryBootstrap = true,
+                Enable = false,
+                RuntimeSession = runtimeSession,
+                RuntimeKey = runtimeKey,
+                PcModSession = pcModSession
+            });
+        }
+        catch
+        {
+            ClosePcModSession(manifest.Id);
+            throw;
+        }
 
         foreach (var patch in session.RegisteredPatches)
             PatchRegistry.Register(patch);
@@ -431,14 +522,26 @@ public static class PcCompatRuntime
         RegistryChanged?.Invoke();
     }
 
-    public static void RegisterManagedInstallContextProbe(Func<bool>? probe)
+    internal static void RegisterManagedInstallContextProbe(Func<bool>? probe)
         => Volatile.Write(ref s_managedInstallContextProbe, probe);
 
-    public static void RegisterUnityMainThreadProbe(Func<bool>? probe)
+    internal static void RegisterUnityMainThreadProbe(Func<bool>? probe)
         => Volatile.Write(ref s_unityMainThreadProbe, probe);
 
-    public static void RegisterUnityMainWorkScheduler(Func<Action, bool>? scheduler)
+    internal static void RegisterUnityMainWorkScheduler(Func<Action, bool>? scheduler)
         => Volatile.Write(ref s_unityMainWorkScheduler, scheduler);
+
+    internal static bool TryScheduleInteropOnUnityMain(Action work)
+    {
+        ArgumentNullException.ThrowIfNull(work);
+        var threadProbe = Volatile.Read(ref s_unityMainThreadProbe);
+        if (threadProbe?.Invoke() == true)
+        {
+            work();
+            return true;
+        }
+        return Volatile.Read(ref s_unityMainWorkScheduler)?.Invoke(work) == true;
+    }
 
     private static void EnsureManagedInstallContext()
     {
@@ -450,7 +553,7 @@ public static class PcCompatRuntime
         }
     }
 
-    public static void UnregisterMod(PcModManifest manifest)
+    internal static void UnregisterMod(PcModManifest manifest)
     {
         if (s_managedDispatchDepth != 0)
             throw new InvalidOperationException(
@@ -599,6 +702,7 @@ public static class PcCompatRuntime
         PcCompatResourceRecipeRuntime.Unload(manifest.Id);
         PcCompatResourceChangerRuntime.Remove(manifest.Id);
         PcCompatKeyViewerLoweredConsumerPlanRegistry.Remove(manifest.Id);
+        ClosePcModSession(manifest.Id);
         lock (SessionLock)
         {
             RecipeReports.Remove(manifest.Id);
@@ -618,6 +722,153 @@ public static class PcCompatRuntime
         RegistryChanged?.Invoke();
     }
 
+    private static PcCompatModSessionLease OpenPcModSession(
+        PcModManifest manifest,
+        ModRuntimeKey runtimeKey)
+    {
+        var hostGeneration = runtimeKey.IsValid ? runtimeKey.Generation : 1;
+        if (!PcCompatResourceRecipeRuntime.TryGetSessionGeneration(
+                manifest.Id, out var resourceGeneration) ||
+            resourceGeneration <= 0)
+        {
+            // MODs without a resource recipe still need a non-zero resource lane
+            // identity. It follows the Host load generation and therefore retires
+            // with the same reload transaction.
+            resourceGeneration = hostGeneration;
+        }
+        var request = PcCompatModSessionIdentity.Create(
+            manifest, hostGeneration, resourceGeneration);
+        var lease = PcCompatModSessionLease.CreateLocal(request);
+        lock (SessionLock)
+        {
+            if (NativeSessions.Remove(manifest.Id, out var previous))
+                previous.Dispose();
+            NativeSessions[manifest.Id] = lease;
+        }
+        Logger.Info(
+            LogTag,
+            $"native session mod={manifest.Id} hostGeneration={hostGeneration} " +
+            $"resourceGeneration={resourceGeneration} handle=0x{lease.SessionHandle:X}");
+        return lease;
+    }
+
+    private static void RegisterOwnedSessionResources(
+        PcModManifest manifest,
+        ModRuntimeSession? runtimeSession,
+        ModRuntimeKey runtimeKey,
+        PcCompatModSessionLease lease)
+    {
+        if (runtimeSession == null || !runtimeKey.IsValid)
+            return;
+        if (!runtimeSession.CanRegisterOwnedResource(runtimeKey))
+        {
+            throw new InvalidOperationException(
+                $"PC MOD capability session belongs to an inactive runtime generation " +
+                $"mod={manifest.Id} generation={runtimeKey.Generation}.");
+        }
+
+        var identities = new List<(ModOwnedResourceKind Kind, string Identity)>
+        {
+            (
+                ModOwnedResourceKind.Provider,
+                $"pcmod-capability-session;host-generation={runtimeKey.Generation};" +
+                $"resource-generation={lease.Request.ResourceGeneration};")
+        };
+        if (PcCompatResourceRecipeRuntime.TryGetSessionGeneration(
+                manifest.Id,
+                out var resourceGeneration) &&
+            resourceGeneration > 0)
+        {
+            identities.Add((
+                ModOwnedResourceKind.Resource,
+                $"resource-session;generation={resourceGeneration};" +
+                $"virtual={(PcCompatVirtualBundleRegistry.HasSession(manifest.Id, resourceGeneration) ? 1 : 0)};"));
+        }
+
+        foreach (var (kind, identity) in identities)
+        {
+            if (ModOwnedResourceRegistry.TryRegister(runtimeKey, kind, identity))
+                continue;
+            ModOwnedResourceRegistry.Retire(runtimeKey);
+            throw new InvalidOperationException(
+                $"PC MOD owned resource registration failed mod={manifest.Id} " +
+                $"generation={runtimeKey.Generation} kind={kind}.");
+        }
+
+        lock (SessionLock)
+        {
+            OwnedRuntimeBindings[manifest.Id] = new OwnedRuntimeBinding(
+                runtimeKey,
+                lease.Request.ResourceGeneration);
+        }
+    }
+
+    internal static bool TryRegisterOwnedResource(
+        string modId,
+        long resourceGeneration,
+        ModOwnedResourceKind kind,
+        string identity)
+    {
+        OwnedRuntimeBinding binding;
+        lock (SessionLock)
+        {
+            if (!OwnedRuntimeBindings.TryGetValue(modId, out binding))
+            {
+                // Unit/legacy execution has no protected native session and keeps
+                // the pre-ownership behavior. A live native session without a
+                // binding is a host transaction defect and must fail closed.
+                return !NativeSessions.ContainsKey(modId);
+            }
+        }
+        return binding.ResourceGeneration == resourceGeneration &&
+               ModOwnedResourceRegistry.TryRegister(binding.Key, kind, identity);
+    }
+
+    internal static void RetireOwnedResource(
+        string modId,
+        long resourceGeneration,
+        ModOwnedResourceKind kind,
+        string identity)
+    {
+        OwnedRuntimeBinding binding;
+        lock (SessionLock)
+        {
+            if (!OwnedRuntimeBindings.TryGetValue(modId, out binding) ||
+                binding.ResourceGeneration != resourceGeneration)
+            {
+                return;
+            }
+        }
+        ModOwnedResourceRegistry.RetireMatching(
+            binding.Key,
+            kind,
+            identity);
+    }
+
+    private static void ClosePcModSession(string modId)
+    {
+        PcCompatModSessionLease? lease = null;
+        lock (SessionLock)
+        {
+            OwnedRuntimeBindings.Remove(modId);
+            if (NativeSessions.Remove(modId, out var existing))
+                lease = existing;
+        }
+        lease?.Dispose();
+    }
+
+    private readonly record struct OwnedRuntimeBinding(
+        ModRuntimeKey Key,
+        long ResourceGeneration);
+
+    internal static bool IsPcModSessionActive(string modId)
+    {
+        PcCompatModSessionLease? lease;
+        lock (SessionLock)
+            NativeSessions.TryGetValue(modId, out lease);
+        return lease?.IsActive == true;
+    }
+
     public static IReadOnlyList<PcCompatManagedModSession> SnapshotSessions()
     {
         lock (SessionLock)
@@ -627,8 +878,10 @@ public static class PcCompatRuntime
     public static PcCompatManagedModSession? GetManagedSession(string modId)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(modId);
+        PcCompatManagedModSession? session;
         lock (SessionLock)
-            return Sessions.TryGetValue(modId, out var session) ? session : null;
+            Sessions.TryGetValue(modId, out session);
+        return session != null && IsPcModSessionActive(modId) ? session : null;
     }
 
     public static bool TryApplyManagedResourceChangerSettings(
@@ -750,9 +1003,11 @@ public static class PcCompatRuntime
     internal static bool CanDispatchManagedContinuation(
         PcCompatManagedExecutionState owner)
     {
-        PcCompatManagedModSession? session;
-        lock (SessionLock)
-            Sessions.TryGetValue(owner.ModId, out session);
+        if (PcCompatManagedExecutionContext.HasReusableCallback(owner))
+            return owner.Phase is not PcCompatManagedExecutionPhase.Disable;
+
+        var sessions = Volatile.Read(ref s_managedDispatchSnapshot).PrefixSessions;
+        sessions.TryGetValue(owner.ModId, out var session);
         if (session == null ||
             session.ResourceSessionGeneration != owner.ResourceSessionGeneration)
             return false;
@@ -766,9 +1021,219 @@ public static class PcCompatRuntime
                     PcCompatManagedLifecycleState.Enabled,
             PcCompatManagedExecutionPhase.Enable or
             PcCompatManagedExecutionPhase.Update =>
-                state == PcCompatManagedLifecycleState.Enabled,
+                state == PcCompatManagedLifecycleState.Enabled ||
+                (owner.Phase == PcCompatManagedExecutionPhase.Enable &&
+                 session.IsCurrentEnableExecution(owner)),
             _ => false
         };
+    }
+
+    internal static bool TryEnterManagedSessionCallback(
+        PcCompatManagedExecutionState owner,
+        out IDisposable? lease,
+        out CancellationToken retirementToken)
+    {
+        lease = null;
+        retirementToken = new CancellationToken(canceled: true);
+        if (PcCompatManagedExecutionContext.TryGetReusableCallback(
+                owner,
+                out lease,
+                out retirementToken))
+            return true;
+
+        var sessions = Volatile.Read(ref s_managedDispatchSnapshot).PrefixSessions;
+        sessions.TryGetValue(owner.ModId, out var session);
+        if (session == null ||
+            session.ResourceSessionGeneration != owner.ResourceSessionGeneration ||
+            !session.TryEnterRuntimeCallback(out lease))
+            return false;
+        retirementToken = session.CallbackRetirementToken;
+        return true;
+    }
+
+    internal static IDisposable? TryEnterManagedExternalCallbackScope(
+        PcCompatManagedExecutionState owner)
+    {
+        ArgumentNullException.ThrowIfNull(owner);
+        if (!TryEnterManagedSessionCallback(owner, out var lease, out var retirementToken))
+            return null;
+        IDisposable? unityMainScope = null;
+        PcCompatManagedCallbackScope? callbackScope = null;
+        try
+        {
+            callbackScope = PcCompatManagedExecutionContext.EnterCallback(
+                owner,
+                lease!,
+                retirementToken);
+            var threadProbe = Volatile.Read(ref s_unityMainThreadProbe);
+            if (!PcCompatUnityMainExecutionContext.IsActive &&
+                threadProbe?.Invoke() == true)
+            {
+                unityMainScope =
+                    PcCompatUnityMainExecutionContext.EnterExternalCallback();
+            }
+            return new ManagedExternalCallbackScope(
+                PcCompatManagedExecutionContext.Enter(owner),
+                unityMainScope,
+                callbackScope);
+        }
+        catch
+        {
+            unityMainScope?.Dispose();
+            if (callbackScope != null)
+                callbackScope.Dispose();
+            else
+                lease?.Dispose();
+            throw;
+        }
+    }
+
+    private sealed class ManagedExternalCallbackScope(
+        PcCompatManagedExecutionScope executionScope,
+        IDisposable? unityMainScope,
+        PcCompatManagedCallbackScope callbackScope) : IDisposable
+    {
+        private PcCompatManagedCallbackScope? _callbackScope = callbackScope;
+        private IDisposable? _unityMainScope = unityMainScope;
+        private PcCompatManagedExecutionScope _executionScope = executionScope;
+        private int _disposed;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+                return;
+            try
+            {
+                _executionScope.Dispose();
+            }
+            finally
+            {
+                try
+                {
+                    Interlocked.Exchange(ref _unityMainScope, null)?.Dispose();
+                }
+                finally
+                {
+                    _callbackScope?.Dispose();
+                    _callbackScope = null;
+                }
+            }
+        }
+    }
+
+    internal static T InvokeDynamicGetterOnUnityMain<T>(
+        PcCompatManagedExecutionState owner,
+        string operation,
+        Func<T> callback,
+        CancellationToken retirementToken,
+        IDisposable callbackLease)
+        => InvokeDynamicGetterOnUnityMain(
+            owner,
+            operation,
+            callback,
+            retirementToken,
+            callbackLease,
+            UnityMainUnloadStartTimeoutMilliseconds);
+
+    internal static T InvokeDynamicGetterOnUnityMain<T>(
+        PcCompatManagedExecutionState owner,
+        string operation,
+        Func<T> callback,
+        CancellationToken retirementToken,
+        IDisposable callbackLease,
+        int timeoutMilliseconds)
+    {
+        ArgumentNullException.ThrowIfNull(callback);
+        ArgumentNullException.ThrowIfNull(callbackLease);
+        if (timeoutMilliseconds < 0)
+            throw new ArgumentOutOfRangeException(nameof(timeoutMilliseconds));
+        if (PcCompatUnityMainExecutionContext.IsActive)
+        {
+            using (callbackLease)
+                return callback();
+        }
+
+        var scheduler = Volatile.Read(ref s_unityMainWorkScheduler);
+        if (scheduler == null)
+        {
+            callbackLease.Dispose();
+            throw new InvalidOperationException(
+                $"PcCompat dynamic getter UnityMain scheduler is unavailable: {operation}.");
+        }
+        var completion = new ManualResetEventSlim(false);
+        ExceptionDispatchInfo? failure = null;
+        T result = default!;
+        var workState = 0;
+        void Run()
+        {
+            if (Interlocked.CompareExchange(ref workState, 1, 0) != 0)
+                return;
+            try
+            {
+                if (callbackLease is IPcCompatManagedCallbackLease transferable)
+                    transferable.TransferToCurrentThread();
+                if (!PcCompatUnityMainExecutionContext.IsActive)
+                    throw new InvalidOperationException(
+                        $"PcCompat dynamic getter scheduled outside UnityMain: {operation}.");
+                using var execution = PcCompatManagedExecutionContext.Enter(owner);
+                result = callback();
+            }
+            catch (Exception exception)
+            {
+                failure = ExceptionDispatchInfo.Capture(exception);
+            }
+            finally
+            {
+                callbackLease.Dispose();
+                Volatile.Write(ref workState, 3);
+                completion.Set();
+            }
+        }
+
+        bool queued;
+        try
+        {
+            queued = scheduler(Run);
+        }
+        catch
+        {
+            if (Interlocked.CompareExchange(ref workState, 2, 0) == 0)
+                callbackLease.Dispose();
+            throw;
+        }
+        if (!queued)
+        {
+            if (Interlocked.CompareExchange(ref workState, 2, 0) == 0)
+                callbackLease.Dispose();
+            throw new InvalidOperationException(
+                $"PcCompat dynamic getter UnityMain queue rejected: {operation}.");
+        }
+        var signaled = WaitHandle.WaitAny(
+            [completion.WaitHandle, retirementToken.WaitHandle],
+            timeoutMilliseconds);
+        if (signaled == 1)
+        {
+            if (Interlocked.CompareExchange(ref workState, 2, 0) == 0)
+                callbackLease.Dispose();
+            throw new OperationCanceledException(
+                $"PcCompat dynamic getter session retired while awaiting UnityMain: {operation}.",
+                retirementToken);
+        }
+        if (signaled == WaitHandle.WaitTimeout)
+        {
+            if (Interlocked.CompareExchange(ref workState, 2, 0) == 0)
+            {
+                    callbackLease.Dispose();
+                throw new TimeoutException(
+                    $"PcCompat dynamic getter UnityMain wait exceeded " +
+                    $"{timeoutMilliseconds} ms: {operation}.");
+            }
+            throw new TimeoutException(
+                $"PcCompat dynamic getter UnityMain execution exceeded " +
+                $"{timeoutMilliseconds} ms: {operation}.");
+        }
+        failure?.Throw();
+        return result;
     }
 
     internal static void ReportManagedContinuationFailure(
@@ -833,7 +1298,7 @@ public static class PcCompatRuntime
         return true;
     }
 
-    public static void RegisterManagedFrameGateSink(
+    internal static void RegisterManagedFrameGateSink(
         Action<PcCompatManagedFrameDispatchMode>? sink)
     {
         Volatile.Write(ref s_managedFrameGateSink, sink);
@@ -843,29 +1308,31 @@ public static class PcCompatRuntime
             sink == null ? null : UpdateManagedFrameGate);
         PcCompatKeyViewerLabelProjectionRuntime.RegisterDemandChangedSink(
             sink == null ? null : UpdateManagedFrameGate);
+        PcCompatManagedComponentBridge.RegisterDemandChangedSink(
+            sink == null ? null : UpdateManagedFrameGate);
         Interlocked.Exchange(ref s_managedFrameGateState, -1);
         UpdateManagedFrameGate();
     }
 
-    public static void RegisterManagedOnGUIGateSink(Action<bool>? sink)
+    internal static void RegisterManagedOnGUIGateSink(Action<bool>? sink)
     {
         Volatile.Write(ref s_managedOnGUIGateSink, sink);
         Interlocked.Exchange(ref s_managedOnGUIGateState, -1);
         UpdateManagedFrameGate();
     }
 
-    public static void RegisterManagedPresentationOwnershipSink(
+    internal static void RegisterManagedPresentationOwnershipSink(
         Func<string, bool, bool>? sink)
         => Volatile.Write(ref s_managedPresentationOwnershipSink, sink);
 
-    public static void RegisterNativeRuleBundleRetireSink(Func<string, bool>? sink)
+    internal static void RegisterNativeRuleBundleRetireSink(Func<string, bool>? sink)
         => Volatile.Write(ref s_nativeRuleBundleRetireSink, sink);
 
-    public static void RegisterManagedPrefixOrderPlanSink(
+    internal static void RegisterManagedPrefixOrderPlanSink(
         PcCompatManagedPrefixOrderPlanHandler? sink)
         => Volatile.Write(ref s_managedPrefixOrderPlanSink, sink);
 
-    public static void RegisterManagedPostfixOrderPlanSink(
+    internal static void RegisterManagedPostfixOrderPlanSink(
         PcCompatManagedPostfixOrderPlanHandler? sink)
         => Volatile.Write(ref s_managedPostfixOrderPlanSink, sink);
 
@@ -882,7 +1349,7 @@ public static class PcCompatRuntime
     private static PcCompatManagedEventDrainHandler? s_managedEventDrain;
     private static PcCompatManagedBoxedValueHandler? s_managedBoxedValueReader;
 
-    public static void RegisterManagedEventSinks(
+    internal static void RegisterManagedEventSinks(
         PcCompatManagedEventDrainHandler? drain,
         PcCompatManagedBoxedValueHandler? boxedValueReader)
     {
@@ -901,7 +1368,7 @@ public static class PcCompatRuntime
         uint patchId,
         ref PcCompatManagedPrefixInvocationV2 invocation)
     {
-        var sessions = Volatile.Read(ref s_managedPrefixSessions);
+        var sessions = Volatile.Read(ref s_managedDispatchSnapshot).PrefixSessions;
         return sessions.TryGetValue(modId, out var session)
             ? session.DispatchManagedPrefix(patchId, ref invocation)
             : -4;
@@ -919,7 +1386,7 @@ public static class PcCompatRuntime
             PcCompatKeyViewerPreviewRuntime.DispatchFrame();
             PcCompatKeyViewerLabelProjectionRuntime.DispatchFrame();
             PcCompatKeyViewerFallbackRuntime.DispatchFrame(deltaTime);
-            var sessions = Volatile.Read(ref s_managedFrameSessions);
+            var sessions = Volatile.Read(ref s_managedDispatchSnapshot).FrameSessions;
             var frameGateChanged = false;
 
             // Per-MOD native rings preserve local FIFO, while dispatch_sequence
@@ -932,8 +1399,7 @@ public static class PcCompatRuntime
                     session.TryCollectManagedCallbacks(ManagedEventCollector);
             }
             var boxedValueReader = ManagedBoxedValueReader;
-            if (boxedValueReader != null)
-                ManagedEventCollector.DispatchAll(boxedValueReader);
+            ManagedEventCollector.DispatchAll(boxedValueReader);
 
             foreach (var session in sessions)
             {
@@ -949,6 +1415,7 @@ public static class PcCompatRuntime
                 var callbacksDispatchedBeforeUpdate = !activationWasPending;
                 if (session.TryDispatchUpdate(deltaTime))
                 {
+                    var activationAccepted = false;
                     if (activationWasPending && session.EnableCompleted)
                     {
                         if (SetManagedPresentationOwnership(
@@ -958,6 +1425,7 @@ public static class PcCompatRuntime
                             Logger.Info(
                                 LogTag,
                                 $"mod={session.Manifest.Id} managed_self_render=enabled");
+                            activationAccepted = true;
                         }
                         else
                         {
@@ -968,6 +1436,8 @@ public static class PcCompatRuntime
                                 "reason=recipe presentation ownership transfer failed");
                         }
                     }
+                    if (activationAccepted)
+                        session.NotifyActivationCompletedObservers();
                     if (!callbacksDispatchedBeforeUpdate)
                         session.TryDispatchManagedCallbacks();
                     frameGateChanged |= activationWasPending ||
@@ -1020,7 +1490,7 @@ public static class PcCompatRuntime
         ++s_managedDispatchDepth;
         try
         {
-            var sessions = Volatile.Read(ref s_managedOnGUISessions);
+            var sessions = Volatile.Read(ref s_managedDispatchSnapshot).OnGuiSessions;
 
             var frameGateChanged = false;
             foreach (var session in sessions)
@@ -1206,7 +1676,7 @@ public static class PcCompatRuntime
                 Logger.Info(
                     LogTag,
                     $"resource session mod={manifest.Id} compatibility={readiness.Compatibility} " +
-                    $"groups={readiness.FeatureGroupCount} ready={readiness.ReadyCandidateCount}/" +
+                    $"groups={readiness.FeatureGroupCount} rawCandidateReady={readiness.ReadyCandidateCount}/" +
                     $"{readiness.CandidateCount} loadEnabled={readiness.RuntimeLoadEnabled}");
                 TryPublishVirtualBundleSession(manifest, bundle, resourceRecipePath);
             }
@@ -1263,13 +1733,15 @@ public static class PcCompatRuntime
             resourceIrPath,
             resourceIr);
         PcCompatResourceChangerRuntime.TryRepublish(manifest.Id);
-        var snapshot = PcCompatVirtualBundleRegistry.GetSnapshot();
+        var readiness = PcCompatVirtualBundleRegistry.GetSessionReadiness(manifest.Id, generation);
         Logger.Info(
             LogTag,
             $"VirtualBundle session mod={manifest.Id} generation={generation} " +
             $"bundles={resourceIr.Bundles.Count} assets={resourceIr.Assets.Count} " +
-            $"required={resourceIr.Assets.Count(asset => asset.RequiredByMod)} " +
-            $"registryBundles={snapshot.BundleCount}");
+            $"requiredReady={readiness.RequiredReadyCount}/{readiness.RequiredAssetCount} " +
+            $"requiredPending={readiness.RequiredPendingCount} " +
+            $"requiredUnsupported={readiness.RequiredUnsupportedCount} " +
+            $"requiredFailed={readiness.RequiredFailedCount}");
     }
 
     private static void WriteStaticScanReport(PcModManifest manifest, PcCompatStaticPatchScanReport report)
@@ -1333,8 +1805,7 @@ public static class PcCompatRuntime
     private static void UpdateManagedFrameGate()
     {
         PcCompatManagedFrameDispatchMode mode;
-        PcCompatManagedModSession[] frameSessions;
-        PcCompatManagedModSession[] onGuiSessions;
+        int onGuiSessionCount;
         lock (SessionLock)
         {
             var active = new List<PcCompatManagedModSession>(Sessions.Count);
@@ -1350,8 +1821,12 @@ public static class PcCompatRuntime
                 hasContinuous |= session.RequiresContinuousFrameDispatch;
                 hasPending |= session.ActivationPending;
             }
-            frameSessions = active.Count == 0 ? Array.Empty<PcCompatManagedModSession>() : active.ToArray();
-            onGuiSessions = onGui.Count == 0 ? Array.Empty<PcCompatManagedModSession>() : onGui.ToArray();
+            var frameSessions = active.Count == 0
+                ? Array.Empty<PcCompatManagedModSession>()
+                : active.ToArray();
+            var onGuiSessions = onGui.Count == 0
+                ? Array.Empty<PcCompatManagedModSession>()
+                : onGui.ToArray();
             var hasAdapterPump = PcCompatKeyViewerPreviewRuntime.HasPumpDemand ||
                                  PcCompatKeyViewerFallbackRuntime.HasDemand ||
                                  PcCompatKeyViewerLabelProjectionRuntime.HasDemand;
@@ -1361,11 +1836,15 @@ public static class PcCompatRuntime
                     ? PcCompatManagedFrameDispatchMode.PendingActivation
                     : PcCompatManagedFrameDispatchMode.Disabled;
             Volatile.Write(
-                ref s_managedPrefixSessions,
-                new Dictionary<string, PcCompatManagedModSession>(Sessions, StringComparer.OrdinalIgnoreCase));
+                ref s_managedDispatchSnapshot,
+                new ManagedDispatchSnapshot(
+                    frameSessions,
+                    onGuiSessions,
+                    new Dictionary<string, PcCompatManagedModSession>(
+                        Sessions,
+                        StringComparer.OrdinalIgnoreCase)));
+            onGuiSessionCount = onGuiSessions.Length;
         }
-        Volatile.Write(ref s_managedFrameSessions, frameSessions);
-        Volatile.Write(ref s_managedOnGUISessions, onGuiSessions);
 
         var frameSink = Volatile.Read(ref s_managedFrameGateSink);
         var frameValue = (int)mode;
@@ -1383,7 +1862,7 @@ public static class PcCompatRuntime
         }
 
         var onGuiSink = Volatile.Read(ref s_managedOnGUIGateSink);
-        var onGuiEnabled = onGuiSessions.Length != 0;
+        var onGuiEnabled = onGuiSessionCount != 0;
         var onGuiValue = onGuiEnabled ? 1 : 0;
         if (onGuiSink != null &&
             Interlocked.Exchange(ref s_managedOnGUIGateState, onGuiValue) != onGuiValue)
@@ -1407,6 +1886,14 @@ public static class PcCompatRuntime
     {
         if (session.ManagedPresentationClaimed == managedOwnsPresentation)
             return true;
+        if (managedOwnsPresentation &&
+            !IsPcModSessionActive(session.Manifest.Id))
+        {
+            Logger.Warn(
+                LogTag,
+                $"managed presentation ownership rejected by inactive PC MOD session mod={session.Manifest.Id}");
+            return false;
+        }
 
         var sink = Volatile.Read(ref s_managedPresentationOwnershipSink);
         if (sink == null)

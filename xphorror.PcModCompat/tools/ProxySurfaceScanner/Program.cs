@@ -3,6 +3,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using dnlib.DotNet;
 using dnlib.DotNet.Emit;
+using Xphorror.PcModCompat.Tools;
 
 var options = CommandLineOptions.Parse(args);
 if (options is null)
@@ -430,31 +431,13 @@ internal sealed class ProxySurfaceScanner
 
 internal static class ProxySurfaceIdentity
 {
-    private static readonly HashSet<string> ManagedBridgeOwnedEntries = new(StringComparer.Ordinal)
-    {
-        "M|UnityEngine.AssetBundleModule|UnityEngine.AssetBundle|static|0|UnityEngine.AssetBundle|LoadFromFile|System.String",
-        "M|UnityEngine.AssetBundleModule|UnityEngine.AssetBundle|instance|0|UnityEngine.Object|LoadAsset|System.String",
-        "M|UnityEngine.AssetBundleModule|UnityEngine.AssetBundle|instance|0|UnityEngine.Object|LoadAsset|System.String;System.Type",
-        "M|UnityEngine.AssetBundleModule|UnityEngine.AssetBundle|instance|1|!!0|LoadAsset|System.String",
-        "M|UnityEngine.AssetBundleModule|UnityEngine.AssetBundle|instance|0|UnityEngine.Object[]|LoadAllAssets|",
-        "M|UnityEngine.AssetBundleModule|UnityEngine.AssetBundle|instance|0|UnityEngine.Object[]|LoadAllAssets|System.Type",
-        "M|UnityEngine.AssetBundleModule|UnityEngine.AssetBundle|instance|1|!!0[]|LoadAllAssets|",
-        "M|UnityEngine.AssetBundleModule|UnityEngine.AssetBundle|instance|0|System.Void|Unload|System.Boolean",
-        "M|UnityEngine.IMGUIModule|UnityEngine.GUILayout|static|0|System.Boolean|Button|System.String;UnityEngine.GUIStyle;UnityEngine.GUILayoutOption[]",
-        "M|UnityEngine.IMGUIModule|UnityEngine.GUILayout|static|0|System.Boolean|Button|UnityEngine.Texture;UnityEngine.GUIStyle;UnityEngine.GUILayoutOption[]",
-        "M|UnityEngine.IMGUIModule|UnityEngine.GUILayout|static|0|System.String|TextArea|System.String;UnityEngine.GUILayoutOption[]",
-        "M|UnityEngine.IMGUIModule|UnityEngine.GUIStyle|instance|0|System.Void|set_fixedWidth|System.Single",
-        "M|UnityEngine.IMGUIModule|UnityEngine.GUIStyle|instance|0|System.Void|set_normal|UnityEngine.GUIStyleState",
-        "M|UnityEngine.IMGUIModule|UnityEngine.GUIStyle|instance|0|System.Void|set_margin|UnityEngine.RectOffset"
-    };
-
     // Surface manifests use '/' for nested types. dnlib may expose either '/' or '+'.
     public static string NormalizeTypeName(string value) => value.Trim().Replace('+', '/');
 
-    public static string NormalizeEntry(string value) => value.Trim().Replace('+', '/');
+    public static string NormalizeEntry(string value) => ManagedBridgeOwnedSurface.Normalize(value);
 
     public static bool IsManagedBridgeOwnedEntry(string value)
-        => ManagedBridgeOwnedEntries.Contains(NormalizeEntry(value));
+        => ManagedBridgeOwnedSurface.Contains(value);
 }
 
 internal sealed record ProxySurfaceScanReport(

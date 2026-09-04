@@ -1,3 +1,4 @@
+using StArray.ModManager.Interop;
 using Xphorror.PcModCompat;
 
 namespace StArray.ModManager.Tests;
@@ -27,6 +28,8 @@ public sealed class PcCompatKeyViewerPreviewRuntimeTests
         PcCompatTouchLaneMappingRuntime.SetTouchContactReuseDelayMilliseconds(
             PcCompatTouchLaneMappingRuntime.DefaultTouchContactReuseDelayMilliseconds);
         PcCompatLegacyInputBridge.SetModalInputCapture(false);
+        PcCompatLegacyInputBridge.ClearDiagnostics(ModId);
+        PcCompatLegacyInputBridge.ClearDiagnostics(SecondModId);
     }
 
     [Test]
@@ -722,6 +725,14 @@ public sealed class PcCompatKeyViewerPreviewRuntimeTests
         Assert.That(
             PcCompatLegacyInputBridge.GetDiagnosticStatus(ModId),
             Does.Match(@"unityHeld=[1-9][0-9]*"));
+        var diagnostic = PcCompatLegacyInputBridge.GetDiagnosticSnapshot(ModId);
+        Assert.Multiple(() =>
+        {
+            Assert.That(diagnostic.QueryCount, Is.GreaterThanOrEqualTo(1));
+            Assert.That(diagnostic.MatchedCount, Is.GreaterThanOrEqualTo(1));
+            Assert.That(diagnostic.TrueCount, Is.GreaterThanOrEqualTo(1));
+            Assert.That(diagnostic.LastRegistrationGeneration, Is.GreaterThan(0));
+        });
     }
 
     [Test]
@@ -897,6 +908,80 @@ public sealed class PcCompatKeyViewerPreviewRuntimeTests
                 Assert.That(PcCompatLegacyInputBridge.GetKeyUp(TestKey.A, 772), Is.True);
                 Assert.That(PcCompatLegacyInputBridge.GetKeyUp(TestKey.A, 772), Is.False);
             });
+        }
+    }
+
+    [Test]
+    public void InputBoundaryDiagnosticsOnlyEmitRegistrationOpenSummary()
+    {
+        var messages = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        void Capture(
+            StArray.ModManager.Manager.Logger.Level _,
+            string __,
+            string message)
+        {
+            if (message.Contains("[DEBUG-kv-input-v3]", StringComparison.Ordinal) &&
+                message.Contains($"mod={ModId}", StringComparison.Ordinal))
+            {
+                messages.Enqueue(message);
+            }
+        }
+
+        StArray.ModManager.Manager.Logger.OnLog += Capture;
+        try
+        {
+            PcCompatKeyViewerEventRuntime.RegisterProvider((cursor, _) =>
+            {
+                if (cursor == PcCompatKeyViewerEventRuntime.OpenAtTailCursor)
+                    return new PcCompatKeyViewerEventBatch { ProviderAvailable = true, Cursor = 200 };
+                if (cursor == 200)
+                {
+                    return new PcCompatKeyViewerEventBatch
+                    {
+                        ProviderAvailable = true,
+                        Cursor = 210,
+                        Events = Enumerable.Range(1, 10)
+                            .Select(index => Event(
+                                (ulong)(200 + index),
+                                PcCompatKeyViewerRawPhase.Down,
+                                slot: index - 1,
+                                x: index % 2 == 0 ? 10 : 900))
+                            .ToArray()
+                    };
+                }
+                return new PcCompatKeyViewerEventBatch
+                {
+                    ProviderAvailable = true,
+                    Cursor = cursor
+                };
+            });
+            var (adapter, overrides) = CreateConfiguration(
+                PcCompatKeyViewerInputMode.Touch,
+                2,
+                staticUnityKeys: true);
+            Assert.That(PcCompatKeyViewerPreviewRuntime.RegisterOrUpdate(
+                ModId, adapter, overrides, out var error), Is.True, error);
+
+            Pump();
+            for (var token = 5000; token < 5020; ++token)
+                _ = PcCompatLegacyInputBridge.GetKeyOwned(TestKey.A, token, ModId);
+
+            var captured = messages.ToArray();
+            Assert.Multiple(() =>
+            {
+                Assert.That(captured.Count(message => message.Contains("boundary=open")),
+                    Is.EqualTo(1));
+                Assert.That(captured.Count(message => message.Contains("boundary=touch")),
+                    Is.Zero);
+                Assert.That(captured.Count(message => message.Contains("boundary=publish")),
+                    Is.Zero);
+                Assert.That(captured.Count(message => message.Contains("boundary=query")),
+                    Is.Zero);
+            });
+        }
+        finally
+        {
+            StArray.ModManager.Manager.Logger.OnLog -= Capture;
         }
     }
 
@@ -1584,7 +1669,11 @@ public sealed class PcCompatKeyViewerPreviewRuntimeTests
         PcCompatKeyViewerFallbackRuntime.RegisterRenderer(frames => rendered = frames.ToArray());
         Assert.That(PcCompatKeyViewerPreviewRuntime.RegisterOrUpdate(
             ModId, adapter, overrides, out var error), Is.True, error);
-        PcCompatKeyViewerFallbackRuntime.RegisterOrUpdate(ModId, adapter, overrides);
+        PcCompatKeyViewerFallbackRuntime.RegisterOrUpdate(
+            ModId,
+            adapter,
+            overrides,
+            sessionGeneration: 37);
 
         Pump();
         PcCompatKeyViewerFallbackRuntime.DispatchFrame(1f / 60f);
@@ -1592,6 +1681,7 @@ public sealed class PcCompatKeyViewerPreviewRuntimeTests
         Assert.Multiple(() =>
         {
             Assert.That(frame.ModId, Is.EqualTo(ModId));
+            Assert.That(frame.SessionGeneration, Is.EqualTo(37));
             Assert.That(frame.Labels, Is.EqualTo(new[] { "T1", "T2" }));
             Assert.That(frame.HeldMask, Is.EqualTo(1));
             Assert.That(frame.Counts, Is.EqualTo(new ulong[] { 1, 0 }));
@@ -1846,6 +1936,196 @@ public sealed class PcCompatKeyViewerPreviewRuntimeTests
             PcCompatKeyViewerPreviewRuntime.WaitForIdle(TimeSpan.FromSeconds(2)),
             Is.True,
             "KeyViewer actor pump did not become idle");
+    }
+
+    [Test]
+    public void VirtualInputHybridSourcesShareOneLogicalLaneAndRestoreRawMode()
+    {
+        var (adapter, overrides) = CreateConfiguration(
+            PcCompatKeyViewerInputMode.Hybrid,
+            2,
+            staticUnityKeys: true);
+        Assert.That(PcCompatKeyViewerPreviewRuntime.RegisterOrUpdate(
+            ModId, adapter, overrides, out var error), Is.True, error);
+
+        PcCompatKeyViewerPreviewRuntime.DispatchVirtualInput(
+            new VirtualInputBatch(VirtualInputBatchKind.Started, 77));
+        PcCompatKeyViewerPreviewRuntime.DispatchVirtualInput(
+            new VirtualInputBatch(
+                VirtualInputBatchKind.Events,
+                77,
+                [
+                    new VirtualInputEvent(
+                        1, 1_000, VirtualInputDevice.Keyboard, VirtualInputPhase.Down,
+                        "A", -1, 0, 0, 0, 0, 0),
+                    new VirtualInputEvent(
+                        2, 2_000, VirtualInputDevice.Touch, VirtualInputPhase.Down,
+                        null, 5, 0, 100, 100, 1_000, 500)
+                ]));
+        Assert.That(PcCompatKeyViewerPreviewRuntime.WaitForIdle(TimeSpan.FromSeconds(2)), Is.True);
+
+        var pressed = PcCompatKeyViewerPreviewRuntime.Snapshot(ModId).Features.Single();
+        Assert.Multiple(() =>
+        {
+            Assert.That(pressed.InputMode, Is.EqualTo(PcCompatKeyViewerInputMode.Touch),
+                "Virtual playback must suppress native polling in rewritten MOD calls.");
+            Assert.That(pressed.HeldMask & 1u, Is.EqualTo(1u));
+            Assert.That(pressed.DownOrdinals[0], Is.EqualTo(1));
+            Assert.That(pressed.UpOrdinals[0], Is.Zero);
+        });
+
+        PcCompatKeyViewerPreviewRuntime.DispatchVirtualInput(
+            new VirtualInputBatch(
+                VirtualInputBatchKind.Events,
+                77,
+                [new VirtualInputEvent(
+                    3, 3_000, VirtualInputDevice.Keyboard, VirtualInputPhase.Up,
+                    "A", -1, 0, 0, 0, 0, 0)]));
+        Assert.That(PcCompatKeyViewerPreviewRuntime.WaitForIdle(TimeSpan.FromSeconds(2)), Is.True);
+        var keyboardReleased = PcCompatKeyViewerPreviewRuntime.Snapshot(ModId).Features.Single();
+        Assert.Multiple(() =>
+        {
+            Assert.That(keyboardReleased.HeldMask & 1u, Is.EqualTo(1u));
+            Assert.That(keyboardReleased.UpOrdinals[0], Is.Zero);
+        });
+
+        PcCompatKeyViewerPreviewRuntime.DispatchVirtualInput(
+            new VirtualInputBatch(
+                VirtualInputBatchKind.Events,
+                77,
+                [new VirtualInputEvent(
+                    4, 4_000, VirtualInputDevice.Touch, VirtualInputPhase.Up,
+                    null, 5, 0, 100, 100, 1_000, 500)]));
+        PcCompatKeyViewerPreviewRuntime.DispatchVirtualInput(
+            new VirtualInputBatch(VirtualInputBatchKind.Ended, 77));
+        Assert.That(PcCompatKeyViewerPreviewRuntime.WaitForIdle(TimeSpan.FromSeconds(2)), Is.True);
+
+        var restored = PcCompatKeyViewerPreviewRuntime.Snapshot(ModId).Features.Single();
+        Assert.Multiple(() =>
+        {
+            Assert.That(restored.InputMode, Is.EqualTo(PcCompatKeyViewerInputMode.Hybrid));
+            Assert.That(restored.HeldMask, Is.Zero);
+            Assert.That(restored.DownOrdinals, Is.All.Zero);
+            Assert.That(restored.UpOrdinals, Is.All.Zero);
+            Assert.That(PcCompatKeyViewerConsumerRuntime.Snapshot(ModId).Registered, Is.True);
+        });
+    }
+
+    [Test]
+    public void VirtualSnapshotSetsHeldStateWithoutReplayingStatistics()
+    {
+        var (adapter, overrides) = CreateConfiguration(
+            PcCompatKeyViewerInputMode.Touch,
+            2,
+            staticUnityKeys: true);
+        Assert.That(PcCompatKeyViewerPreviewRuntime.RegisterOrUpdate(
+            ModId, adapter, overrides, out var error), Is.True, error);
+
+        PcCompatKeyViewerPreviewRuntime.DispatchVirtualInput(
+            new VirtualInputBatch(VirtualInputBatchKind.Started, 91));
+        PcCompatKeyViewerPreviewRuntime.DispatchVirtualInput(
+            new VirtualInputBatch(
+                VirtualInputBatchKind.Snapshot,
+                91,
+                [new VirtualInputEvent(
+                    10, 55_000, VirtualInputDevice.Keyboard, VirtualInputPhase.Down,
+                    "A", -1, 0, 0, 0, 0, 0)]));
+        Assert.That(PcCompatKeyViewerPreviewRuntime.WaitForIdle(TimeSpan.FromSeconds(2)), Is.True);
+
+        var feature = PcCompatKeyViewerPreviewRuntime.Snapshot(ModId).Features.Single();
+        Assert.Multiple(() =>
+        {
+            Assert.That(feature.HeldMask & 1u, Is.EqualTo(1u));
+            Assert.That(feature.DownOrdinals[0], Is.Zero);
+            Assert.That(feature.RainPulses, Is.Empty);
+        });
+
+        PcCompatKeyViewerPreviewRuntime.DispatchVirtualInput(
+            new VirtualInputBatch(VirtualInputBatchKind.Cancelled, 91,
+                [new VirtualInputEvent(
+                    11, 56_000, VirtualInputDevice.Keyboard, VirtualInputPhase.Cancel,
+                    "A", -1, 0, 0, 0, 0, 0)]));
+        PcCompatKeyViewerPreviewRuntime.DispatchVirtualInput(
+            new VirtualInputBatch(VirtualInputBatchKind.Ended, 91));
+        Assert.That(PcCompatKeyViewerPreviewRuntime.WaitForIdle(TimeSpan.FromSeconds(2)), Is.True);
+    }
+
+    [Test]
+    public void VirtualInputBroadcastsSameBatchToEveryFeatureInAdapter()
+    {
+        var (mainAdapter, mainOverrides) = CreateConfiguration(
+            PcCompatKeyViewerInputMode.Hybrid,
+            2,
+            staticUnityKeys: true,
+            featureId: "main");
+        var (footAdapter, footOverrides) = CreateConfiguration(
+            PcCompatKeyViewerInputMode.Hybrid,
+            2,
+            staticUnityKeys: true,
+            featureId: "foot");
+        var adapter = new PcCompatKeyViewerAdapterDocument
+        {
+            ModId = mainAdapter.ModId,
+            PackageSha256 = mainAdapter.PackageSha256,
+            TargetGameRevision = mainAdapter.TargetGameRevision,
+            ProxySurfaceHash = mainAdapter.ProxySurfaceHash,
+            Assemblies = mainAdapter.Assemblies,
+            Features = [mainAdapter.Features.Single(), footAdapter.Features.Single()]
+        };
+        var overrides = new PcCompatKeyViewerOverrideDocument
+        {
+            ModId = mainOverrides.ModId,
+            PackageSha256 = mainOverrides.PackageSha256,
+            TargetGameRevision = mainOverrides.TargetGameRevision,
+            ProxySurfaceHash = mainOverrides.ProxySurfaceHash,
+            Assemblies = mainOverrides.Assemblies,
+            Features =
+            [
+                mainOverrides.Features.Single(),
+                footOverrides.Features.Single()
+            ]
+        };
+        Assert.That(PcCompatKeyViewerPreviewRuntime.RegisterOrUpdate(
+            ModId, adapter, overrides, out var error), Is.True, error);
+
+        PcCompatKeyViewerPreviewRuntime.DispatchVirtualInput(
+            new VirtualInputBatch(VirtualInputBatchKind.Started, 112));
+        PcCompatKeyViewerPreviewRuntime.DispatchVirtualInput(
+            new VirtualInputBatch(
+                VirtualInputBatchKind.Events,
+                112,
+                [new VirtualInputEvent(
+                    1, 10_000, VirtualInputDevice.Keyboard, VirtualInputPhase.Down,
+                    "A", -1, 0, 0, 0, 0, 0)]));
+        Assert.That(PcCompatKeyViewerPreviewRuntime.WaitForIdle(TimeSpan.FromSeconds(2)), Is.True);
+
+        var features = PcCompatKeyViewerPreviewRuntime.Snapshot(ModId).Features
+            .OrderBy(feature => feature.FeatureId, StringComparer.Ordinal)
+            .ToArray();
+        Assert.Multiple(() =>
+        {
+            Assert.That(features.Select(feature => feature.FeatureId),
+                Is.EqualTo(new[] { "foot", "main" }));
+            Assert.That(features, Has.All.Matches<PcCompatKeyViewerPreviewFeatureSnapshot>(
+                feature => (feature.HeldMask & 1u) != 0));
+            Assert.That(features, Has.All.Matches<PcCompatKeyViewerPreviewFeatureSnapshot>(
+                feature => feature.DownOrdinals[0] == 1));
+        });
+
+        PcCompatKeyViewerPreviewRuntime.DispatchVirtualInput(
+            new VirtualInputBatch(
+                VirtualInputBatchKind.Cancelled,
+                112,
+                [new VirtualInputEvent(
+                    2, 11_000, VirtualInputDevice.Keyboard, VirtualInputPhase.Cancel,
+                    "A", -1, 0, 0, 0, 0, 0)]));
+        PcCompatKeyViewerPreviewRuntime.DispatchVirtualInput(
+            new VirtualInputBatch(VirtualInputBatchKind.Ended, 112));
+        Assert.That(PcCompatKeyViewerPreviewRuntime.WaitForIdle(TimeSpan.FromSeconds(2)), Is.True);
+
+        var ended = PcCompatKeyViewerPreviewRuntime.Snapshot(ModId).Features;
+        Assert.That(ended, Has.All.Matches<PcCompatKeyViewerPreviewFeatureSnapshot>(
+            feature => feature.HeldMask == 0 && feature.DownOrdinals.All(value => value == 0)));
     }
 
     private static (PcCompatKeyViewerAdapterDocument Adapter,

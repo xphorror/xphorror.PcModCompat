@@ -323,6 +323,4 @@
   <data name="PcCompat_SettingsLinkedHint" xml:space="preserve"><value>These controls bind the same live values as the original MOD menu. Changes use the original setter and save entry.</value></data>
   <data name="Inspector_HotkeyPress" xml:space="preserve"><value>Press a key... (Esc cancel, Backspace clear)</value></data>
   <data name="Inspector_ListAdd" xml:space="preserve"><value>Add</value></data>
-  <data name="License_ModManagerRequired" xml:space="preserve"><value>The current license does not include ModManager</value></data>
-  <data name="License_PcCompatRequired" xml:space="preserve"><value>PC MOD compatibility license required</value></data>
 </root>

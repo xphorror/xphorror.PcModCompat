@@ -14,6 +14,7 @@ internal static unsafe class PcCompatManagedSelfRenderBridge
     private static int s_installed;
     private static int s_callbackActive;
     private static long s_lastFrameTimestamp;
+    private static long s_lastTelemetryPollTimestamp;
     private static long s_frameCallbackCount;
     private static long s_frameReentrySkips;
     private static long s_frameFailureCount;
@@ -39,6 +40,9 @@ internal static unsafe class PcCompatManagedSelfRenderBridge
 
     [DllImport(NativeLibrary, EntryPoint = "modmanager_pccompat_set_managed_frame_mode")]
     private static extern void SetManagedFrameModeNative(int mode);
+
+    [DllImport(NativeLibrary, EntryPoint = "modmanager_pccompat_poll_shared_game_snapshot")]
+    private static extern int PollSharedGameSnapshotNative();
 
     [DllImport(
         NativeLibrary,
@@ -226,6 +230,7 @@ internal static unsafe class PcCompatManagedSelfRenderBridge
         }
 
         Interlocked.Exchange(ref s_lastFrameTimestamp, 0);
+        Interlocked.Exchange(ref s_lastTelemetryPollTimestamp, 0);
         Interlocked.Exchange(ref s_frameCallbackCount, 0);
         Interlocked.Exchange(ref s_frameReentrySkips, 0);
         Interlocked.Exchange(ref s_frameFailureCount, 0);
@@ -368,6 +373,17 @@ internal static unsafe class PcCompatManagedSelfRenderBridge
                     (now - previous) / (double)Stopwatch.Frequency,
                     0d,
                     0.25d);
+            // Shared gameplay facts are host telemetry. Drive their throttled sampler from the
+            // established UnityMain frame instead of making data availability depend on one MOD
+            // recipe's PlayerControl_Update hook remaining installable.
+            var lastTelemetryPoll = Interlocked.Read(ref s_lastTelemetryPollTimestamp);
+            if (lastTelemetryPoll == 0 ||
+                now - lastTelemetryPoll >= Stopwatch.Frequency / 10)
+            {
+                Interlocked.Exchange(ref s_lastTelemetryPollTimestamp, now);
+                _ = PollSharedGameSnapshotNative();
+            }
+            PcCompatDynamicGetterSnapshotHost.RefreshOnUnityMain();
             PcCompatRuntime.DispatchManagedFrame(deltaTime);
         }
         catch (Exception exception)

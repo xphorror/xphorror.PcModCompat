@@ -9,51 +9,51 @@ namespace StArray.ModManager.Android.Native;
 public static class JniHelperNative
 {
     private const string LibModManager = "starray_modmanager";
-
+    
     /// <summary>
     /// 获取 Unity Surface（C 实现，更快速）
     /// </summary>
     [DllImport(LibModManager, EntryPoint = "jnihelper_get_unity_surface")]
     public static extern IntPtr GetUnitySurface();
-
+    
     /// <summary>
     /// 获取 Unity ANativeWindow（从 Surface 转换，可用于 ImGui）
     /// </summary>
     [DllImport(LibModManager, EntryPoint = "jnihelper_get_unity_native_window")]
     public static extern IntPtr GetUnityNativeWindow();
-
+    
     /// <summary>
     /// 获取当前 Activity 或 Application
     /// </summary>
     [DllImport(LibModManager, EntryPoint = "jnihelper_get_current_activity")]
     public static extern IntPtr GetCurrentActivity();
-
+    
     /// <summary>
     /// 获取 JavaVM
     /// </summary>
     [DllImport(LibModManager, EntryPoint = "jnihelper_get_jvm")]
     public static extern IntPtr GetJavaVM();
-
+    
     /// <summary>
     /// 获取 JNIEnv（自动附加当前线程）
     /// </summary>
     [DllImport(LibModManager, EntryPoint = "jnihelper_get_env")]
     public static extern IntPtr GetJNIEnv();
-
+    
     /// <summary>
     /// 查找 Java 类（返回全局引用）
     /// </summary>
     [DllImport(LibModManager, EntryPoint = "jnihelper_find_class")]
     public static extern IntPtr FindClass([MarshalAs(UnmanagedType.LPStr)] string className);
-
+    
     /// <summary>
     /// 获取方法 ID
     /// </summary>
     [DllImport(LibModManager, EntryPoint = "jnihelper_get_method_id")]
-    public static extern IntPtr GetMethodID(IntPtr clazz,
+    public static extern IntPtr GetMethodID(IntPtr clazz, 
         [MarshalAs(UnmanagedType.LPStr)] string methodName,
         [MarshalAs(UnmanagedType.LPStr)] string signature);
-
+    
     /// <summary>
     /// 获取静态方法 ID
     /// </summary>
@@ -61,7 +61,7 @@ public static class JniHelperNative
     public static extern IntPtr GetStaticMethodID(IntPtr clazz,
         [MarshalAs(UnmanagedType.LPStr)] string methodName,
         [MarshalAs(UnmanagedType.LPStr)] string signature);
-
+    
     /// <summary>
     /// 获取字段 ID
     /// </summary>
@@ -69,7 +69,7 @@ public static class JniHelperNative
     public static extern IntPtr GetFieldID(IntPtr clazz,
         [MarshalAs(UnmanagedType.LPStr)] string fieldName,
         [MarshalAs(UnmanagedType.LPStr)] string signature);
-
+    
     /// <summary>
     /// 获取静态字段 ID
     /// </summary>
@@ -77,7 +77,7 @@ public static class JniHelperNative
     public static extern IntPtr GetStaticFieldID(IntPtr clazz,
         [MarshalAs(UnmanagedType.LPStr)] string fieldName,
         [MarshalAs(UnmanagedType.LPStr)] string signature);
-
+    
     /// <summary>
     /// 创建 Java String
     /// </summary>
@@ -96,13 +96,13 @@ public static class JniHelperNative
 
     [DllImport(LibModManager, EntryPoint = "jnihelper_get_string_length")]
     public static extern int GetStringLength(IntPtr jstr);
-
+    
     /// <summary>
     /// Java String 转 C 字符串（需要调用者释放内存）
     /// </summary>
     [DllImport(LibModManager, EntryPoint = "jnihelper_get_string")]
     private static extern IntPtr GetStringInternal(IntPtr jstr);
-
+    
     /// <summary>
     /// Java String 转 C# string（自动管理内存）
     /// </summary>
@@ -110,11 +110,11 @@ public static class JniHelperNative
     {
         if (jstr == IntPtr.Zero)
             return null;
-
+        
         IntPtr ptr = GetStringInternal(jstr);
         if (ptr == IntPtr.Zero)
             return null;
-
+        
         try
         {
             return Marshal.PtrToStringUTF8(ptr);
@@ -125,13 +125,13 @@ public static class JniHelperNative
             Marshal.FreeHGlobal(ptr);
         }
     }
-
+    
     /// <summary>
     /// 删除本地引用
     /// </summary>
     [DllImport(LibModManager, EntryPoint = "jnihelper_delete_local_ref")]
     public static extern void DeleteLocalRef(IntPtr obj);
-
+    
     /// <summary>
     /// 删除全局引用
     /// </summary>
@@ -143,7 +143,7 @@ public static class JniHelperNative
 
     [DllImport(LibModManager, EntryPoint = "jnihelper_new_local_ref")]
     public static extern IntPtr NewLocalRef(IntPtr obj);
-
+    
     /// <summary>
     /// 检查并清除异常
     /// </summary>

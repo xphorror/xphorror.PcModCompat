@@ -45,14 +45,17 @@ public static class PcCompatCapabilityBundleRegistry
     private static Timer? s_retryTimer;
     private static object? s_bundleRequest;
     private static object? s_bundleProxy;
+    private static object? s_bundleRoot;
     private static object? s_manifestRequest;
     private static object? s_manifestProxy;
+    private static object? s_manifestRoot;
     private static PendingCapabilityAsset? s_pendingAsset;
 
     private sealed record LoadedCapabilityAsset(
         PcCompatCapabilityAssetDescriptor Descriptor,
         object Proxy,
-        nint Pointer);
+        nint Pointer,
+        object Root);
 
     private sealed class PendingCapabilityAsset
     {
@@ -309,12 +312,16 @@ public static class PcCompatCapabilityBundleRegistry
         if (!PcCompatResourceBundleLoader.InvokeUnityBundleApi(api => api.IsDone(request)))
             return;
         var bundle = PcCompatResourceBundleLoader.InvokeUnityBundleApi(api => api.GetAssetBundle(request));
-        if (PcCompatGeneratedUnityBundleApi.GetPointer(bundle) == nint.Zero)
+        var bundlePointer = PcCompatGeneratedUnityBundleApi.GetPointer(bundle);
+        if (bundlePointer == nint.Zero)
             throw new InvalidOperationException("Host capability bundle request completed without a bundle.");
+        var bundleRoot = PcCompatResourceBundleLoader.InvokeUnityBundleApi(
+            api => api.CreateNativeRoot(bundlePointer));
         lock (Gate)
         {
             s_bundleRequest = null;
             s_bundleProxy = bundle;
+            s_bundleRoot = bundleRoot;
             s_status = PcCompatCapabilityRegistryStatus.LoadingManifest;
         }
     }
@@ -342,10 +349,15 @@ public static class PcCompatCapabilityBundleRegistry
             return;
 
         var manifestBaseProxy = PcCompatResourceBundleLoader.InvokeUnityBundleApi(api => api.GetAsset(request));
-        if (manifestBaseProxy == null || PcCompatGeneratedUnityBundleApi.GetPointer(manifestBaseProxy) == nint.Zero)
+        var manifestPointer = manifestBaseProxy == null
+            ? nint.Zero
+            : PcCompatGeneratedUnityBundleApi.GetPointer(manifestBaseProxy);
+        if (manifestPointer == nint.Zero)
             throw new InvalidOperationException("Capability internal manifest asset is null.");
         var manifestProxy = PcCompatResourceBundleLoader.InvokeUnityBundleApi(
             api => api.WrapAsset(manifestBaseProxy, "UnityEngine.TextAsset"));
+        var manifestRoot = PcCompatResourceBundleLoader.InvokeUnityBundleApi(
+            api => api.CreateNativeRoot(manifestPointer));
         var text = PcCompatResourceBundleLoader.InvokeUnityBundleApi(
             api => api.GetTextAssetText(manifestProxy));
         PcCompatCapabilityPackage package;
@@ -357,6 +369,7 @@ public static class PcCompatCapabilityBundleRegistry
         {
             s_manifestRequest = null;
             s_manifestProxy = manifestProxy;
+            s_manifestRoot = manifestRoot;
             RemainingAssets.Clear();
             foreach (var descriptor in package.Assets.Values.OrderBy(asset => asset.Id, StringComparer.Ordinal))
             {
@@ -412,11 +425,13 @@ public static class PcCompatCapabilityBundleRegistry
         var pointer = PcCompatGeneratedUnityBundleApi.GetPointer(assetProxy);
         if (pointer == nint.Zero)
             throw new InvalidOperationException("Capability asset is null: " + pending.Descriptor.Id + ".");
+        var assetRoot = PcCompatResourceBundleLoader.InvokeUnityBundleApi(
+            api => api.CreateNativeRoot(pointer));
         lock (Gate)
         {
             LoadedAssets.Add(
                 pending.Descriptor.Id,
-                new LoadedCapabilityAsset(pending.Descriptor, assetProxy, pointer));
+                new LoadedCapabilityAsset(pending.Descriptor, assetProxy, pointer, assetRoot));
             s_pendingAsset = null;
         }
     }
@@ -465,8 +480,10 @@ public static class PcCompatCapabilityBundleRegistry
             s_error = message;
             s_bundleRequest = null;
             s_bundleProxy = null;
+            s_bundleRoot = null;
             s_manifestRequest = null;
             s_manifestProxy = null;
+            s_manifestRoot = null;
             s_pendingAsset = null;
             RemainingAssets.Clear();
             LoadedAssets.Clear();

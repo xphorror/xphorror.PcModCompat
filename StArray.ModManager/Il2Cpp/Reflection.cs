@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using StArray.ModManager.Runtime;
 using StArray.ModManager.RuntimeAbstractions;
 
 namespace StArray.ModManager.Il2Cpp;
@@ -51,8 +52,31 @@ public unsafe class Il2CppClass : IRuntimeClass
 
     public Il2CppMethod? GetMethod(string name, int paramCount)
     {
+        var preferred = RuntimeMethodOverloadPreferences.Resolve(
+            Namespace,
+            Name,
+            name,
+            paramCount);
+        if (preferred != null && GetMethod(name, preferred) is { } exact)
+            return exact;
+
         var m = Il2CppFunctions.il2cpp_class_get_method_from_name(Ptr, name, paramCount);
-        return m != 0 ? new Il2CppMethod(m) : null;
+        if (m != 0)
+            return new Il2CppMethod(m);
+
+        var compatibility = RuntimeMethodOverloadPreferences.ResolveCompatibility(
+            Namespace,
+            Name,
+            name,
+            paramCount);
+        if (compatibility is not { } descriptor ||
+            !RuntimeMethodCompatibility.IsSupported(descriptor.Kind) ||
+            GetMethod(name, descriptor.ActualParameterTypes) is not { } actual)
+        {
+            return null;
+        }
+
+        return new Il2CppMethod(actual.Ptr, descriptor.Kind);
     }
 
     IRuntimeMethod? IRuntimeClass.GetMethod(string name, int paramCount)
@@ -138,8 +162,16 @@ public unsafe class Il2CppClass : IRuntimeClass
 
 public unsafe class Il2CppMethod : IRuntimeMethod
 {
+    private readonly RuntimeMethodCompatibilityKind _compatibilityKind;
+    private nint _compatibilityHandle;
+
     public nint Ptr { get; }
     public Il2CppMethod(nint ptr) => Ptr = ptr;
+    internal Il2CppMethod(nint ptr, RuntimeMethodCompatibilityKind compatibilityKind)
+    {
+        Ptr = ptr;
+        _compatibilityKind = compatibilityKind;
+    }
     public bool IsValid => Ptr != 0;
 
     public string Name => Marshal.PtrToStringAnsi(Il2CppFunctions.il2cpp_method_get_name(Ptr)) ?? "";
@@ -167,7 +199,33 @@ public unsafe class Il2CppMethod : IRuntimeMethod
         }
     }
 
-    public nint FunctionPtr => Ptr != 0 ? *(nint*)Ptr : 0;
+    public nint FunctionPtr
+    {
+        get
+        {
+            var target = Ptr != 0 ? *(nint*)Ptr : 0;
+            if (target == 0)
+                return target;
+
+            var guardedTarget = UnityObjectCallSafety.GetFunctionPointer(Ptr, target);
+            if (guardedTarget != target)
+                return guardedTarget;
+
+            if (_compatibilityKind == RuntimeMethodCompatibilityKind.None)
+                return target;
+
+            lock (this)
+            {
+                if (_compatibilityHandle == nint.Zero)
+                {
+                    _compatibilityHandle = RuntimeMethodCompatibility.CreateHandle(
+                        target,
+                        _compatibilityKind);
+                }
+                return _compatibilityHandle;
+            }
+        }
+    }
 
     public unsafe nint Invoke(nint obj, nint[]? args = null)
         => Il2CppRuntimeApi.Invoke(
@@ -240,7 +298,7 @@ public unsafe class Il2CppField : IRuntimeField
     public nint GetObjectValue(nint obj) => Il2CppFunctions.il2cpp_field_get_value_object(Ptr, obj);
 }
 
-/// 自定义类工厂 Native il2cpp_class_new
+/// 自定义类工厂 Native il2cpp_class_new  
 public static class ClassFactory
 {
     [DllImport("starray_modmanager", EntryPoint = "modmanager_class_create")]

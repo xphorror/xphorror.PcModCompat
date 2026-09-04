@@ -101,7 +101,7 @@ public sealed class JniUpstreamApiContractTests
             root, "StArray.ModManager.Android", "Native", "JniHelperNative.cs"));
         var native = File.ReadAllText(Path.Combine(
             root, "Android", "library", "src", "main", "cpp", "core", "jni_helper.c"));
-        var buildScript = File.ReadAllText(Path.Combine(root, "build.ps1"));
+        var buildScript = File.ReadAllText(Path.Combine(root, "build_android_single.ps1"));
         var managedEntries = Regex.Matches(
                 managed,
                 "EntryPoint\\s*=\\s*\\\"(jnihelper_[a-z0-9_]+)\\\"")

@@ -12,6 +12,9 @@ public class PcCompatHarmonySynchronousPrefixTests
     private static int s_lastState;
     private static int s_observerAfterSkipCount;
     private static MethodBase? s_lastOriginalMethod;
+    private static object?[]? s_lastPostfixArgs;
+    private static bool s_lastPostfixBooleanResult;
+    private static SyntheticMode s_lastPostfixEnumResult;
 
     [Test]
     public void BinaryRecipeRoundTripsSynchronousPrefixIdentity()
@@ -379,6 +382,324 @@ public class PcCompatHarmonySynchronousPrefixTests
     }
 
     [Test]
+    public void DeferredPostfixArgsAreReadOnlySnapshotsOfPrimitiveEnumAndProxySlots()
+    {
+        var (manifest, _) = ReadSampleManifest();
+        var rule = PostfixArgsRule(
+            nameof(ReadAndMutateArgsPostfix),
+            52,
+            typeof(SyntheticArgsTarget).FullName!,
+            typeof(int).FullName!,
+            typeof(float).FullName!,
+            typeof(SyntheticMode).FullName!,
+            typeof(SyntheticFieldProxy).FullName!);
+        var path = WriteRecipe(manifest, rule);
+        try
+        {
+            var dispatcher = BuildDispatcher(path, rule, nameof(ReadAndMutateArgsPostfix), "Postfix");
+            var record = new byte[PcCompatManagedCallbackDispatcher.EventRecordSize];
+            BinaryPrimitives.WriteUInt32LittleEndian(record, 52);
+            BinaryPrimitives.WriteUInt32LittleEndian(record.AsSpan(4), 4);
+            BinaryPrimitives.WriteUInt64LittleEndian(record.AsSpan(16), 7);
+            BinaryPrimitives.WriteUInt64LittleEndian(record.AsSpan(24), BitConverter.SingleToUInt32Bits(1.25f));
+            BinaryPrimitives.WriteUInt64LittleEndian(record.AsSpan(32), (uint)SyntheticMode.First);
+            BinaryPrimitives.WriteUInt64LittleEndian(record.AsSpan(40), 0x1234);
+            s_lastPostfixArgs = null;
+
+            dispatcher.GetType()
+                .GetMethod("DispatchRecord", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .Invoke(dispatcher, new object?[]
+                {
+                    record,
+                    0,
+                    new PcCompatManagedBoxedValueHandler(NoBoxedValue),
+                    null,
+                    null
+                });
+
+            var args = s_lastPostfixArgs!;
+            Assert.Multiple(() =>
+            {
+                Assert.That(args, Has.Length.EqualTo(4));
+                Assert.That(args[0], Is.EqualTo(7));
+                Assert.That(args[1], Is.EqualTo(1.25f));
+                Assert.That(args[2], Is.EqualTo(SyntheticMode.First));
+                Assert.That(((SyntheticFieldProxy)args[3]!).Pointer, Is.EqualTo((IntPtr)0x1234));
+                Assert.That(BinaryPrimitives.ReadUInt64LittleEndian(record.AsSpan(16)), Is.EqualTo(7ul));
+                Assert.That(BinaryPrimitives.ReadUInt64LittleEndian(record.AsSpan(24)), Is.EqualTo((ulong)BitConverter.SingleToUInt32Bits(1.25f)));
+                Assert.That(BinaryPrimitives.ReadUInt64LittleEndian(record.AsSpan(32)), Is.EqualTo((ulong)SyntheticMode.First));
+                Assert.That(BinaryPrimitives.ReadUInt64LittleEndian(record.AsSpan(40)), Is.EqualTo(0x1234ul));
+            });
+        }
+        finally
+        {
+            Directory.Delete(Path.GetDirectoryName(path)!, true);
+        }
+    }
+
+    [Test]
+    public void DeferredPostfixArgsRejectRefOrOutTargetParameters()
+    {
+        var (manifest, _) = ReadSampleManifest();
+        var rule = PostfixArgsRule(
+            nameof(ReadAndMutateArgsPostfix),
+            53,
+            typeof(SyntheticRefArgsTarget).FullName!,
+            "System.Int32&");
+        var path = WriteRecipe(manifest, rule);
+        try
+        {
+            var dispatcher = BuildDispatcher(path, rule, nameof(ReadAndMutateArgsPostfix), "Postfix");
+            var stats = (PcCompatManagedEventDispatchStats)dispatcher.GetType()
+                .GetMethod("SnapshotStats")!
+                .Invoke(dispatcher, null)!;
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(stats.BoundCallbacks, Is.EqualTo(0));
+                Assert.That(stats.SkipReasons, Does.Contain("deferred Postfix __args cannot expose ref/out target parameters"));
+            });
+        }
+        finally
+        {
+            Directory.Delete(Path.GetDirectoryName(path)!, true);
+        }
+    }
+
+    [Test]
+    public void DeferredPostfixArgsRejectMoreThanSixTargetParameters()
+    {
+        var (manifest, _) = ReadSampleManifest();
+        var rule = PostfixArgsRule(
+            nameof(ReadAndMutateArgsPostfix),
+            54,
+            "SyntheticSevenArgsTarget",
+            Enumerable.Repeat(typeof(int).FullName!, 7).ToArray());
+        var path = WriteRecipe(manifest, rule);
+        try
+        {
+            var dispatcher = BuildDispatcher(path, rule, nameof(ReadAndMutateArgsPostfix), "Postfix");
+            var stats = (PcCompatManagedEventDispatchStats)dispatcher.GetType()
+                .GetMethod("SnapshotStats")!
+                .Invoke(dispatcher, null)!;
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(stats.BoundCallbacks, Is.EqualTo(0));
+                Assert.That(stats.SkipReasons, Does.Contain("exceeds invocation capacity 6"));
+            });
+        }
+        finally
+        {
+            Directory.Delete(Path.GetDirectoryName(path)!, true);
+        }
+    }
+
+    [Test]
+    public void DeferredPostfixArgsRejectUnsupportedStructSlots()
+    {
+        var (manifest, _) = ReadSampleManifest();
+        var rule = PostfixArgsRule(
+            nameof(ReadAndMutateArgsPostfix),
+            55,
+            typeof(SyntheticStructArgsTarget).FullName!,
+            typeof(SyntheticValue).FullName!);
+        var path = WriteRecipe(manifest, rule);
+        try
+        {
+            var dispatcher = BuildDispatcher(path, rule, nameof(ReadAndMutateArgsPostfix), "Postfix");
+            var stats = (PcCompatManagedEventDispatchStats)dispatcher.GetType()
+                .GetMethod("SnapshotStats")!
+                .Invoke(dispatcher, null)!;
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(stats.BoundCallbacks, Is.EqualTo(0));
+                Assert.That(stats.SkipReasons, Does.Contain("unsupported callback parameter type"));
+            });
+        }
+        finally
+        {
+            Directory.Delete(Path.GetDirectoryName(path)!, true);
+        }
+    }
+
+    [Test]
+    public void DeferredPostfixReadsBooleanAndEnumResultsByValue()
+    {
+        var (manifest, _) = ReadSampleManifest();
+        var booleanRule = PostfixResultRule(
+            nameof(CaptureBooleanResultPostfix),
+            56,
+            typeof(SyntheticBooleanResultTarget).FullName!,
+            typeof(bool).FullName!);
+        var enumRule = PostfixResultRule(
+            nameof(CaptureEnumResultPostfix),
+            57,
+            typeof(SyntheticEnumResultTarget).FullName!,
+            typeof(SyntheticMode).FullName!);
+        var path = WriteRecipe(manifest, booleanRule, enumRule);
+        try
+        {
+            var dispatcher = BuildDispatcherMany(
+                path,
+                new RegistrationSpec(booleanRule, nameof(CaptureBooleanResultPostfix), "Postfix"),
+                new RegistrationSpec(enumRule, nameof(CaptureEnumResultPostfix), "Postfix"));
+            s_lastPostfixBooleanResult = false;
+            s_lastPostfixEnumResult = default;
+
+            DispatchPostfixResult(
+                dispatcher,
+                56,
+                PcCompatManagedPrefixResultKind.Boolean,
+                1);
+            DispatchPostfixResult(
+                dispatcher,
+                57,
+                PcCompatManagedPrefixResultKind.Int32,
+                (uint)SyntheticMode.Second);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(s_lastPostfixBooleanResult, Is.True);
+                Assert.That(s_lastPostfixEnumResult, Is.EqualTo(SyntheticMode.Second));
+            });
+        }
+        finally
+        {
+            Directory.Delete(Path.GetDirectoryName(path)!, true);
+        }
+    }
+
+    [Test]
+    public void SharedGenericPostfixSkipsNonEnumBoxAndStillDispatchesRealEnum()
+    {
+        var (manifest, _) = ReadSampleManifest();
+        const uint patchId = 73;
+        var rule = PostfixArgsRule(
+            nameof(CaptureBoxedEnumPostfix),
+            patchId,
+            typeof(SyntheticBoxedEnumTarget).FullName!,
+            typeof(Enum).FullName!);
+        var path = WriteRecipe(manifest, rule);
+        try
+        {
+            var dispatcher = BuildDispatcher(
+                path,
+                rule,
+                nameof(CaptureBoxedEnumPostfix),
+                "Postfix");
+            var record = new byte[PcCompatManagedCallbackDispatcher.EventRecordSize];
+            BinaryPrimitives.WriteUInt32LittleEndian(record, patchId);
+            BinaryPrimitives.WriteUInt32LittleEndian(record.AsSpan(4), 1);
+            BinaryPrimitives.WriteUInt64LittleEndian(record.AsSpan(16), 0x1234);
+            var boxedType = typeof(bool).FullName!;
+            var boxedValue = 1L;
+            bool ReadBoxed(IntPtr boxed, out string? typeName, out long value)
+            {
+                typeName = boxedType;
+                value = boxedValue;
+                return boxed == (IntPtr)0x1234;
+            }
+
+            s_lastBoxedEnum = null;
+            DispatchRecord(dispatcher, record, ReadBoxed);
+            var afterNonEnum = SnapshotStats(dispatcher);
+            boxedType = typeof(SyntheticMode).FullName!;
+            boxedValue = (long)SyntheticMode.Second;
+            DispatchRecord(dispatcher, record, ReadBoxed);
+            var afterEnum = SnapshotStats(dispatcher);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(s_lastBoxedEnum, Is.EqualTo(SyntheticMode.Second));
+                Assert.That(afterNonEnum.FailedCallbacks, Is.Zero);
+                Assert.That(afterNonEnum.DispatchedCallbacks, Is.Zero);
+                Assert.That(afterEnum.FailedCallbacks, Is.Zero);
+                Assert.That(afterEnum.DispatchedCallbacks, Is.EqualTo(1));
+            });
+        }
+        finally
+        {
+            Directory.Delete(Path.GetDirectoryName(path)!, true);
+        }
+    }
+
+    [Test]
+    public void SharedGenericPrefixSkipsNonEnumBoxWithoutBlockingOriginal()
+    {
+        var (manifest, _) = ReadSampleManifest();
+        var rule = PrefixRule(nameof(CaptureBoxedEnumPrefix), typeof(Enum).FullName!);
+        var path = WriteRecipe(manifest, rule);
+        try
+        {
+            var dispatcher = BuildDispatcher(path, rule, nameof(CaptureBoxedEnumPrefix));
+            var frame = CreateInvocation(PcCompatManagedPrefixResultKind.Void, 0x1234);
+            bool ReadBoxed(IntPtr boxed, out string? typeName, out long value)
+            {
+                typeName = typeof(float).FullName;
+                value = 0;
+                return boxed == (IntPtr)0x1234;
+            }
+            var invocation = new object?[]
+            {
+                1u,
+                frame,
+                new PcCompatManagedBoxedValueHandler(ReadBoxed),
+                true
+            };
+
+            s_lastBoxedEnum = null;
+            var handled = (bool)dispatcher.GetType()
+                .GetMethod("TryDispatchSynchronousPrefix", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .Invoke(dispatcher, invocation)!;
+            var updated = (PcCompatManagedPrefixInvocationV2)invocation[1]!;
+            var stats = SnapshotStats(dispatcher);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(handled, Is.False);
+                Assert.That(updated.RunOriginal, Is.EqualTo(1u));
+                Assert.That(s_lastBoxedEnum, Is.Null);
+                Assert.That(stats.FailedCallbacks, Is.Zero);
+            });
+        }
+        finally
+        {
+            Directory.Delete(Path.GetDirectoryName(path)!, true);
+        }
+    }
+
+    [Test]
+    public void DeferredPostfixRejectsResultWriteBack()
+    {
+        var (manifest, _) = ReadSampleManifest();
+        var rule = PostfixResultRule(
+            nameof(MutateResultPostfix),
+            58,
+            typeof(SyntheticBooleanResultTarget).FullName!,
+            typeof(bool).FullName!);
+        var path = WriteRecipe(manifest, rule);
+        try
+        {
+            var dispatcher = BuildDispatcher(path, rule, nameof(MutateResultPostfix), "Postfix");
+            var stats = (PcCompatManagedEventDispatchStats)dispatcher.GetType()
+                .GetMethod("SnapshotStats")!
+                .Invoke(dispatcher, null)!;
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(stats.BoundCallbacks, Is.EqualTo(0));
+                Assert.That(stats.SkipReasons, Does.Contain("deferred Postfix cannot write back ref/out __result"));
+            });
+        }
+        finally
+        {
+            Directory.Delete(Path.GetDirectoryName(path)!, true);
+        }
+    }
+
+    [Test]
     public void ObserverPrefixStillRunsAfterOriginalWasSkipped()
     {
         var (manifest, _) = ReadSampleManifest();
@@ -465,6 +786,92 @@ public class PcCompatHarmonySynchronousPrefixTests
     }
 
     [Test]
+    public void PrefixRefInstanceWritesReplacementPointerBackToInvocationFrame()
+    {
+        var (manifest, _) = ReadSampleManifest();
+        var rule = FieldRule(nameof(ReplaceInstancePrefix));
+        var path = WriteRecipe(manifest, rule);
+        try
+        {
+            var dispatcher = BuildDispatcher(path, rule, nameof(ReplaceInstancePrefix));
+            var frame = CreateInvocation(PcCompatManagedPrefixResultKind.Void);
+            frame.Instance = 0x1234;
+            var invocation = new object?[]
+            {
+                31u,
+                frame,
+                new PcCompatManagedBoxedValueHandler(NoBoxedValue),
+                true
+            };
+
+            var handled = (bool)dispatcher.GetType()
+                .GetMethod("TryDispatchSynchronousPrefix", BindingFlags.Instance | BindingFlags.NonPublic)!
+                .Invoke(dispatcher, invocation)!;
+            var updated = (PcCompatManagedPrefixInvocationV2)invocation[1]!;
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(handled, Is.True);
+                Assert.That(updated.Instance, Is.EqualTo(0x9876ul));
+            });
+        }
+        finally
+        {
+            Directory.Delete(Path.GetDirectoryName(path)!, true);
+        }
+    }
+
+    [Test]
+    public void DeferredPostfixRejectsRefInstanceWriteBack()
+    {
+        var (manifest, _) = ReadSampleManifest();
+        var rule = OriginalMethodRule(nameof(MutateInstancePostfix), "Postfix", 59);
+        var path = WriteRecipe(manifest, rule);
+        try
+        {
+            var dispatcher = BuildDispatcher(path, rule, nameof(MutateInstancePostfix), "Postfix");
+            var stats = (PcCompatManagedEventDispatchStats)dispatcher.GetType()
+                .GetMethod("SnapshotStats")!
+                .Invoke(dispatcher, null)!;
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(stats.BoundCallbacks, Is.EqualTo(0));
+                Assert.That(stats.SkipReasons, Does.Contain("deferred Postfix cannot write back ref/out __instance"));
+            });
+        }
+        finally
+        {
+            Directory.Delete(Path.GetDirectoryName(path)!, true);
+        }
+    }
+
+    [Test]
+    public void PrefixRefInstanceRejectsStaticTarget()
+    {
+        var (manifest, _) = ReadSampleManifest();
+        var rule = StaticInstanceRule(nameof(ReplaceStaticInstancePrefix));
+        var path = WriteRecipe(manifest, rule);
+        try
+        {
+            var dispatcher = BuildDispatcher(path, rule, nameof(ReplaceStaticInstancePrefix));
+            var stats = (PcCompatManagedEventDispatchStats)dispatcher.GetType()
+                .GetMethod("SnapshotStats")!
+                .Invoke(dispatcher, null)!;
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(stats.BoundCallbacks, Is.EqualTo(0));
+                Assert.That(stats.SkipReasons, Does.Contain("ref/out __instance cannot bind to a static target"));
+            });
+        }
+        finally
+        {
+            Directory.Delete(Path.GetDirectoryName(path)!, true);
+        }
+    }
+
+    [Test]
     public void NativeDispatchersDecideBeforeOriginalAndForwardMethodInfo()
     {
         var source = File.ReadAllText(Path.Combine(
@@ -487,10 +894,13 @@ public class PcCompatHarmonySynchronousPrefixTests
             var end = source.IndexOf("\n}\n", start, StringComparison.Ordinal);
             Assert.That(end, Is.GreaterThan(start), dispatcher);
             var body = source[start..end];
-            var gate = body.IndexOf("modmanager_runtime_enabled", StringComparison.Ordinal);
+            var gate = body.IndexOf("pccompat_runtime_enabled", StringComparison.Ordinal);
             var prefix = body.IndexOf("run_managed_prefix_rules", StringComparison.Ordinal);
             var bypassOriginal = body.IndexOf("original(", gate, StringComparison.Ordinal);
             var guardedOriginal = body.IndexOf("original(", prefix, StringComparison.Ordinal);
+            var instanceRefresh = body.IndexOf("self = args.instance;", prefix, StringComparison.Ordinal);
+            if (dispatcher == "dispatcher_instance_void_color1")
+                instanceRefresh = body.IndexOf("self = color_args.instance;", prefix, StringComparison.Ordinal);
             Assert.Multiple(() =>
             {
                 Assert.That(gate, Is.GreaterThanOrEqualTo(0), dispatcher);
@@ -499,6 +909,11 @@ public class PcCompatHarmonySynchronousPrefixTests
                 Assert.That(bypassOriginal, Is.GreaterThan(gate).And.LessThan(prefix), dispatcher);
                 Assert.That(guardedOriginal, Is.GreaterThan(prefix), dispatcher);
                 Assert.That(body, Does.Contain("method_info"), dispatcher);
+                if (dispatcher.StartsWith("dispatcher_instance_", StringComparison.Ordinal))
+                {
+                    Assert.That(instanceRefresh, Is.GreaterThan(prefix), dispatcher);
+                    Assert.That(instanceRefresh, Is.LessThan(guardedOriginal), dispatcher);
+                }
             });
         }
 
@@ -509,6 +924,7 @@ public class PcCompatHarmonySynchronousPrefixTests
             Assert.That(source, Does.Contain("modmanager_pccompat_get_managed_prefix_invocation_size"));
             Assert.That(source, Does.Contain("invocation.arguments[index] = args.raw_args[index]"));
             Assert.That(source, Does.Contain("args.raw_args[index] = invocation.arguments[index]"));
+            Assert.That(source, Does.Contain("args.instance = reinterpret_cast<void *>("));
             Assert.That(source, Does.Contain("refresh_fixed_args_after_managed_prefix(args)"));
             Assert.That(source, Does.Contain("modmanager_pccompat_set_managed_prefix_callback"));
             Assert.That(source, Does.Contain("modmanager_pccompat_read_bundle_mod_id"));
@@ -656,6 +1072,32 @@ public class PcCompatHarmonySynchronousPrefixTests
         __args[3] = new SyntheticFieldProxy((IntPtr)0x9876);
     }
 
+    private static void ReadAndMutateArgsPostfix(object[] __args)
+    {
+        s_lastPostfixArgs = __args.ToArray();
+        __args[0] = 99;
+        __args[1] = 2.5f;
+        __args[2] = SyntheticMode.Second;
+        __args[3] = new SyntheticFieldProxy((IntPtr)0x9876);
+    }
+
+    private static void CaptureBooleanResultPostfix(bool __result)
+        => s_lastPostfixBooleanResult = __result;
+
+    private static void CaptureEnumResultPostfix(SyntheticMode __result)
+        => s_lastPostfixEnumResult = __result;
+
+    private static Enum? s_lastBoxedEnum;
+
+    private static void CaptureBoxedEnumPostfix(Enum value)
+        => s_lastBoxedEnum = value;
+
+    private static void CaptureBoxedEnumPrefix(Enum value)
+        => s_lastBoxedEnum = value;
+
+    private static void MutateResultPostfix(ref bool __result)
+        => __result = false;
+
     private static bool StopOriginalPrefix() => false;
 
     private static void ObserveAfterSkipPrefix()
@@ -663,6 +1105,18 @@ public class PcCompatHarmonySynchronousPrefixTests
 
     private static void MutateProxyField(ref int ___InstanceValue)
         => ___InstanceValue += 9;
+
+    private static void ReplaceInstancePrefix(ref SyntheticFieldProxy __instance)
+    {
+        Assert.That(__instance.Pointer, Is.EqualTo((IntPtr)0x1234));
+        __instance = new SyntheticFieldProxy((IntPtr)0x9876);
+    }
+
+    private static void MutateInstancePostfix(ref SyntheticFieldProxy __instance)
+        => __instance = new SyntheticFieldProxy((IntPtr)0x9876);
+
+    private static void ReplaceStaticInstancePrefix(ref SyntheticStaticProxy __instance)
+        => __instance = new SyntheticStaticProxy((IntPtr)0x9876);
 
     private static void PostfixOrderCallback()
     {
@@ -754,6 +1208,23 @@ public class PcCompatHarmonySynchronousPrefixTests
             Source = "managed_field:test"
         };
 
+    private static PcCompatCompiledRule StaticInstanceRule(string callbackMethod)
+        => new()
+        {
+            Id = $"managed_prefix:60:{typeof(PcCompatHarmonySynchronousPrefixTests).FullName}:{callbackMethod}",
+            FeatureId = "managed_callback",
+            TargetType = typeof(SyntheticStaticProxy).FullName!,
+            TargetMethod = nameof(SyntheticStaticProxy.Run),
+            TargetIsStatic = true,
+            TargetReturnType = "System.Void",
+            TargetParameterTypes = Array.Empty<string>(),
+            ParamCount = 0,
+            Stage = PcCompatRuleStage.BeforeOriginal,
+            Op = PcCompatRuleOp.ManagedSynchronousPrefix,
+            RequiredCapabilities = PcCompatCapability.SkipOriginal,
+            Source = "managed_static_instance:test"
+        };
+
     private static PcCompatCompiledRule OriginalMethodRule(string callbackMethod, string kind, uint patchId)
         => new()
         {
@@ -798,6 +1269,91 @@ public class PcCompatHarmonySynchronousPrefixTests
             RequiredCapabilities = PcCompatCapability.SkipOriginal,
             Source = "managed_args:test"
         };
+
+    private static PcCompatCompiledRule PostfixArgsRule(
+        string callbackMethod,
+        uint patchId,
+        string targetType,
+        params string[] parameterTypes)
+        => new()
+        {
+            Id = $"managed_event:{patchId}:{typeof(PcCompatHarmonySynchronousPrefixTests).FullName}:{callbackMethod}",
+            FeatureId = "managed_callback",
+            TargetType = targetType,
+            TargetMethod = nameof(SyntheticArgsTarget.Run),
+            TargetIsStatic = false,
+            TargetReturnType = "System.Void",
+            TargetParameterTypes = parameterTypes,
+            ParamCount = parameterTypes.Length,
+            Stage = PcCompatRuleStage.AfterOriginal,
+            Op = PcCompatRuleOp.ManagedEventCallback,
+            RequiredCapabilities = PcCompatCapability.None,
+            Source = "managed_postfix_args:test"
+        };
+
+    private static PcCompatCompiledRule PostfixResultRule(
+        string callbackMethod,
+        uint patchId,
+        string targetType,
+        string targetReturnType)
+        => new()
+        {
+            Id = $"managed_event:{patchId}:{typeof(PcCompatHarmonySynchronousPrefixTests).FullName}:{callbackMethod}",
+            FeatureId = "managed_callback",
+            TargetType = targetType,
+            TargetMethod = "Run",
+            TargetIsStatic = false,
+            TargetReturnType = targetReturnType,
+            TargetParameterTypes = Array.Empty<string>(),
+            ParamCount = 0,
+            Stage = PcCompatRuleStage.AfterOriginal,
+            Op = PcCompatRuleOp.ManagedEventCallback,
+            RequiredCapabilities = PcCompatCapability.None,
+            Source = "managed_postfix_result:test"
+        };
+
+    private static void DispatchPostfixResult(
+        object dispatcher,
+        uint patchId,
+        PcCompatManagedPrefixResultKind resultKind,
+        ulong resultValue)
+    {
+        var record = new byte[PcCompatManagedCallbackDispatcher.EventRecordSize];
+        BinaryPrimitives.WriteUInt32LittleEndian(record, patchId);
+        BinaryPrimitives.WriteUInt32LittleEndian(record.AsSpan(160), (uint)resultKind);
+        BinaryPrimitives.WriteUInt32LittleEndian(record.AsSpan(164), 1);
+        BinaryPrimitives.WriteUInt64LittleEndian(record.AsSpan(168), resultValue);
+        dispatcher.GetType()
+            .GetMethod("DispatchRecord", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .Invoke(dispatcher, new object?[]
+            {
+                record,
+                0,
+                new PcCompatManagedBoxedValueHandler(NoBoxedValue),
+                null,
+                null
+            });
+    }
+
+    private static void DispatchRecord(
+        object dispatcher,
+        byte[] record,
+        PcCompatManagedBoxedValueHandler boxedValueReader)
+        => dispatcher.GetType()
+            .GetMethod("DispatchRecord", BindingFlags.Instance | BindingFlags.NonPublic)!
+            .Invoke(dispatcher, new object?[]
+            {
+                record,
+                0,
+                boxedValueReader,
+                null,
+                null
+            });
+
+    private static PcCompatManagedEventDispatchStats SnapshotStats(object dispatcher)
+        => (PcCompatManagedEventDispatchStats)dispatcher.GetType()
+            .GetMethod("SnapshotStats")!
+            .Invoke(dispatcher, null)!;
 
     private static string WriteRecipe(PcModManifest manifest, params PcCompatCompiledRule[] rules)
     {
@@ -927,6 +1483,53 @@ public class PcCompatHarmonySynchronousPrefixTests
         public void Run()
         {
         }
+    }
+
+    private sealed class SyntheticStaticProxy
+    {
+        public SyntheticStaticProxy(IntPtr pointer) => Pointer = pointer;
+
+        public IntPtr Pointer { get; }
+
+        public static void Run()
+        {
+        }
+    }
+
+    private sealed class SyntheticRefArgsTarget
+    {
+        public void Run(ref int value)
+        {
+        }
+    }
+
+    private readonly struct SyntheticValue
+    {
+        public SyntheticValue(int value) => Value = value;
+
+        public int Value { get; }
+    }
+
+    private sealed class SyntheticStructArgsTarget
+    {
+        public void Run(SyntheticValue value)
+        {
+        }
+    }
+
+    private sealed class SyntheticBooleanResultTarget
+    {
+        public bool Run() => true;
+    }
+
+    private sealed class SyntheticEnumResultTarget
+    {
+        public SyntheticMode Run() => SyntheticMode.First;
+    }
+
+    private sealed class SyntheticBoxedEnumTarget
+    {
+        public void Run(Enum value) { }
     }
 
     private enum SyntheticMode

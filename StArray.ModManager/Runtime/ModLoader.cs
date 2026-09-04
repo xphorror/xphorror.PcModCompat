@@ -1,7 +1,9 @@
 using StArray.ModManager.Resources;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading;
+using StArray.ModManager.Behaviours;
 using StArray.ModManager.Manager;
 using Xphorror.PcModCompat;
 
@@ -10,10 +12,22 @@ namespace StArray.ModManager.Runtime;
 /// <summary>Mod 管理器核心 / Mod loader — scan, load, enable/disable mods</summary>
 public class ModLoader
 {
+    private const string NativeShadowDirectoryName = ".starray-shadow";
+    private const string NativeDataDirectoryName = ".starray-data";
+    private static readonly TimeSpan RuntimeCallbackQuiescenceTimeout = TimeSpan.FromSeconds(5);
     private readonly List<ModEntry> _mods = new();
     private readonly IReadOnlyList<ModEntry> _modsView;
     private readonly List<ModEntry> _pendingLoads = new(4);
+    private readonly List<NativeModLoadState> _orphanedNativeStates = new();
+    private readonly ConditionalWeakTable<ModEntry, object> _transitionLocks = new();
     private readonly string _modsDirectory;
+    private readonly string _nativeShadowRoot;
+    private readonly string _nativeDataRoot;
+    private readonly ModHostPathPolicy _hostPathPolicy;
+    // ScanMods rebuilds ModEntry objects. A per-object lock is insufficient because an old
+    // UI/config reference can otherwise race a newly discovered entry that shares its
+    // RuntimeSession. Serialize lifecycle transitions and scans at the host boundary.
+    private readonly object _transitionGate = new();
     private int _pendingLoadUpdateActive;
     private int _pendingLoadRequestScheduled;
     private int _pendingAsyncLoadCount;
@@ -35,14 +49,85 @@ public class ModLoader
     public bool HasPendingAsyncLoads => PendingAsyncLoadCount > 0 || _mods.Any(mod =>
         mod.LoadState == ModLoadState.Loading && mod.PluginInstance is IAsyncModPlugin);
 
+    internal ModOwnedResourceAuditSnapshot SnapshotOwnedResourceAudit()
+    {
+        var sessions = _mods
+            .Select(mod => mod.RuntimeSession.Snapshot())
+            .Concat(_orphanedNativeStates.Select(state => state.RuntimeSession.Snapshot()))
+            .ToArray();
+        return ModOwnedResourceRegistry.CreateAuditSnapshot(sessions);
+    }
+
+    internal string GetOwnedResourceDiagnostics(bool includeResources = true)
+        => SnapshotOwnedResourceAudit().ToDiagnosticText(includeResources);
+
     /// <summary>创建 ModLoader 并指定 Mods 目录</summary>
     public ModLoader(string modsDirectory)
+        : this(modsDirectory, null)
     {
-        _modsDirectory = modsDirectory;
+    }
+
+    public ModLoader(string modsDirectory, ModHostPathPolicy? hostPathPolicy)
+    {
+        _modsDirectory = Path.GetFullPath(modsDirectory);
+        _nativeShadowRoot = Path.Combine(_modsDirectory, NativeShadowDirectoryName);
+        _nativeDataRoot = Path.Combine(_modsDirectory, NativeDataDirectoryName);
+        _hostPathPolicy = hostPathPolicy ?? new ModHostPathPolicy();
         _modsView = _mods.AsReadOnly();
     }
 
-    private static Type? ResolvePluginType(Assembly assembly)
+    /// <summary>
+    /// Host-owned subdirectories of the Mods directory. Both hold generated state, never a
+    /// MOD, so the scanner must not treat them as discoverable MOD folders.
+    /// </summary>
+    private static bool IsHostOwnedDirectory(string directory)
+    {
+        var name = Path.GetFileName(directory);
+        return string.Equals(name, NativeShadowDirectoryName, StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(name, NativeDataDirectoryName, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Per-domain filesystem roots for an Android Managed MOD. The MOD directory stays
+    /// read-only (execution runs from the shadow package), and every writable root lives
+    /// under a Host-owned per-MOD directory so one MOD cannot reach another's files.
+    /// </summary>
+    internal ModDataDomainPathRoots BuildDomainPathRoots(string modId, string sourceDirectory)
+    {
+        var modDataRoot = Path.Combine(_nativeDataRoot, SanitizeModDirectoryName(modId));
+        return new ModDataDomainPathRoots
+        {
+            InstallRoot = sourceDirectory,
+            ConfigRoot = Path.Combine(modDataRoot, "config"),
+            CacheRoot = Path.Combine(modDataRoot, "cache"),
+            LogRoot = Path.Combine(modDataRoot, "log"),
+            TempRoot = Path.Combine(modDataRoot, "temp"),
+            DataOverlayRoot = Path.Combine(modDataRoot, "data"),
+            SharedReadOnlyRoots = _hostPathPolicy.SharedReadOnlyRoots,
+            SharedWritableRoots = _hostPathPolicy.SharedWritableRoots,
+            HostProtectedRoots = _hostPathPolicy.HostProtectedRoots
+        };
+    }
+
+    /// <summary>
+    /// MOD IDs reach the filesystem here, so anything that could escape the data root or
+    /// collide across MODs is replaced rather than trusted.
+    /// </summary>
+    private static string SanitizeModDirectoryName(string modId)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(modId);
+        var invalid = Path.GetInvalidFileNameChars();
+        var buffer = new char[modId.Length];
+        for (var i = 0; i < modId.Length; i++)
+        {
+            var c = modId[i];
+            buffer[i] = c == '.' || Array.IndexOf(invalid, c) >= 0 ? '_' : c;
+        }
+        var name = new string(buffer).Trim('_');
+        return name.Length == 0 ? "_" : name;
+    }
+
+    internal static Type? ResolvePluginType(Assembly assembly)
     {
         try
         {
@@ -138,12 +223,40 @@ public class ModLoader
     /// </summary>
     public void ScanMods()
     {
-        // 保存当前已加载 Mod 的状态（扫描后恢复）
-        var runtimeStates = _mods
-            .Where(m => m.LoadState is ModLoadState.Loading or ModLoadState.Loaded or ModLoadState.Error)
-            .ToDictionary(
-                m => m.Id,
-                m => (m.PluginInstance, m.IsEnabled, m.LoadState, m.LoadError, m.LoadProgress, m.LoadStage));
+        lock (_transitionGate)
+            ScanModsCore();
+    }
+
+    private void ScanModsCore()
+    {
+        // 保存当前运行状态和原生 MOD 的 load context（扫描后恢复）。
+        // Native contexts with process-lifetime hooks must also survive a rescan.
+        var previousMods = _mods.ToArray();
+        var runtimeStates = new Dictionary<string, (IModPlugin? PluginInstance, bool IsEnabled,
+            ModLoadState LoadState, string? LoadError, float LoadProgress, string LoadStage,
+            object? LoaderData, string LoaderKind, string FolderPath,
+            ModRuntimeSession RuntimeSession)>(StringComparer.OrdinalIgnoreCase);
+        foreach (var existing in previousMods.Where(mod =>
+                     mod.LoadState is ModLoadState.Loading or ModLoadState.Loaded or ModLoadState.Error ||
+                     mod.LoaderData is NativeModLoadState))
+        {
+            if (!runtimeStates.TryAdd(
+                    existing.Id,
+                    (existing.PluginInstance,
+                     existing.IsEnabled,
+                     existing.LoadState,
+                     existing.LoadError,
+                     existing.LoadProgress,
+                     existing.LoadStage,
+                      existing.LoaderData,
+                      existing.LoaderKind,
+                      existing.FolderPath,
+                      existing.RuntimeSession)))
+            {
+                Logger.Error(nameof(ModLoader),
+                    $"duplicate MOD id retained only once during rescan: {existing.Id}");
+            }
+        }
 
         _mods.Clear();
 
@@ -151,28 +264,61 @@ public class ModLoader
         {
             Directory.CreateDirectory(_modsDirectory);
             Logger.Info(nameof(ModLoader), L10n.Get("Log_DirCreated", _modsDirectory));
+            ReleaseOrphanedRuntimeStates(previousMods, Array.Empty<ModEntry>());
             return;
         }
 
-        foreach (var dir in Directory.GetDirectories(_modsDirectory))
+        foreach (var dir in Directory.GetDirectories(_modsDirectory).Where(dir =>
+                     !IsHostOwnedDirectory(dir)))
         {
             var mod = DiscoverMod(dir);
             if (mod != null)
             {
+                if (string.IsNullOrWhiteSpace(mod.Id))
+                {
+                    Logger.Error(nameof(ModLoader), $"MOD rejected because its ID is empty: {dir}");
+                    ReleaseRejectedNativeMod(mod);
+                    continue;
+                }
+                if (_mods.Any(existing =>
+                        string.Equals(existing.Id, mod.Id, StringComparison.OrdinalIgnoreCase)))
+                {
+                    Logger.Error(nameof(ModLoader),
+                        $"MOD rejected because ID is already used: {mod.Id} ({dir})");
+                    ReleaseRejectedNativeMod(mod);
+                    continue;
+                }
+
                 // 恢复之前已加载的状态
                 if (runtimeStates.TryGetValue(mod.Id, out var state))
                 {
-                    mod.PluginInstance = state.PluginInstance;
-                    mod.IsEnabled = state.IsEnabled;
-                    mod.LoadState = state.LoadState;
-                    mod.LoadError = state.LoadError;
-                    mod.LoadProgress = state.LoadProgress;
-                    mod.LoadStage = state.LoadStage;
+                    if (HasSameRuntimeIdentity(mod, state.LoaderKind, state.FolderPath))
+                    {
+                        if (mod.LoaderData is NativeModLoadState discoveredNative &&
+                            !ReferenceEquals(discoveredNative, state.LoaderData))
+                            discoveredNative.ReleaseContext();
+                        mod.PluginInstance = state.PluginInstance;
+                        mod.IsEnabled = state.IsEnabled;
+                        mod.LoadState = state.LoadState;
+                        mod.LoadError = state.LoadError;
+                        mod.LoadProgress = state.LoadProgress;
+                        mod.LoadStage = state.LoadStage;
+                        mod.LoaderData = state.LoaderData;
+                        mod.RuntimeSession = state.RuntimeSession;
+                    }
+                    else
+                    {
+                        Logger.Warn(nameof(ModLoader),
+                            $"runtime state not restored because MOD identity changed: {mod.Id} " +
+                            $"{state.LoaderKind} -> {mod.LoaderKind}");
+                    }
                 }
                 _mods.Add(mod);
                 Logger.Info(nameof(ModLoader), L10n.Get("Log_ModFound", mod.Name, mod.Id));
             }
         }
+
+        ReleaseOrphanedRuntimeStates(previousMods, _mods);
 
         Logger.Info(nameof(ModLoader), L10n.Get("Log_ModCount", _mods.Count));
     }
@@ -250,48 +396,190 @@ public class ModLoader
     {
         var dirName = Path.GetFileName(folderPath);
 
-        if (PcModManifestReader.TryRead(folderPath, out var pcManifest, out var pcError))
-        {
-            Logger.Info(nameof(ModLoader), $"PcModCompat manifest found: {pcManifest.Id} ({pcManifest.Kind})");
-            return PcCompatModPlugin.CreateEntry(pcManifest);
-        }
-
-        if (!string.IsNullOrEmpty(pcError))
-            Logger.Warn(nameof(ModLoader), $"PcModCompat manifest ignored for {dirName}: {pcError}");
-
         var entryDll = Directory.GetFiles(folderPath, "*.dll")
             .FirstOrDefault(f => Path.GetFileNameWithoutExtension(f) == dirName)
             ?? Directory.GetFiles(folderPath, "*.dll")
                 .FirstOrDefault(f => !Path.GetFileNameWithoutExtension(f).Equals("StArray.ModManager", StringComparison.OrdinalIgnoreCase));
 
+        // Info.json is shared by several Android MOD packages for display/update metadata.
+        // Prove the actual plugin shape first so an Android IModPlugin cannot be routed to the
+        // PC compatibility loader merely because that file happens to be present.
+        string? nativePluginTypeName = null;
+        string? nativeProbeReason = null;
+        var nativePluginProven = entryDll != null &&
+            NativeModMetadataDescriptor.TryReadPluginTypeName(
+                entryDll,
+                out nativePluginTypeName,
+                out nativeProbeReason);
+
+        if (nativePluginProven && nativePluginTypeName != null)
+        {
+            Logger.Info(
+                nameof(ModLoader),
+                $"native IModPlugin takes precedence over PcModCompat manifest: " +
+                $"mod={dirName} type={nativePluginTypeName}");
+        }
+        else if (!string.IsNullOrEmpty(nativeProbeReason))
+        {
+            Logger.Debug(nameof(ModLoader),
+                $"native plugin probe unavailable for {dirName}: {nativeProbeReason}");
+        }
+
+        PcModManifest? parsedPcManifest;
+        string? pcError;
+        var hasPcManifest = PcModManifestReader.TryRead(
+            folderPath,
+            out parsedPcManifest,
+            out pcError);
+        if (!nativePluginProven && hasPcManifest && parsedPcManifest != null)
+        {
+            Logger.Info(nameof(ModLoader), $"PcModCompat manifest found: {parsedPcManifest.Id} ({parsedPcManifest.Kind})");
+            return PcCompatModPlugin.CreateEntry(parsedPcManifest);
+        }
+
+        if (!nativePluginProven && !string.IsNullOrEmpty(pcError))
+            Logger.Warn(nameof(ModLoader), $"PcModCompat manifest ignored for {dirName}: {pcError}");
+
         if (entryDll == null) return null;
 
         try
         {
-            var assembly = Assembly.LoadFrom(entryDll);
-
-            var pluginType = ResolvePluginType(assembly);
-
-            if (pluginType == null) return null;
-
-            // 实例化以读取元数据
-            var plugin = (IModPlugin)Activator.CreateInstance(pluginType)!;
-
-            return new ModEntry
+            NativeModShadowPackage? shadowPackage = null;
+            var metadataAssemblyPath = entryDll;
+            if (NativeModShadowRewriteRuntime.IsEnabled)
             {
-                Id = plugin.Id,
-                Name = plugin.Name,
-                Version = plugin.Version,
-                Author = plugin.Author,
-                Description = plugin.Description,
-                Dependencies = plugin.Dependencies.ToList(),
-                FolderPath = folderPath,
-                EntryPoint = entryDll,
-            };
+                shadowPackage = NativeModShadowPackage.Prepare(
+                    _nativeShadowRoot,
+                    folderPath,
+                    entryDll);
+                metadataAssemblyPath = shadowPackage.EntryAssemblyPath;
+            }
+            NativeModMetadataDescriptor? descriptor = null;
+            if (NativeModMetadataDescriptor.TryRead(
+                    metadataAssemblyPath,
+                    out var staticallyProvenDescriptor,
+                    out var descriptorReason) &&
+                staticallyProvenDescriptor != null)
+            {
+                descriptor = staticallyProvenDescriptor;
+            }
+            else if (nativePluginProven && nativePluginTypeName != null)
+            {
+                // A proven native entry must not fall into LegacyReadOnly merely because an
+                // identity getter uses compiler-generated static data or another opaque but
+                // domain-safe implementation. Info.json is consumed as display metadata only;
+                // with no manifest, the folder name remains the discovery identity. The real
+                // plugin getters run only after BeginLoad has bound the isolated domain.
+                descriptor = NativeModMetadataDescriptor.CreateDiscoveryFallback(
+                    nativePluginTypeName,
+                    parsedPcManifest?.Id ?? dirName,
+                    parsedPcManifest?.DisplayName ?? dirName,
+                    parsedPcManifest?.Version ?? "0.0.0",
+                    parsedPcManifest?.Author ?? string.Empty);
+                Logger.Warn(
+                    nameof(ModLoader),
+                    $"native metadata-only identity unavailable mod={dirName}: " +
+                    $"{descriptorReason ?? "unknown reason"}; using host metadata fallback " +
+                    "and deferring identity getters to isolated load");
+            }
+
+            if (descriptor != null)
+            {
+                var runtimeSession = new ModRuntimeSession();
+                var state = new NativeModLoadState(
+                    descriptor.Id,
+                    descriptor.PluginTypeName,
+                    entryDll,
+                    runtimeSession,
+                    shadowPackage);
+                Logger.Info(
+                    nameof(ModLoader),
+                    $"native metadata-only discovery mod={descriptor.Id} " +
+                    $"type={descriptor.PluginTypeName} " +
+                    (shadowPackage == null
+                        ? "mode=direct "
+                        : $"cache={shadowPackage.CacheKey} ") +
+                    $"metadata={(string.IsNullOrWhiteSpace(descriptorReason) ? "static" : "host-fallback")}");
+                return new ModEntry
+                {
+                    Id = descriptor.Id,
+                    Name = descriptor.Name,
+                    Version = descriptor.Version,
+                    Author = descriptor.Author,
+                    Description = descriptor.Description,
+                    Dependencies = descriptor.Dependencies.ToList(),
+                    FolderPath = folderPath,
+                    EntryPoint = entryDll,
+                    PluginInstance = null,
+                    LoaderData = state,
+                    LoaderKind = ModEntry.NativeLoaderKind,
+                    RuntimeSession = runtimeSession
+                };
+            }
+
+            Logger.Warn(
+                nameof(ModLoader),
+                $"native metadata-only discovery unavailable mod={dirName}: " +
+                $"{descriptorReason ?? "unknown reason"}; native entry was not proven; " +
+                "using LegacyReadOnly discovery");
+            var context = new NativeModAssemblyLoadContext(
+                dirName,
+                metadataAssemblyPath);
+            try
+            {
+                var assembly = context.LoadFromAssemblyPath(metadataAssemblyPath);
+                var pluginType = ResolvePluginType(assembly);
+                if (pluginType == null)
+                {
+                    context.Unload();
+                    return null;
+                }
+
+                // Metadata discovery and actual loading share this one instance. This prevents
+                // constructors and static registration from running once during scan and again
+                // during enable.
+                var plugin = (IModPlugin)Activator.CreateInstance(pluginType)!;
+                context.ReconcileObservedUnmanagedLibraries();
+                var runtimeSession = new ModRuntimeSession();
+                var state = new NativeModLoadState(
+                    entryDll,
+                    context,
+                    assembly,
+                    plugin,
+                    runtimeSession,
+                    shadowPackage);
+                Logger.Info(
+                    nameof(ModLoader),
+                    shadowPackage == null
+                        ? $"native direct package mod={plugin.Id}"
+                        : $"native shadow package mod={plugin.Id} cache={shadowPackage.CacheKey} " +
+                          $"hit={(shadowPackage.CacheHit ? 1 : 0)} " +
+                          $"assemblies={shadowPackage.Assemblies.Count}");
+                return new ModEntry
+                {
+                    Id = plugin.Id,
+                    Name = plugin.Name,
+                    Version = plugin.Version,
+                    Author = plugin.Author,
+                    Description = plugin.Description,
+                    Dependencies = plugin.Dependencies.ToList(),
+                    FolderPath = folderPath,
+                    EntryPoint = entryDll,
+                    PluginInstance = plugin,
+                    LoaderData = state,
+                    LoaderKind = ModEntry.NativeLoaderKind,
+                    RuntimeSession = runtimeSession
+                };
+            }
+            catch
+            {
+                context.Unload();
+                throw;
+            }
         }
         catch (Exception ex)
         {
-            Logger.Error(nameof(ModLoader), L10n.Get("Log_ModAssemblyError", dirName, ex.Message));
+            LogDiscoveryFailure(dirName, ex);
             return null;
         }
     }
@@ -301,6 +589,13 @@ public class ModLoader
     /// </summary>
     public bool LoadMod(ModEntry mod)
     {
+        lock (_transitionGate)
+        lock (_transitionLocks.GetValue(mod, static _ => new object()))
+            return LoadModCore(mod);
+    }
+
+    private bool LoadModCore(ModEntry mod)
+    {
         if (mod.LoadState == ModLoadState.Loaded)
         {
             Logger.Info(nameof(ModLoader), L10n.Get("Log_ModAlreadyLoaded", mod.Name));
@@ -309,23 +604,158 @@ public class ModLoader
         if (mod.LoadState == ModLoadState.Loading)
             return true;
 
+        var runtimeSnapshot = mod.RuntimeSession.Snapshot();
+        if (runtimeSnapshot.State == ModRuntimeLifecycleState.Active)
+        {
+            // A rescan or a notification failure can leave a fresh ModEntry carrying a
+            // generation that was already published. Never call BeginLoad again: that would
+            // either duplicate hooks or produce the misleading "state=Active" failure.
+            if (mod.PluginInstance == null)
+            {
+                mod.LoadState = ModLoadState.Error;
+                mod.IsEnabled = false;
+                mod.LoadStage = "ActiveRuntimeWithoutPlugin";
+                mod.LoadError =
+                    $"MOD runtime is already active but plugin instance is unavailable " +
+                    $"generation={runtimeSnapshot.Key.Generation}; restart the app before retrying.";
+                Logger.Error(nameof(ModLoader),
+                    $"active runtime has no plugin instance mod={mod.Id} " +
+                    $"generation={runtimeSnapshot.Key.Generation}");
+                NotifyModStateChanged(mod);
+                return false;
+            }
+
+            mod.IsEnabled = true;
+            mod.LoadState = ModLoadState.Loaded;
+            mod.LoadError = null;
+            mod.LoadProgress = 1;
+            mod.LoadStage = "Ready";
+            Logger.Warn(nameof(ModLoader),
+                $"reconciled already-active MOD runtime mod={mod.Id} " +
+                $"generation={runtimeSnapshot.Key.Generation}; duplicate load ignored");
+            NotifyModStateChanged(mod);
+            return true;
+        }
+
+        if (runtimeSnapshot.State is
+                ModRuntimeLifecycleState.Retiring or
+                ModRuntimeLifecycleState.Quiescing)
+        {
+            mod.IsEnabled = false;
+            mod.LoadStage = "Transitioning";
+            mod.LoadError =
+                $"MOD runtime is still transitioning state={runtimeSnapshot.State} " +
+                $"generation={runtimeSnapshot.Key.Generation}; retry after it finishes.";
+            Logger.Warn(nameof(ModLoader),
+                $"load rejected during runtime transition mod={mod.Id} " +
+                $"state={runtimeSnapshot.State} generation={runtimeSnapshot.Key.Generation}");
+            NotifyModStateChanged(mod);
+            return false;
+        }
+
+        HookHelper.ResumeProcessLifetimeHookRegistration(mod.RuntimeOwnerId);
         if (mod.LoadState == ModLoadState.NotLoaded &&
             mod.PluginInstance != null &&
-            HookHelper.HasProcessLifetimeHooks(mod.Id))
+            HookHelper.HasProcessLifetimeHooks(mod.RuntimeKey))
         {
+            try
+            {
+                VerifyRetainedIsolationManifest(mod);
+            }
+            catch (Exception ex)
+            {
+                mod.LoadState = ModLoadState.NotLoaded;
+                mod.IsEnabled = false;
+                mod.LoadError = ex.Message;
+                mod.LoadStage = "Suspended";
+                Logger.Warn(
+                    nameof(ModLoader),
+                    $"{mod.Name} retained generation cannot resume after isolation identity change: " +
+                    ToSingleLine(ex.Message));
+                NotifyModStateChanged(mod);
+                return false;
+            }
+            if (!mod.RuntimeSession.TryResume(out var resumedKey))
+            {
+                var snapshot = mod.RuntimeSession.Snapshot();
+                Logger.Warn(
+                    nameof(ModLoader),
+                    $"{mod.Name} cannot resume runtime state={snapshot.State} " +
+                    $"generation={snapshot.Key.Generation} callbacks={snapshot.ActiveCallbacks} " +
+                    $"operations={snapshot.ActiveOperations}");
+                return false;
+            }
+            if (!HookHelper.ResumeNativeOperationGeneration(resumedKey))
+            {
+                if (mod.RuntimeSession.TryBeginRetirement(resumedKey) &&
+                    mod.RuntimeSession.WaitForQuiescence(resumedKey, TimeSpan.Zero))
+                {
+                    mod.RuntimeSession.TryCompleteSuspension(resumedKey);
+                }
+                Logger.Warn(
+                    nameof(ModLoader),
+                    $"{mod.Name} cannot resume native operation generation=" +
+                    resumedKey.Generation);
+                return false;
+            }
+            HookHelper.ResumeProcessLifetimeHooks(resumedKey);
+            BehaviourManager.ResumeOwner(mod.RuntimeOwnerId);
             mod.IsEnabled = true;
             mod.LoadState = ModLoadState.Loaded;
             mod.LoadError = null;
             mod.LoadProgress = 1;
             mod.LoadStage = string.Empty;
-            Logger.Info(nameof(ModLoader), $"{mod.Name} resumed with process-lifetime native hooks");
-            OnModStateChanged?.Invoke(mod);
+            Logger.Info(
+                nameof(ModLoader),
+                $"{mod.Name} resumed with process-lifetime native hooks " +
+                $"generation={resumedKey.Generation}");
+            NotifyModStateChanged(mod);
             return true;
+        }
+
+        var runtimeKey = default(ModRuntimeKey);
+        try
+        {
+            runtimeKey = mod.RuntimeSession.BeginLoad(mod.LoaderKind, mod.Id);
+            if (!mod.RuntimeSession.TrySetTrustedDependencies(runtimeKey, mod.Dependencies))
+            {
+                mod.RuntimeSession.TryAbortLoad(runtimeKey);
+                throw new InvalidOperationException(
+                    $"MOD dependency metadata could not be bound to generation={runtimeKey.Generation}.");
+            }
+            EnsureNativeShadowState(mod);
+            BindBootstrapIsolationManifest(mod, runtimeKey);
+            if (mod.LoaderData is NativeModLoadState nativeState)
+                nativeState.BindRuntimeKey(runtimeKey);
+            if (!HookHelper.OpenNativeOperationGeneration(runtimeKey))
+            {
+                mod.RuntimeSession.TryAbortLoad(runtimeKey);
+                throw new InvalidOperationException(
+                    $"Native operation generation could not open for {mod.Id} " +
+                    $"generation={runtimeKey.Generation}.");
+            }
+        }
+        catch (Exception ex)
+        {
+            if (runtimeKey.IsValid)
+                mod.RuntimeSession.TryAbortLoad(runtimeKey);
+            if (mod.LoaderData is NativeModLoadState failedNativeState &&
+                (!runtimeKey.IsValid || !HookHelper.HasProcessLifetimeHooks(runtimeKey)))
+            {
+                failedNativeState.ReleaseContext();
+                mod.PluginInstance = null;
+            }
+            mod.LoadState = ModLoadState.Error;
+            mod.LoadError = ex.Message;
+            LogLoadFailure(mod, ex);
+            NotifyModStateChanged(mod);
+            return false;
         }
 
         mod.LoadState = ModLoadState.Loading;
         mod.LoadError = null;
-        OnModStateChanged?.Invoke(mod);
+        NotifyModStateChanged(mod);
+        var pluginLifecycleStarted = false;
 
         try
         {
@@ -352,7 +782,11 @@ public class ModLoader
 
                 if (plugin is IAsyncModPlugin asyncPlugin)
                 {
-                    using (HookHelper.EnterOwnerScope(mod.Id))
+                    pluginLifecycleStarted = true;
+                    using (HookHelper.EnterOwnerScope(
+                               mod.RuntimeOwnerId,
+                               mod.RuntimeSession,
+                               runtimeKey))
                         asyncPlugin.BeginLoad();
                     Interlocked.Increment(ref _pendingAsyncLoadCount);
                     try
@@ -368,14 +802,45 @@ public class ModLoader
                     Logger.Info(
                         nameof(ModLoader),
                         L10n.Get("Log_PcCompatBackgroundStarted", mod.Name));
-                    OnModStateChanged?.Invoke(mod);
+                    NotifyModStateChanged(mod);
                     return true;
                 }
 
-                using (HookHelper.EnterOwnerScope(mod.Id))
+                pluginLifecycleStarted = true;
+                using (HookHelper.EnterOwnerScope(
+                           mod.RuntimeOwnerId,
+                           mod.RuntimeSession,
+                           runtimeKey))
                     plugin.OnLoad();
                 MarkLoaded(mod, L10n.Get("Log_PcCompatLoadSuccess", mod.Name));
-                OnModStateChanged?.Invoke(mod);
+                NotifyModStateChanged(mod);
+                return true;
+            }
+
+            if (mod.LoaderData is NativeModLoadState nativeState)
+            {
+                // ReleaseContext deliberately keeps the entry descriptor. A later enable must
+                // create a fresh collectible ALC instead of falling through to Assembly.LoadFrom.
+                using (HookHelper.EnterOwnerScope(
+                           mod.RuntimeOwnerId,
+                           mod.RuntimeSession,
+                           runtimeKey))
+                {
+                    var plugin = nativeState.EnsureLoaded(
+                        mod.RuntimeSession.SnapshotIsolationManifest().Manifest);
+                    mod.PluginInstance = plugin;
+                    pluginLifecycleStarted = true;
+                    plugin.OnLoad();
+                }
+
+                if (mod.PluginInstance is IModSettings settings)
+                    ModManagerUI.LoadSettings(mod, settings);
+
+                Logger.Info(nameof(ModLoader),
+                    L10n.Get("Log_ModEntryExecuted", mod.Name) +
+                    $" context={nativeState.Assembly?.GetName().Name}");
+                MarkLoaded(mod, L10n.Get("Log_ModLoadSuccess", mod.Name));
+                NotifyModStateChanged(mod);
                 return true;
             }
 
@@ -393,7 +858,11 @@ public class ModLoader
                 {
                     var plugin = (IModPlugin)Activator.CreateInstance(pluginType)!;
                     mod.PluginInstance = plugin;
-                    using (HookHelper.EnterOwnerScope(mod.Id))
+                    pluginLifecycleStarted = true;
+                    using (HookHelper.EnterOwnerScope(
+                               mod.RuntimeOwnerId,
+                               mod.RuntimeSession,
+                               runtimeKey))
                         plugin.OnLoad();
 
                     if (plugin is IModSettings s)
@@ -407,18 +876,18 @@ public class ModLoader
                 Logger.Info(nameof(ModLoader), L10n.Get("Log_ModNoEntry", mod.Name));
             }
 
-            mod.IsEnabled = true;
-            mod.LoadState = ModLoadState.Loaded;
-            Logger.Info(nameof(ModLoader), L10n.Get("Log_ModLoadSuccess", mod.Name));
+            MarkLoaded(mod, L10n.Get("Log_ModLoadSuccess", mod.Name));
         }
         catch (Exception ex)
         {
-            mod.LoadState = ModLoadState.Error;
-            mod.LoadError = ex.Message;
-            LogLoadFailure(mod, ex);
+            HandleLoadFailure(
+                mod,
+                runtimeKey,
+                ex,
+                pluginLifecycleStarted);
         }
 
-        OnModStateChanged?.Invoke(mod);
+        NotifyModStateChanged(mod);
         return mod.LoadState == ModLoadState.Loaded;
     }
 
@@ -427,29 +896,89 @@ public class ModLoader
     /// </summary>
     public void UnloadMod(ModEntry mod)
     {
+        lock (_transitionGate)
+        lock (_transitionLocks.GetValue(mod, static _ => new object()))
+            UnloadModCore(mod);
+    }
+
+    private void UnloadModCore(ModEntry mod)
+    {
         if (mod.LoadState is not (ModLoadState.Loaded or ModLoadState.Loading)) return;
 
-        var hasProcessLifetimeHooks = HookHelper.HasProcessLifetimeHooks(mod.Id);
+        var runtimeKey = mod.EnsureRuntimeActive();
+        var runtimeStateBeforeRetirement = mod.RuntimeSession.Snapshot().State;
+        if (!mod.RuntimeSession.TryBeginRetirement(runtimeKey))
+        {
+            var snapshot = mod.RuntimeSession.Snapshot();
+            throw new InvalidOperationException(
+                $"MOD runtime retirement rejected state={snapshot.State} " +
+                $"generation={snapshot.Key.Generation} callbacks={snapshot.ActiveCallbacks} " +
+                $"operations={snapshot.ActiveOperations}.");
+        }
+        HookHelper.BlockProcessLifetimeHookRegistration(mod.RuntimeOwnerId);
+        var hasProcessLifetimeHooks = HookHelper.HasProcessLifetimeHooks(runtimeKey);
+        var hasUntrackedProcessLifetimeCallbacks =
+            HookHelper.HasUntrackedProcessLifetimeCallbacks(runtimeKey);
         var supportsLogicalRetirement =
-            mod.PluginInstance is ILogicalProcessLifetimeHookRetirement;
+            !hasUntrackedProcessLifetimeCallbacks &&
+            (mod.PluginInstance is ILogicalProcessLifetimeHookRetirement ||
+             HookHelper.SupportsOwnerScopedHookLifecycle);
         Logger.Info(
             nameof(ModLoader),
             $"[DEBUG-kv-unload-v1] request mod={mod.Id} state={mod.LoadState} " +
             $"enabled={mod.IsEnabled} processHooks={hasProcessLifetimeHooks} " +
+            $"untrackedCallbacks={hasUntrackedProcessLifetimeCallbacks} " +
             $"logicalRetire={supportsLogicalRetirement} " +
             $"plugin={mod.PluginInstance?.GetType().FullName ?? "<null>"} " +
             $"tid={Environment.CurrentManagedThreadId}");
+
+        try
+        {
+            EnsureNativeOperationsQuiesced(mod, runtimeKey);
+        }
+        catch
+        {
+            mod.RuntimeSession.TryCancelRetirement(
+                runtimeKey,
+                runtimeStateBeforeRetirement);
+            HookHelper.ResumeProcessLifetimeHookRegistration(mod.RuntimeOwnerId);
+            HookHelper.ResumeNativeOperationGeneration(runtimeKey);
+            throw;
+        }
 
         if (hasProcessLifetimeHooks && !supportsLogicalRetirement)
         {
             if (mod.LoadState == ModLoadState.Loading)
             {
+                mod.RuntimeSession.TryCancelRetirement(
+                    runtimeKey,
+                    runtimeStateBeforeRetirement);
+                HookHelper.ResumeProcessLifetimeHookRegistration(mod.RuntimeOwnerId);
+                HookHelper.ResumeNativeOperationGeneration(runtimeKey);
                 Logger.Warn(
                     nameof(ModLoader),
                     $"{mod.Name} cannot be cancelled after installing process-lifetime native hooks");
                 return;
             }
 
+            try
+            {
+                EnsureProcessLifetimeHooksSuspended(mod, runtimeKey);
+                EnsureRuntimeCallbacksQuiesced(mod, runtimeKey);
+            }
+            catch
+            {
+                mod.RuntimeSession.TryCancelRetirement(
+                    runtimeKey,
+                    runtimeStateBeforeRetirement);
+                HookHelper.ResumeProcessLifetimeHookRegistration(mod.RuntimeOwnerId);
+                HookHelper.ResumeProcessLifetimeHooks(runtimeKey);
+                HookHelper.ResumeNativeOperationGeneration(runtimeKey);
+                throw;
+            }
+            BehaviourManager.SuspendOwner(mod.RuntimeOwnerId);
+            if (!mod.RuntimeSession.TryCompleteSuspension(runtimeKey))
+                throw new InvalidOperationException("MOD runtime suspension could not be committed.");
             mod.IsEnabled = false;
             mod.LoadState = ModLoadState.NotLoaded;
             mod.LoadProgress = 0;
@@ -460,7 +989,8 @@ public class ModLoader
                 $"[DEBUG-kv-unload-v1] route=suspend mod={mod.Id} reason=process-lifetime-hooks " +
                 $"tid={Environment.CurrentManagedThreadId}; {mod.Name} suspended without OnUnload; " +
                 "native hooks and delegate roots remain until restart");
-            OnModStateChanged?.Invoke(mod);
+            LogOwnedResourceAudit("suspend");
+            NotifyModStateChanged(mod);
             return;
         }
 
@@ -469,6 +999,23 @@ public class ModLoader
             asyncPlugin.CancelLoad();
         if (wasLoading)
             CompletePendingAsyncLoad();
+        try
+        {
+            if (hasProcessLifetimeHooks)
+                EnsureProcessLifetimeHooksSuspended(mod, runtimeKey);
+            EnsureRuntimeCallbacksQuiesced(mod, runtimeKey);
+        }
+        catch
+        {
+            mod.RuntimeSession.TryCancelRetirement(
+                runtimeKey,
+                runtimeStateBeforeRetirement);
+            HookHelper.ResumeProcessLifetimeHookRegistration(mod.RuntimeOwnerId);
+            if (hasProcessLifetimeHooks)
+                HookHelper.ResumeProcessLifetimeHooks(runtimeKey);
+            HookHelper.ResumeNativeOperationGeneration(runtimeKey);
+            throw;
+        }
         if (mod.PluginInstance != null)
         {
             Logger.Info(
@@ -477,11 +1024,21 @@ public class ModLoader
                 $"tid={Environment.CurrentManagedThreadId}");
             try
             {
-                using (HookHelper.EnterOwnerScope(mod.Id))
+                using (HookHelper.EnterOwnerScope(
+                           mod.RuntimeOwnerId,
+                           mod.RuntimeSession,
+                           runtimeKey))
                     mod.PluginInstance.OnUnload();
             }
             catch (Exception exception)
             {
+                mod.RuntimeSession.TryCancelRetirement(
+                    runtimeKey,
+                    runtimeStateBeforeRetirement);
+                HookHelper.ResumeProcessLifetimeHookRegistration(mod.RuntimeOwnerId);
+                if (hasProcessLifetimeHooks)
+                    HookHelper.ResumeProcessLifetimeHooks(runtimeKey);
+                HookHelper.ResumeNativeOperationGeneration(runtimeKey);
                 Logger.Error(
                     nameof(ModLoader),
                     $"[DEBUG-kv-unload-v1] route=onunload-failed mod={mod.Id} " +
@@ -493,15 +1050,67 @@ public class ModLoader
                 $"[DEBUG-kv-unload-v1] route=onunload-complete mod={mod.Id} " +
                 $"tid={Environment.CurrentManagedThreadId}");
         }
-        mod.PluginInstance = mod.LoaderData is PcModManifest manifest
-            ? new PcCompatModPlugin(manifest)
-            : null;
+        if (hasProcessLifetimeHooks)
+            EnsureProcessLifetimeHooksSuspended(mod, runtimeKey);
+        hasProcessLifetimeHooks = HookHelper.HasProcessLifetimeHooks(runtimeKey);
+        if (hasProcessLifetimeHooks)
+            BehaviourManager.SuspendOwner(mod.RuntimeOwnerId);
+        else
+        {
+            EnsureNativeOperationGenerationRetired(mod, runtimeKey);
+            BehaviourManager.RetireOwner(mod.RuntimeOwnerId);
+            ModOwnedResourceRegistry.Retire(runtimeKey);
+            // Drop this generation's UI fault/quarantine bookkeeping so a reload starts clean.
+            UiOwnerScope.Release(mod.RuntimeOwnerId, runtimeKey.Generation);
+            // Direct Link: drop links on both sides so a retired generation can neither be
+            // entered as a Provider nor keep driving one as a Consumer.
+            ModDirectLinkGate.ReleaseLinksFor(runtimeKey);
+        }
+        if (mod.LoaderData is NativeModLoadState nativeState)
+        {
+            if (hasProcessLifetimeHooks)
+            {
+                Logger.Warn(nameof(ModLoader),
+                    $"native MOD context retained after logical unload: {mod.Id}");
+                mod.PluginInstance = nativeState.Plugin;
+            }
+            else
+            {
+                if (mod.PluginInstance is IDisposable disposable)
+                    disposable.Dispose();
+                nativeState.ReleaseContext();
+                mod.PluginInstance = null;
+            }
+        }
+        else
+        {
+            mod.PluginInstance = mod.LoaderData is PcModManifest manifest
+                ? new PcCompatModPlugin(manifest)
+                : null;
+        }
+        var runtimeTransitionCommitted = hasProcessLifetimeHooks
+            ? mod.RuntimeSession.TryCompleteSuspension(runtimeKey)
+            : mod.RuntimeSession.TryCompleteRetirement(runtimeKey);
+        if (!runtimeTransitionCommitted)
+            throw new InvalidOperationException("MOD runtime retirement could not be committed.");
         mod.IsEnabled = false;
         mod.LoadState = ModLoadState.NotLoaded;
         mod.LoadProgress = 0;
         mod.LoadStage = string.Empty;
         Logger.Info(nameof(ModLoader), L10n.Get("Log_ModUnloaded", mod.Name));
-        OnModStateChanged?.Invoke(mod);
+        LogOwnedResourceAudit("unload");
+        NotifyModStateChanged(mod);
+    }
+
+    private void LogOwnedResourceAudit(string reason)
+    {
+        var audit = SnapshotOwnedResourceAudit();
+        var report = $"reason={reason}{Environment.NewLine}" +
+                     audit.ToDiagnosticText(includeResources: false).TrimEnd();
+        if (audit.HasLeaks)
+            Logger.Error(nameof(ModLoader), report);
+        else
+            Logger.Info(nameof(ModLoader), report);
     }
 
     /// <summary>
@@ -518,6 +1127,15 @@ public class ModLoader
     /// <summary>在 UI/Unity 主线程轮询异步 MOD，并执行需要主线程语义的收尾。</summary>
     public void UpdatePendingLoads()
     {
+        lock (_transitionGate)
+        {
+            UpdatePendingLoadsCore();
+            return;
+        }
+    }
+
+    private void UpdatePendingLoadsCore()
+    {
         if (Interlocked.Exchange(ref _pendingLoadUpdateActive, 1) != 0)
             return;
 
@@ -532,60 +1150,67 @@ public class ModLoader
 
             foreach (var mod in _pendingLoads)
             {
-                if (mod.PluginInstance is not IAsyncModPlugin asyncPlugin)
-                    continue;
-
-                UpdateLoadProgress(mod, asyncPlugin);
-                if (!asyncPlugin.IsLoadReady)
-                    continue;
-
-                // UnloadMod runs on the UI thread while this pass runs on the
-                // platform completion thread. Re-verify that the entry is still
-                // waiting for this exact plugin before installing anything;
-                // UnloadMod already accounted the pending count in that case.
-                if (mod.LoadState != ModLoadState.Loading ||
-                    !ReferenceEquals(mod.PluginInstance, asyncPlugin))
-                    continue;
-
-                try
+                lock (_transitionLocks.GetValue(mod, static _ => new object()))
                 {
-                    using (HookHelper.EnterOwnerScope(mod.Id))
-                        asyncPlugin.CompleteLoad();
-                    if (mod.LoadState == ModLoadState.Loading &&
-                        ReferenceEquals(mod.PluginInstance, asyncPlugin))
-                    {
-                        MarkLoaded(mod, L10n.Get("Log_PcCompatLoadSuccess", mod.Name));
-                    }
-                    else
-                    {
-                        UnwindStaleCompletion(mod);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    if (mod.LoadState == ModLoadState.Loading &&
-                        ReferenceEquals(mod.PluginInstance, asyncPlugin))
-                    {
-                        mod.LoadState = ModLoadState.Error;
-                        mod.IsEnabled = false;
-                        mod.LoadProgress = 1;
-                        mod.LoadStage = "Failed";
-                        mod.LoadError = ex.Message;
-                        LogLoadFailure(mod, ex);
-                    }
-                    else
-                    {
-                        Logger.Info(
-                            nameof(ModLoader),
-                            L10n.Get("Log_StaleCompletionIgnored", mod.Name, ex.Message));
-                    }
-                }
-                finally
-                {
-                    CompletePendingAsyncLoad();
-                }
+                    if (mod.PluginInstance is not IAsyncModPlugin asyncPlugin)
+                        continue;
 
-                OnModStateChanged?.Invoke(mod);
+                    UpdateLoadProgress(mod, asyncPlugin);
+                    if (!asyncPlugin.IsLoadReady)
+                        continue;
+
+                    // UnloadMod runs on the UI thread while this pass runs on the
+                    // platform completion thread. Re-verify that the entry is still
+                    // waiting for this exact plugin before installing anything;
+                    // UnloadMod already accounted the pending count in that case.
+                    if (mod.LoadState != ModLoadState.Loading ||
+                        !ReferenceEquals(mod.PluginInstance, asyncPlugin))
+                        continue;
+
+                    try
+                    {
+                        var runtimeKey = mod.EnsureRuntimeLoading();
+                        using (HookHelper.EnterOwnerScope(
+                                   mod.RuntimeOwnerId,
+                                   mod.RuntimeSession,
+                                   runtimeKey))
+                            asyncPlugin.CompleteLoad();
+                        if (mod.LoadState == ModLoadState.Loading &&
+                            ReferenceEquals(mod.PluginInstance, asyncPlugin))
+                        {
+                            MarkLoaded(mod, L10n.Get("Log_PcCompatLoadSuccess", mod.Name));
+                        }
+                        else
+                        {
+                            UnwindStaleCompletion(mod);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        if (mod.LoadState == ModLoadState.Loading &&
+                            ReferenceEquals(mod.PluginInstance, asyncPlugin))
+                        {
+                            HandleLoadFailure(
+                                mod,
+                                mod.RuntimeKey,
+                                ex,
+                                pluginLifecycleStarted: true);
+                            mod.LoadProgress = 1;
+                        }
+                        else
+                        {
+                            Logger.Info(
+                                nameof(ModLoader),
+                                L10n.Get("Log_StaleCompletionIgnored", mod.Name, ex.Message));
+                        }
+                    }
+                    finally
+                    {
+                        CompletePendingAsyncLoad();
+                    }
+
+                    NotifyModStateChanged(mod);
+                }
             }
         }
         finally
@@ -631,12 +1256,52 @@ public class ModLoader
         }
     }
 
+    private void NotifyModStateChanged(ModEntry mod)
+    {
+        try
+        {
+            OnModStateChanged?.Invoke(mod);
+        }
+        catch (Exception exception)
+        {
+            // State observers are UI/configuration observers. They must not turn an already
+            // published runtime into a failed load or cause a second BeginLoad on retry.
+            Logger.Warn(
+                nameof(ModLoader),
+                $"MOD state observer failed id={mod.Id} state={mod.LoadState}: " +
+                $"{exception.GetType().Name}: {ToSingleLine(exception.Message)}");
+        }
+    }
+
     private static void LogLoadFailure(ModEntry mod, Exception exception)
     {
+        Logger.Error(
+            nameof(ModLoader),
+            FormatExceptionChain(exception, $"load-failure mod={mod.Id}"));
+    }
+
+    private static void LogDiscoveryFailure(string modId, Exception exception)
+    {
+        var headline = L10n.Get(
+            "Log_ModAssemblyError",
+            modId,
+            ToSingleLine(exception.Message));
+        Logger.Error(
+            nameof(ModLoader),
+            $"{headline} {FormatExceptionChain(exception, $"discovery-failure mod={modId}")}");
+    }
+
+    private static string FormatExceptionChain(Exception exception, string prefix)
+    {
         const int maxLogcatChars = 2800;
+        const int maxExceptionDepth = 32;
         var chain = new List<Exception>(4);
-        for (Exception? current = exception; current != null; current = current.InnerException)
+        for (Exception? current = exception;
+             current != null && chain.Count < maxExceptionDepth;
+             current = current.InnerException)
+        {
             chain.Add(current);
+        }
 
         var root = chain[^1];
         var rootFrame = root.StackTrace?
@@ -644,7 +1309,7 @@ public class ModLoader
             .Select(frame => frame.Trim())
             .FirstOrDefault();
         var summary = new StringBuilder(512)
-            .Append("load-failure mod=").Append(mod.Id)
+            .Append(prefix)
             .Append(" root=").Append(root.GetType().FullName)
             .Append(": ").Append(ToSingleLine(root.Message))
             .Append(" chain=");
@@ -658,6 +1323,8 @@ public class ModLoader
                 .Append(ToSingleLine(chain[i].Message));
         }
 
+        if (chain.Count == maxExceptionDepth && root.InnerException != null)
+            summary.Append(" -> <exception-chain-truncated>");
         if (!string.IsNullOrWhiteSpace(rootFrame))
             summary.Append(" rootAt=").Append(ToSingleLine(rootFrame));
 
@@ -667,7 +1334,7 @@ public class ModLoader
             summary.Append("...");
         }
 
-        Logger.Error(nameof(ModLoader), summary.ToString());
+        return summary.ToString();
     }
 
     private static string ToSingleLine(string? value)
@@ -682,8 +1349,233 @@ public class ModLoader
         mod.LoadStage = progress.Stage;
     }
 
+    private void EnsureNativeShadowState(ModEntry mod)
+    {
+        if (!string.Equals(mod.LoaderKind, ModEntry.NativeLoaderKind, StringComparison.Ordinal) ||
+            string.IsNullOrWhiteSpace(mod.EntryPoint) ||
+            !File.Exists(mod.EntryPoint) ||
+            !NativeModShadowRewriteRuntime.IsEnabled)
+        {
+            return;
+        }
+
+        var entryPath = Path.GetFullPath(mod.EntryPoint);
+        var sourceDirectory = Path.GetDirectoryName(entryPath)
+                              ?? throw new InvalidDataException(
+                                  "Native MOD entry assembly has no parent directory.");
+        if (mod.LoaderData is NativeModLoadState { ShadowPackage: { } existingPackage })
+        {
+            var currentIdentity = ModIsolationManifestFactory.ReadAssemblyIdentity(entryPath);
+            if (!ModIsolationManifestFactory.MatchesAssemblyIdentity(
+                    existingPackage.OriginalEntryIdentity,
+                    currentIdentity))
+            {
+                throw new InvalidDataException(
+                    $"Native MOD source changed after discovery: {mod.Id}; " +
+                    "rescan the MOD directory before loading.");
+            }
+        }
+        var shadowPackage = NativeModShadowPackage.Prepare(
+            _nativeShadowRoot,
+            sourceDirectory,
+            entryPath);
+        if (!ModDataDomainRegistry.TryResolve(
+                mod.RuntimeSession.DomainToken,
+                out var domain))
+        {
+            throw new InvalidOperationException(
+                $"Native MOD data domain is unavailable while binding shadow paths: {mod.Id}.");
+        }
+        domain.BindOriginalAssemblyLocations(shadowPackage.OriginalAssemblyLocations);
+        domain.BindPathRoots(BuildDomainPathRoots(mod.Id, sourceDirectory));
+        if (mod.LoaderData is NativeModLoadState state)
+        {
+            state.BindShadowPackage(shadowPackage);
+            mod.PluginInstance = state.Plugin;
+            return;
+        }
+
+        var created = new NativeModLoadState(
+            mod.Id,
+            null,
+            entryPath,
+            mod.RuntimeSession,
+            shadowPackage);
+        mod.LoaderData = created;
+        mod.PluginInstance = null;
+    }
+
+    private static void BindBootstrapIsolationManifest(
+        ModEntry mod,
+        ModRuntimeKey runtimeKey)
+    {
+        if (string.IsNullOrWhiteSpace(mod.EntryPoint) || !File.Exists(mod.EntryPoint))
+            return;
+
+        var manifestPath = Path.Combine(mod.FolderPath, "isolation.json");
+        var manifest = File.Exists(manifestPath)
+            ? ModIsolationManifest.Read(manifestPath)
+            : ModIsolationManifestFactory.CreateBootstrap(
+                mod.Id,
+                mod.LoaderKind,
+                mod.EntryPoint);
+        var actualIdentity = ModIsolationManifestFactory.ReadAssemblyIdentity(mod.EntryPoint);
+        if (!ModIsolationManifestFactory.MatchesAssemblyIdentity(
+                manifest.OriginalAssembly,
+                actualIdentity))
+        {
+            throw new InvalidDataException(
+                $"MOD isolation manifest does not match entry assembly: mod={mod.Id} " +
+                $"manifest={manifest.OriginalAssembly.ModuleVersionId}/" +
+                $"{manifest.OriginalAssembly.Sha256} " +
+                $"actual={actualIdentity.ModuleVersionId}/{actualIdentity.Sha256}.");
+        }
+        if (mod.LoaderData is NativeModLoadState { ShadowPackage: { } shadowPackage })
+        {
+            shadowPackage.Verify();
+            if (!ModIsolationManifestFactory.MatchesAssemblyIdentity(
+                    shadowPackage.OriginalEntryIdentity,
+                    actualIdentity))
+            {
+                throw new InvalidDataException(
+                    $"Native MOD source changed after shadow package preparation: {mod.Id}; " +
+                    "rescan the MOD directory before loading.");
+            }
+            if (manifest.ShadowAssembly != null &&
+                !ModIsolationManifestFactory.MatchesAssemblyIdentity(
+                    manifest.ShadowAssembly,
+                    shadowPackage.EntryIdentity))
+            {
+                throw new InvalidDataException(
+                    $"MOD isolation manifest shadow identity does not match the verified package: " +
+                    $"{mod.Id}.");
+            }
+            manifest = manifest with
+            {
+                ShadowAssembly = shadowPackage.EntryIdentity,
+                StaticMembers = MergeShadowStaticMembers(
+                    manifest.StaticMembers,
+                    shadowPackage.StaticMembers)
+            };
+        }
+        if (!mod.RuntimeSession.TryBindIsolationManifest(
+                runtimeKey,
+                manifest,
+                out var manifestHash))
+        {
+            throw new InvalidOperationException(
+                $"MOD isolation manifest could not bind for {mod.Id} " +
+                $"generation={runtimeKey.Generation}.");
+        }
+        Logger.Info(
+            nameof(ModLoader),
+            $"isolation manifest bound mod={mod.Id} generation={runtimeKey.Generation} " +
+            $"hash={manifestHash} level={ModIsolationCapabilityLevel.Guarded}");
+    }
+
+    private static void VerifyRetainedIsolationManifest(ModEntry mod)
+    {
+        var snapshot = mod.RuntimeSession.SnapshotIsolationManifest();
+        if (snapshot.Manifest is null || string.IsNullOrWhiteSpace(mod.EntryPoint) ||
+            !File.Exists(mod.EntryPoint))
+        {
+            return;
+        }
+
+        var manifestPath = Path.Combine(mod.FolderPath, "isolation.json");
+        var current = File.Exists(manifestPath)
+            ? ModIsolationManifest.Read(manifestPath)
+            : ModIsolationManifestFactory.CreateBootstrap(
+                mod.Id,
+                mod.LoaderKind,
+                mod.EntryPoint);
+        var actualIdentity = ModIsolationManifestFactory.ReadAssemblyIdentity(mod.EntryPoint);
+        if (mod.LoaderData is NativeModLoadState { ShadowPackage: { } shadowPackage })
+        {
+            shadowPackage.Verify();
+            if (!ModIsolationManifestFactory.MatchesAssemblyIdentity(
+                    shadowPackage.OriginalEntryIdentity,
+                    actualIdentity))
+            {
+                throw new InvalidDataException(
+                    $"Native MOD source no longer matches its retained shadow package: {mod.Id}.");
+            }
+            current = current with
+            {
+                ShadowAssembly = shadowPackage.EntryIdentity,
+                StaticMembers = MergeShadowStaticMembers(
+                    current.StaticMembers,
+                    shadowPackage.StaticMembers)
+            };
+        }
+        if (!ModIsolationManifestFactory.MatchesAssemblyIdentity(
+                current.OriginalAssembly,
+                actualIdentity) ||
+            !ModIsolationManifestFactory.MatchesAssemblyIdentity(
+                snapshot.Manifest.OriginalAssembly,
+                actualIdentity) ||
+            !string.Equals(
+                current.ComputeManifestHash(),
+                snapshot.Hash,
+                StringComparison.Ordinal))
+        {
+            throw new InvalidDataException(
+                $"retained MOD isolation manifest changed for {mod.Id}; " +
+                "unload and reload the MOD to establish a new generation.");
+        }
+    }
+
+    private static IReadOnlyList<ModIsolationStaticMemberRecord> MergeShadowStaticMembers(
+        IReadOnlyList<ModIsolationStaticMemberRecord> declared,
+        IReadOnlyList<ModIsolationStaticMemberRecord> rewritten)
+    {
+        if (rewritten.Count == 0)
+            return declared;
+
+        var merged = declared.ToDictionary(
+            member => member.MemberIdentity,
+            StringComparer.Ordinal);
+        foreach (var member in rewritten)
+        {
+            if (merged.TryGetValue(member.MemberIdentity, out var existing))
+            {
+                if (existing.StaticSlotId != member.StaticSlotId ||
+                    existing.Classification != ModStaticStateClassification.DomainMutable)
+                {
+                    throw new InvalidDataException(
+                        $"Isolation manifest static classification does not match shadow rewrite: " +
+                        $"{member.MemberIdentity}.");
+                }
+                continue;
+            }
+            merged.Add(member.MemberIdentity, member);
+        }
+
+        var slotCollision = merged.Values
+            .GroupBy(member => member.StaticSlotId)
+            .FirstOrDefault(group => group.Select(member => member.MemberIdentity)
+                .Distinct(StringComparer.Ordinal).Skip(1).Any());
+        if (slotCollision != null)
+        {
+            throw new InvalidDataException(
+                $"Isolation manifest static slot collision: {slotCollision.Key}.");
+        }
+        return merged.Values
+            .OrderBy(member => member.MemberIdentity, StringComparer.Ordinal)
+            .ToArray();
+    }
+
     private static void MarkLoaded(ModEntry mod, string logMessage)
     {
+        var runtimeKey = mod.RuntimeKey;
+        if (!mod.RuntimeSession.TryPublishActive(runtimeKey))
+        {
+            var snapshot = mod.RuntimeSession.Snapshot();
+            throw new InvalidOperationException(
+                $"MOD runtime active publication rejected state={snapshot.State} " +
+                $"generation={snapshot.Key.Generation} callbacks={snapshot.ActiveCallbacks} " +
+                $"operations={snapshot.ActiveOperations}.");
+        }
         mod.IsEnabled = true;
         mod.LoadState = ModLoadState.Loaded;
         mod.LoadProgress = 1;
@@ -691,12 +1583,232 @@ public class ModLoader
         Logger.Info(nameof(ModLoader), logMessage);
     }
 
+    private static void EnsureRuntimeCallbacksQuiesced(ModEntry mod, ModRuntimeKey runtimeKey)
+    {
+        if (mod.RuntimeSession.WaitForQuiescence(
+                runtimeKey,
+                RuntimeCallbackQuiescenceTimeout))
+            return;
+
+        var snapshot = mod.RuntimeSession.Snapshot();
+        var operations = mod.RuntimeSession.SnapshotOwnedOperations(runtimeKey);
+        var operationDetails = operations.Count == 0
+            ? "none"
+            : string.Join(',', operations.Select(operation =>
+                $"{operation.OperationId}:{operation.Name}:cancel=" +
+                (operation.CancellationRequested ? "1" : "0")));
+        throw new TimeoutException(
+            $"MOD runtime callback quiescence timed out mod={mod.Id} " +
+            $"generation={runtimeKey.Generation} callbacks={snapshot.ActiveCallbacks} " +
+            $"operations={snapshot.ActiveOperations} pending=[{operationDetails}].");
+    }
+
+    private static void EnsureNativeOperationsQuiesced(
+        ModEntry mod,
+        ModRuntimeKey runtimeKey)
+    {
+        if (HookHelper.CancelNativeOperationsAndWait(
+                runtimeKey,
+                RuntimeCallbackQuiescenceTimeout))
+        {
+            return;
+        }
+
+        var active = HookHelper.GetActiveNativeOperationCount(runtimeKey);
+        throw new TimeoutException(
+            $"MOD native operation quiescence timed out mod={mod.Id} " +
+            $"generation={runtimeKey.Generation} active={active}.");
+    }
+
+    private static void EnsureNativeOperationGenerationRetired(
+        ModEntry mod,
+        ModRuntimeKey runtimeKey)
+    {
+        if (HookHelper.RetireNativeOperationGeneration(runtimeKey))
+            return;
+        var active = HookHelper.GetActiveNativeOperationCount(runtimeKey);
+        throw new InvalidOperationException(
+            $"MOD native operation generation retirement failed mod={mod.Id} " +
+            $"generation={runtimeKey.Generation} active={active}.");
+    }
+
+    private static void CloseUnusedNativeOperationGeneration(ModRuntimeKey runtimeKey)
+    {
+        if (!HookHelper.CancelNativeOperationsAndWait(runtimeKey, TimeSpan.Zero))
+            return;
+        HookHelper.RetireNativeOperationGeneration(runtimeKey);
+    }
+
+    private static void EnsureProcessLifetimeHooksSuspended(
+        ModEntry mod,
+        ModRuntimeKey runtimeKey)
+    {
+        if (HookHelper.SuspendProcessLifetimeHooks(runtimeKey))
+            return;
+        throw new TimeoutException(
+            $"MOD native hook quiescence timed out mod={mod.Id} " +
+            $"generation={runtimeKey.Generation}.");
+    }
+
+    private static void HandleLoadFailure(
+        ModEntry mod,
+        ModRuntimeKey runtimeKey,
+        Exception exception,
+        bool pluginLifecycleStarted)
+    {
+        HookHelper.BlockProcessLifetimeHookRegistration(mod.RuntimeOwnerId);
+        var retainedHooks = HookHelper.HasProcessLifetimeHooks(runtimeKey);
+        var nativeHooksSuspended = !retainedHooks ||
+            HookHelper.SuspendProcessLifetimeHooks(runtimeKey);
+        if (!nativeHooksSuspended)
+        {
+            Logger.Error(
+                nameof(ModLoader),
+                $"failed load native hook quiescence timed out mod={mod.Id} " +
+                $"generation={runtimeKey.Generation}");
+        }
+        var retirementStarted = mod.RuntimeSession.TryBeginRetirement(runtimeKey);
+        var quiesced = false;
+        if (retirementStarted)
+        {
+            var nativeOperationsQuiesced = HookHelper.CancelNativeOperationsAndWait(
+                runtimeKey,
+                RuntimeCallbackQuiescenceTimeout);
+            if (!nativeOperationsQuiesced)
+            {
+                Logger.Error(
+                    nameof(ModLoader),
+                    $"failed load native operation quiescence timed out mod={mod.Id} " +
+                    $"generation={runtimeKey.Generation} active=" +
+                    HookHelper.GetActiveNativeOperationCount(runtimeKey));
+            }
+            try
+            {
+                EnsureRuntimeCallbacksQuiesced(mod, runtimeKey);
+                quiesced = nativeHooksSuspended && nativeOperationsQuiesced;
+            }
+            catch (Exception retirementError)
+            {
+                Logger.Error(
+                    nameof(ModLoader),
+                    $"failed load could not quiesce mod={mod.Id}: {retirementError.Message}");
+            }
+        }
+
+        if (retainedHooks)
+        {
+            if (quiesced)
+            {
+                BehaviourManager.SuspendOwner(mod.RuntimeOwnerId);
+                mod.RuntimeSession.TryCompleteSuspension(runtimeKey);
+            }
+            mod.LoadStage = "Suspended";
+            mod.LoadError = exception.Message +
+                            " Native hooks remain mapped; restart the app before retrying.";
+        }
+        else if (quiesced && HookHelper.RetireNativeOperationGeneration(runtimeKey))
+        {
+            CleanupFailedPlugin(mod, runtimeKey, pluginLifecycleStarted);
+            BehaviourManager.RetireOwner(mod.RuntimeOwnerId);
+            ModOwnedResourceRegistry.Retire(runtimeKey);
+            UiOwnerScope.Release(mod.RuntimeOwnerId, runtimeKey.Generation);
+            ModDirectLinkGate.ReleaseLinksFor(runtimeKey);
+            if (!mod.RuntimeSession.TryCompleteRetirement(runtimeKey))
+            {
+                Logger.Error(
+                    nameof(ModLoader),
+                    $"failed load retirement commit rejected mod={mod.Id} " +
+                    $"generation={runtimeKey.Generation}");
+            }
+            mod.LoadStage = "Failed";
+            mod.LoadError = exception.Message;
+        }
+        else
+        {
+            if (!retirementStarted)
+                mod.RuntimeSession.TryAbortLoad(runtimeKey);
+            mod.LoadStage = "RestartRequired";
+            mod.LoadError = exception.Message +
+                            " MOD runtime did not retire cleanly; restart the app before retrying.";
+            Logger.Error(
+                nameof(ModLoader),
+                $"failed load retained runtime mod={mod.Id} " +
+                $"generation={runtimeKey.Generation} nativeOperations=" +
+                HookHelper.GetActiveNativeOperationCount(runtimeKey));
+        }
+
+        mod.IsEnabled = false;
+        mod.LoadState = ModLoadState.Error;
+        LogLoadFailure(mod, exception);
+    }
+
+    private static void CleanupFailedPlugin(
+        ModEntry mod,
+        ModRuntimeKey runtimeKey,
+        bool invokeOnUnload)
+    {
+        var plugin = mod.PluginInstance;
+        if (plugin != null && invokeOnUnload)
+        {
+            try
+            {
+                using (HookHelper.EnterOwnerScope(
+                           mod.RuntimeOwnerId,
+                           mod.RuntimeSession,
+                           runtimeKey))
+                    plugin.OnUnload();
+            }
+            catch (Exception cleanupError)
+            {
+                Logger.Warn(
+                    nameof(ModLoader),
+                    $"failed load cleanup OnUnload threw mod={mod.Id}: {cleanupError.Message}");
+            }
+        }
+
+        if (plugin is IDisposable disposable)
+        {
+            try
+            {
+                disposable.Dispose();
+            }
+            catch (Exception cleanupError)
+            {
+                Logger.Warn(
+                    nameof(ModLoader),
+                    $"failed load cleanup Dispose threw mod={mod.Id}: {cleanupError.Message}");
+            }
+        }
+
+        if (mod.LoaderData is NativeModLoadState nativeState)
+        {
+            nativeState.ReleaseContext();
+            mod.PluginInstance = null;
+        }
+        else if (mod.LoaderData is PcModManifest manifest)
+        {
+            mod.PluginInstance = new PcCompatModPlugin(manifest);
+        }
+        else
+        {
+            mod.PluginInstance = null;
+        }
+    }
+
     /// <summary>
     /// 添加一个新的 Mod 条目（手动创建）
     /// </summary>
     public ModEntry AddMod(ModEntry mod)
     {
-        _mods.Add(mod);
+        if (string.IsNullOrWhiteSpace(mod.Id))
+            throw new ArgumentException("MOD ID cannot be empty.", nameof(mod));
+        lock (_transitionGate)
+        {
+            if (_mods.Any(existing =>
+                    string.Equals(existing.Id, mod.Id, StringComparison.OrdinalIgnoreCase)))
+                throw new InvalidOperationException($"A MOD with ID '{mod.Id}' is already registered.");
+            _mods.Add(mod);
+        }
         Logger.Info(nameof(ModLoader), L10n.Get("Log_ModAdded", mod.Name));
         return mod;
     }
@@ -709,10 +1821,90 @@ public class ModLoader
         if (mod.LoadState == ModLoadState.Loaded)
             UnloadMod(mod);
 
-        var removed = _mods.Remove(mod);
+        bool removed;
+        lock (_transitionGate)
+            removed = _mods.Remove(mod);
         if (removed)
             Logger.Info(nameof(ModLoader), L10n.Get("Log_ModRemoved", mod.Name));
         return removed;
+    }
+
+    private void ReleaseRejectedNativeMod(ModEntry mod)
+    {
+        if (mod.LoaderData is not NativeModLoadState state)
+            return;
+
+        // The rejected entry has never been enabled by this loader. Its state is
+        // therefore not one of the previously retained process-hook states.
+        state.ReleaseContext();
+    }
+
+    private void ReleaseOrphanedRuntimeStates(
+        IReadOnlyList<ModEntry> previousMods,
+        IReadOnlyList<ModEntry> currentMods)
+    {
+        foreach (var previous in previousMods)
+        {
+            if (currentMods.Any(current =>
+                    string.Equals(current.Id, previous.Id, StringComparison.OrdinalIgnoreCase) &&
+                    ReferenceEquals(current.LoaderData, previous.LoaderData)))
+                continue;
+
+            if (previous.LoadState is ModLoadState.Loading or ModLoadState.Loaded)
+            {
+                try
+                {
+                    UnloadMod(previous);
+                }
+                catch (Exception ex)
+                {
+                    Logger.Error(nameof(ModLoader),
+                        $"orphaned MOD retirement failed mod={previous.Id}: {ex}");
+                }
+            }
+
+            if (previous.LoaderData is NativeModLoadState state &&
+                HookHelper.HasProcessLifetimeHooks(previous.RuntimeKey))
+            {
+                if (!_orphanedNativeStates.Contains(state))
+                    _orphanedNativeStates.Add(state);
+                Logger.Warn(nameof(ModLoader),
+                    $"retaining removed native MOD context because process hooks remain: {previous.Id}");
+            }
+            else
+            {
+                if (previous.LoaderData is NativeModLoadState nativeState)
+                    nativeState.ReleaseContext();
+                // An abandoned PCCompat entry must not retain a fresh placeholder plugin
+                // after its session has been unregistered by UnloadMod.
+                if (previous.LoaderData is PcModManifest)
+                    previous.PluginInstance = null;
+            }
+        }
+    }
+
+    private static bool HasSameRuntimeIdentity(
+        ModEntry discovered,
+        string previousLoaderKind,
+        string previousFolderPath)
+    {
+        if (!string.Equals(
+                discovered.LoaderKind,
+                previousLoaderKind,
+                StringComparison.Ordinal))
+            return false;
+
+        try
+        {
+            return string.Equals(
+                Path.GetFullPath(discovered.FolderPath),
+                Path.GetFullPath(previousFolderPath),
+                StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
     }
 
 }

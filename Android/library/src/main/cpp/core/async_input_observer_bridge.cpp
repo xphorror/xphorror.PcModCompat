@@ -2,6 +2,7 @@
 
 #include "async_input_observer_abi.h"
 #include "hud_logic_worker.h"
+#include "pccompat_open_runtime.h"
 #include "realtime_event_core.h"
 
 #include <android/log.h>
@@ -9,6 +10,7 @@
 #include <cstdint>
 #include <dlfcn.h>
 #include <mutex>
+#include <cstring>
 
 namespace starray::async_input_bridge {
 namespace {
@@ -17,6 +19,8 @@ extern "C" int modmanager_modal_input_is_active(void);
 
 constexpr const char *kLogTag = "StArray.AsyncInputBridge";
 constexpr int32_t kVirtualKeyboardDeviceId = -1;
+constexpr uint32_t kRegisterObserverDescriptorSlot = 0x73000001u;
+constexpr uint32_t kIsTestMacroEnabledDescriptorSlot = 0x73000002u;
 
 std::mutex g_registration_lock;
 std::atomic<bool> g_registered{false};
@@ -24,6 +28,43 @@ std::atomic<bool> g_enabled{false};
 std::atomic<uint64_t> g_async_producer_epoch{0};
 using IsTestMacroEnabledFn = int (*)();
 std::atomic<IsTestMacroEnabledFn> g_is_test_macro_enabled{nullptr};
+
+bool resolve_async_input_callable(
+    void *handle,
+    const char *name,
+    uint32_t descriptor_slot,
+    bool required,
+    void **address_out) {
+    if (handle == nullptr || name == nullptr || address_out == nullptr)
+        return false;
+    *address_out = nullptr;
+    dlerror();
+    void *candidate = dlsym(handle, name);
+    const char *error = dlerror();
+    if (error != nullptr || candidate == nullptr)
+        return !required;
+
+    Dl_info info{};
+    if (dladdr(candidate, &info) == 0 || info.dli_fname == nullptr)
+        return false;
+    const char *base_name = std::strrchr(info.dli_fname, '/');
+    base_name = base_name == nullptr ? info.dli_fname : base_name + 1;
+    if (std::strcmp(base_name, "libAsyncInput.so") != 0)
+        return false;
+
+    uintptr_t protected_address = 0;
+    if (!PC_COMPAT_RESOLVE_CONTINUATION(
+            0,
+            0,
+            descriptor_slot,
+            reinterpret_cast<uintptr_t>(candidate),
+            &protected_address) ||
+        protected_address != reinterpret_cast<uintptr_t>(candidate)) {
+        return false;
+    }
+    *address_out = reinterpret_cast<void *>(protected_address);
+    return true;
+}
 
 void on_enabled_changed(void *, int32_t enabled, uint64_t producer_epoch) {
     g_async_producer_epoch.store(producer_epoch, std::memory_order_release);
@@ -99,12 +140,25 @@ void ensure_registered() {
     if (handle == nullptr)
         return;
 
-    auto register_observer = reinterpret_cast<ADOFAIAsyncInputRegisterRawObserverV1Fn>(
-        dlsym(handle, "ADOFAIAsyncInput_RegisterRawObserverV1"));
-    if (register_observer == nullptr) {
+    void *register_address = nullptr;
+    void *test_macro_address = nullptr;
+    if (!resolve_async_input_callable(
+            handle,
+            "ADOFAIAsyncInput_RegisterRawObserverV1",
+            kRegisterObserverDescriptorSlot,
+            true,
+            &register_address) ||
+        !resolve_async_input_callable(
+            handle,
+            "ADOFAIAsyncInput_IsTestMacroEnabled",
+            kIsTestMacroEnabledDescriptorSlot,
+            false,
+            &test_macro_address)) {
         dlclose(handle);
         return;
     }
+    auto register_observer =
+        reinterpret_cast<ADOFAIAsyncInputRegisterRawObserverV1Fn>(register_address);
 
     const AdoAsyncRawObserverV1 observer{
         .struct_size = sizeof(AdoAsyncRawObserverV1),
@@ -120,8 +174,7 @@ void ensure_registered() {
     }
 
     g_is_test_macro_enabled.store(
-        reinterpret_cast<IsTestMacroEnabledFn>(
-            dlsym(handle, "ADOFAIAsyncInput_IsTestMacroEnabled")),
+        reinterpret_cast<IsTestMacroEnabledFn>(test_macro_address),
         std::memory_order_release);
     g_registered.store(true, std::memory_order_release);
     __android_log_print(

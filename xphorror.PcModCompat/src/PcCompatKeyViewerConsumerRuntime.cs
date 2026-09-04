@@ -81,6 +81,12 @@ public static class PcCompatKeyViewerLoweredConsumerPlanRegistry
         if (error != null)
             return false;
         Plans[Key(plan.ModId, plan.FeatureId)] = compiled!;
+        PcCompatDeepDebug.Write(
+            "consumer-plan",
+            $"action=register mod={plan.ModId} feature={plan.FeatureId} " +
+            $"provider={PcCompatDeepDebug.Sanitize(plan.BindingProviderCandidateKey)} " +
+            $"lanes={compiled!.LaneCount} identities=[{string.Join(',', compiled.Identities.Select(identity =>
+                $"{identity.Kind}:{identity.Value}->lane{identity.Lane}"))}]");
         return true;
     }
 
@@ -92,6 +98,7 @@ public static class PcCompatKeyViewerLoweredConsumerPlanRegistry
                      modId + "\0",
                      StringComparison.OrdinalIgnoreCase)))
             Plans.TryRemove(key, out _);
+        PcCompatDeepDebug.Write("consumer-plan", $"action=remove mod={modId}");
     }
 
     internal static bool TryGet(
@@ -165,7 +172,8 @@ public static class PcCompatKeyViewerLoweredConsumerPlanRegistry
             foreach (var identity in lane.Identities)
             {
                 if (identity.Kind is not (PcCompatInputIdentityKind.UnityKeyCode or
-                    PcCompatInputIdentityKind.WindowsVirtualKey) ||
+                    PcCompatInputIdentityKind.WindowsVirtualKey or
+                    PcCompatInputIdentityKind.ActionId) ||
                     !int.TryParse(
                         identity.Value,
                         System.Globalization.NumberStyles.Integer,
@@ -273,6 +281,12 @@ public static class PcCompatKeyViewerConsumerRuntime
         ArgumentNullException.ThrowIfNull(features);
         if (!features.Any(feature => feature.Active))
         {
+            PcCompatDeepDebug.WriteState(
+                "consumer-state",
+                modId,
+                "inactive:" + (features.Count == 0 ? 0 : features[0].RegistrationGeneration),
+                $"action=inactive mod={modId} sequence={sequence} features={features.Count} " +
+                $"registrationGeneration={(features.Count == 0 ? 0 : features[0].RegistrationGeneration)}");
             if (features.Count != 0)
                 Remove(modId, features[0].RegistrationGeneration);
             return;
@@ -344,6 +358,18 @@ public static class PcCompatKeyViewerConsumerRuntime
                     PublishedSequence = feature.SourceSequence
                 }).ToArray()
             });
+        var stateIdentity = string.Join('|', activeFeatures.Select(feature =>
+            feature.FeatureId + ":" + feature.Mode + ":" + feature.HeldMask + ":" +
+            string.Join(',', feature.DownOrdinals) + ":" + string.Join(',', feature.UpOrdinals) + ":" +
+            feature.SourceSequence + ":" + feature.RegistrationGeneration));
+        PcCompatDeepDebug.WriteState(
+            "consumer-state",
+            modId,
+            stateIdentity,
+            $"action=publish mod={modId} sequence={sequence} anyUnityDown={anyUnityDownOrdinal} " +
+            $"features=[{string.Join(" | ", activeFeatures.Select(DescribeFeature))}] " +
+            $"unitySurface=[{FormatSurface(unityKeys)}] windowsSurface=[{FormatSurface(windowsKeys)}] " +
+            $"actionSurface=[{FormatSurface(actions)}]");
     }
 
     internal static void Remove(string modId, long registrationGeneration)
@@ -354,7 +380,28 @@ public static class PcCompatKeyViewerConsumerRuntime
             return;
         ((ICollection<KeyValuePair<string, PublishedModState>>)States).Remove(
             new KeyValuePair<string, PublishedModState>(modId, state));
+        PcCompatDeepDebug.Write(
+            "consumer-state",
+            $"action=remove mod={modId} registrationGeneration={registrationGeneration} " +
+            $"publishedSequence={state.Diagnostic.PublishedSequence}");
     }
+
+    private static string DescribeFeature(PcCompatKeyViewerPublishedFeature feature)
+        => $"id={feature.FeatureId} active={feature.Active} qualification={feature.Qualification} " +
+           $"mode={feature.Mode} held=0x{feature.HeldMask:X} sourceSequence={feature.SourceSequence} " +
+           $"sessionGeneration={feature.SessionGeneration} producerEpoch={feature.ProducerEpoch} " +
+           $"registrationGeneration={feature.RegistrationGeneration} " +
+           $"down=[{string.Join(',', feature.DownOrdinals)}] up=[{string.Join(',', feature.UpOrdinals)}] " +
+           $"identities=[{string.Join(',', feature.Identities.Select(identity =>
+               $"{identity.Kind}:{identity.Value}->lane{identity.Lane}"))}]";
+
+    private static string FormatSurface(
+        IReadOnlyDictionary<int, PcCompatKeyViewerConsumerKeyState> surface)
+        => string.Join(',', surface.OrderBy(pair => pair.Key).Select(pair =>
+            $"{pair.Key}:mode={pair.Value.Mode}/held={pair.Value.Held}/" +
+            $"down={pair.Value.DownOrdinal}/up={pair.Value.UpOrdinal}/" +
+            $"seq={pair.Value.SourceSequence}/session={pair.Value.SessionGeneration}/" +
+            $"epoch={pair.Value.ProducerEpoch}/reg={pair.Value.RegistrationGeneration}"));
 
     private static bool TryGetState(
         string modId,

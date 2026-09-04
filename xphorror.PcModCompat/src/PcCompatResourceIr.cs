@@ -16,6 +16,7 @@ public enum PcCompatResourceIrMaterializationKind
     TmpFontFromAtlas = 5,
     PrefabGraph = 6,
     TextureAlpha8 = 7,
+    FontFromFile = 8,
     Unsupported = 255
 }
 
@@ -530,6 +531,14 @@ public static class PcCompatResourceIr
                     asset.Sprite != null || asset.Material != null || asset.TmpFont != null ||
                     asset.Prefab != null || asset.CloneCapabilityAsset)
                     return Fail($"Alpha8 texture resource is invalid: {asset.Id}", out error);
+                break;
+            case PcCompatResourceIrMaterializationKind.FontFromFile:
+                if (!ValidId(asset.PayloadId, 128) || !payloadIds.Contains(asset.PayloadId) ||
+                    asset.Compatibility == PcCompatResourceIrCompatibility.Unsupported ||
+                    asset.CapabilityStableId.Length != 0 || asset.Texture != null ||
+                    asset.Sprite != null || asset.Material != null || asset.TmpFont != null ||
+                    asset.Prefab != null || asset.CloneCapabilityAsset)
+                    return Fail($"font file resource is invalid: {asset.Id}", out error);
                 break;
             case PcCompatResourceIrMaterializationKind.SpriteFromTexture:
                 if (asset.PayloadId.Length != 0 || asset.Texture != null || asset.Material != null ||

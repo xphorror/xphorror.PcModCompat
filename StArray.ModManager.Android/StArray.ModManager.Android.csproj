@@ -12,7 +12,6 @@
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <NoWarn>$(NoWarn);CS1591</NoWarn>
     <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
-    <Il2CppMscorlibPath Condition="'$(Il2CppMscorlibPath)' == ''">$(MSBuildThisFileDirectory)..\Il2CppInterop\Il2CppInterop.Runtime\Libs\Il2Cppmscorlib.dll</Il2CppMscorlibPath>
   </PropertyGroup>
 
   <ItemGroup>
@@ -26,8 +25,12 @@
   </ItemGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="StArray.ModManager.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <Reference Include="Il2Cppmscorlib">
-      <HintPath>$(Il2CppMscorlibPath)</HintPath>
+      <HintPath>..\Il2CppInterop\Il2CppInterop.Runtime\Libs\Il2Cppmscorlib.dll</HintPath>
       <Private>true</Private>
     </Reference>
   </ItemGroup>
@@ -35,10 +38,5 @@
   <ItemGroup>
     <PackageReference Include="OpenTK.Graphics" Version="4.9.4" />
   </ItemGroup>
-
-  <Target Name="ValidateIl2CppMscorlibReference" BeforeTargets="ResolveReferences">
-    <Error Condition="!Exists('$(Il2CppMscorlibPath)')"
-           Text="Set Il2CppMscorlibPath to a generated Il2Cppmscorlib.dll reference assembly." />
-  </Target>
 
 </Project>

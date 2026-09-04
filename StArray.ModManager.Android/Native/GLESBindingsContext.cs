@@ -1,18 +1,18 @@
 ﻿using OpenTK;
 
+using System.Runtime.InteropServices;
+
 namespace StArray.ModManager.Android.Native;
 
 public class GLESBindingsContext : IBindingsContext
 {
-    private IntPtr _libHandle;
-
-    public GLESBindingsContext()
-    {
-        _libHandle = DL.dlopen("libGLESv3.so", DL.Flags.RTLD_LAZY);
-    }
+    [DllImport("starray_modmanager", EntryPoint = "modmanager_gl_get_proc_address",
+        CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr ResolveGlProcAddress(
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string procName);
 
     public IntPtr GetProcAddress(string procName)
     {
-        return DL.dlsym(_libHandle, procName);
+        return ResolveGlProcAddress(procName);
     }
 }

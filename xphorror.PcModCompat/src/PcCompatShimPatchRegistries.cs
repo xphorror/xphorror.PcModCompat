@@ -69,4 +69,19 @@ internal static class PcCompatShimPatchRegistries
 
     internal static PropertyInfo? CountProperty(Type registryType)
         => registryType.GetProperty("RegisteredPatchCount", BindingFlags.Public | BindingFlags.Static);
+
+    /// <summary>
+    /// Returns a cheap monotonic change reader. Harmony exposes a dedicated revision that changes
+    /// on Patch, Unpatch and clear; older/JALib registries use RegisteredPatchCount as their host
+    /// revision contract. The delegate is compiled once so the per-frame liveness check performs no
+    /// reflection or allocation.
+    /// </summary>
+    internal static Func<int>? ChangeVersionReader(Type registryType)
+    {
+        var property = registryType.GetProperty("Revision", BindingFlags.Public | BindingFlags.Static)
+                       ?? CountProperty(registryType);
+        if (property?.PropertyType != typeof(int) || property.GetMethod is not { IsStatic: true } getter)
+            return null;
+        return getter.CreateDelegate<Func<int>>();
+    }
 }

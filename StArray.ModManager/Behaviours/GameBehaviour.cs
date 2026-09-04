@@ -1,4 +1,5 @@
 using ImGuiNET;
+using StArray.ModManager.Runtime;
 
 namespace StArray.ModManager.Behaviours;
 
@@ -16,6 +17,14 @@ namespace StArray.ModManager.Behaviours;
 /// </summary>
 public abstract class GameBehaviour
 {
+    /// <summary>创建该行为时的 MOD owner；宿主行为保持 null。</summary>
+    internal string? OwnerId { get; set; }
+
+    /// <summary>创建该行为时的 MOD 加载代次；用于拒绝旧异步 continuation。</summary>
+    internal ModRuntimeSession? RuntimeSession { get; set; }
+
+    internal ModRuntimeKey RuntimeKey { get; set; }
+
     /// <summary>是否已调用过 OnAwake</summary>
     internal bool Awoken { get; set; }
 

@@ -40,6 +40,7 @@ public interface IImGuiRenderer
 
     private static nint _fontPtr1;
     private static nint _fontPtr2;
+    private static nint _textGlyphRanges;
 
     private static void FreeFontMemory()
     {
@@ -53,6 +54,12 @@ public interface IImGuiRenderer
         {
             Marshal.FreeHGlobal(_fontPtr2);
             _fontPtr2 = 0;
+        }
+
+        if (_textGlyphRanges != 0)
+        {
+            Marshal.FreeHGlobal(_textGlyphRanges);
+            _textGlyphRanges = 0;
         }
     }
 
@@ -69,6 +76,7 @@ public interface IImGuiRenderer
             stream.ReadExactly(font);
             _fontPtr1 = Marshal.AllocHGlobal(font.Length);
             Marshal.Copy(font, 0, _fontPtr1, font.Length);
+            _textGlyphRanges = ImGuiTextGlyphRanges.Create(io);
 
             var config = ImGuiNative.ImFontConfig_ImFontConfig();
             config->MergeMode = 1;
@@ -80,7 +88,7 @@ public interface IImGuiRenderer
                     font.Length,
                     16f,
                     config,
-                    io.Fonts.GetGlyphRangesChineseSimplifiedCommon());
+                    _textGlyphRanges);
             }
             finally
             {

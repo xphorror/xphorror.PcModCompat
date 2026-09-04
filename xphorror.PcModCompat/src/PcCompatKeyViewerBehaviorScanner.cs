@@ -31,7 +31,7 @@ public sealed class PcCompatKeyViewerBehaviorScanResult
 /// </summary>
 public static class PcCompatKeyViewerBehaviorScanner
 {
-    public const string CurrentAnalyzerVersion = "keyviewer-behavior-scan-v5-local-provider-dominance";
+    public const string CurrentAnalyzerVersion = "keyviewer-behavior-scan-v7-parameter-provider-transaction";
     private const string PackageFingerprintVersion = "keyviewer-package-fingerprint-v1";
     private const string ProxySurfaceFingerprintVersion = "keyviewer-proxy-surface-fingerprint-v1";
 
@@ -189,9 +189,12 @@ public static class PcCompatKeyViewerBehaviorScanner
                 {
                     var instructions = PcCompatIlDecoder.Decode(
                         peReader.GetMethodBody(method.RelativeVirtualAddress));
+                    node.Instructions = instructions;
                     AnalyzeInstructions(reader, node, instructions);
                     AnalyzeIndexedArrayLoops(reader, node, instructions);
                     AnalyzeIdentityTransform(reader, node, instructions);
+                    AnalyzeArrayParameterInputTransactions(node, instructions);
+                    AnalyzeArrayFieldProviderAssignments(node, instructions);
                 }
                 methods.Add(node);
             }
@@ -256,9 +259,15 @@ public static class PcCompatKeyViewerBehaviorScanner
                         identity.Name,
                         PcCompatMetadataNames.GetFieldType(reader, instruction.MetadataToken));
                     if (opCode == OpCodes.Stfld || opCode == OpCodes.Stsfld)
+                    {
                         node.FieldWrites.Add(field);
+                        node.FieldWriteSites.Add(new FieldAccessSite(field, instruction.Offset));
+                    }
                     else
+                    {
                         node.FieldReads.Add(field);
+                        node.FieldReadSites.Add(new FieldAccessSite(field, instruction.Offset));
+                    }
                 }
             }
             else if (opCode == OpCodes.Ldstr)
@@ -266,6 +275,221 @@ public static class PcCompatKeyViewerBehaviorScanner
                 var value = PcCompatMetadataNames.GetUserString(reader, instruction.MetadataToken);
                 if (!string.IsNullOrEmpty(value))
                     node.Strings.Add(value);
+            }
+        }
+    }
+
+    private static void AnalyzeArrayParameterInputTransactions(
+        MethodNode node,
+        IReadOnlyList<PcCompatIlInstruction> instructions)
+    {
+        if (instructions.Count == 0 || !node.HasBackEdge)
+            return;
+
+        var instructionIndexByOffset = instructions
+            .Select((instruction, index) => (instruction.Offset, index))
+            .ToDictionary(value => value.Offset, value => value.index);
+        foreach (var inputCall in node.Calls.Where(call =>
+                     call.DeclaringType == "UnityEngine.Input" &&
+                     call.Name == "GetKey" &&
+                     call.ParameterTypes.SequenceEqual(["UnityEngine.KeyCode"]) &&
+                     call.ReturnType == "System.Boolean"))
+        {
+            if (!instructionIndexByOffset.TryGetValue(inputCall.Offset, out var callIndex))
+                continue;
+            var elementIndex = PreviousValueInstruction(instructions, callIndex - 1);
+            var laneIndex = PreviousValueInstruction(instructions, elementIndex - 1);
+            var arrayIndex = PreviousValueInstruction(instructions, laneIndex - 1);
+            if (elementIndex < 0 || laneIndex < 0 || arrayIndex < 0 ||
+                !IsArrayElementAccess(instructions[elementIndex].OpCode) ||
+                !TryGetLoadLocalIndex(instructions[laneIndex], out var indexLocal) ||
+                !TryGetLoadArgumentIndex(instructions[arrayIndex], out var argumentIndex))
+            {
+                continue;
+            }
+
+            var parameterIndex = argumentIndex - (node.IsStatic ? 0 : 1);
+            if (parameterIndex < 0 || parameterIndex >= node.ParameterTypes.Count ||
+                node.ParameterTypes[parameterIndex] != "UnityEngine.KeyCode[]" ||
+                !TryFindEnclosingLoop(
+                    instructions,
+                    inputCall.Offset,
+                    out var loopStart,
+                    out var loopEnd))
+            {
+                continue;
+            }
+
+            var resultStoreIndex = NextMeaningful(instructions, callIndex + 1);
+            if (resultStoreIndex < 0 ||
+                !TryGetStoreLocalIndex(instructions[resultStoreIndex], out var resultLocal))
+            {
+                continue;
+            }
+
+            var stateWrites = node.FieldWriteSites.Where(site =>
+                    site.Offset >= loopStart && site.Offset <= loopEnd &&
+                    site.Field.Type == "System.Boolean" &&
+                    ValueBeforeFieldStoreIsLocal(
+                        instructions,
+                        instructionIndexByOffset,
+                        site.Offset,
+                        resultLocal))
+                .ToArray();
+            var stateFields = stateWrites.Select(site => site.Field).Distinct().ToArray();
+            var stateReadBeforeWrite = stateFields.Any(field =>
+                node.FieldReadSites.Any(site =>
+                    site.Offset >= loopStart &&
+                    site.Offset < stateWrites
+                        .Where(write => write.Field == field)
+                        .Min(write => write.Offset) &&
+                    site.Field == field));
+            var transitionProven = stateWrites.Length != 0 && stateReadBeforeWrite &&
+                                   instructions.Any(instruction =>
+                                       instruction.Offset >= inputCall.Offset &&
+                                       instruction.Offset <= loopEnd &&
+                                       instruction.OpCode.FlowControl == FlowControl.Cond_Branch);
+
+            var countWrites = node.FieldWriteSites.Where(site =>
+                    site.Offset >= loopStart && site.Offset <= loopEnd &&
+                    (IsIntegral(site.Field.Type) || IsIntegralArray(site.Field.Type)))
+                .Select(site => site.Field)
+                .Concat(node.FieldReadSites.Where(site =>
+                        site.Offset >= loopStart && site.Offset <= loopEnd &&
+                        IsIntegralArray(site.Field.Type))
+                    .Select(site => site.Field))
+                .Concat(FindArrayFieldsCachedForLoop(
+                    node,
+                    instructions,
+                    instructionIndexByOffset,
+                    loopStart,
+                    loopEnd,
+                    IsIntegralArray))
+                .Distinct()
+                .ToArray();
+            var countProven = instructions.Any(instruction =>
+                                  instruction.Offset >= loopStart &&
+                                  instruction.Offset <= loopEnd &&
+                                  instruction.OpCode is var op &&
+                                  (op == OpCodes.Add || op == OpCodes.Add_Ovf ||
+                                   op == OpCodes.Add_Ovf_Un)) &&
+                              (countWrites.Length != 0 || instructions.Any(instruction =>
+                                  instruction.Offset >= loopStart &&
+                                  instruction.Offset <= loopEnd &&
+                                  instruction.OpCode.Name?.StartsWith(
+                                      "stelem",
+                                      StringComparison.Ordinal) == true));
+            if (!transitionProven || !countProven)
+                continue;
+
+            node.ArrayParameterInputTransactions.Add(new ArrayParameterInputTransaction(
+                parameterIndex,
+                argumentIndex,
+                indexLocal,
+                resultLocal,
+                loopStart,
+                loopEnd,
+                inputCall,
+                stateFields,
+                countWrites));
+            node.IdentityTransformKind = PcCompatKeyViewerIdentityTransformKind.UnityKeyCodeIdentity;
+        }
+    }
+
+    private static void AnalyzeArrayFieldProviderAssignments(
+        MethodNode node,
+        IReadOnlyList<PcCompatIlInstruction> instructions)
+    {
+        if (node.FieldWriteSites.Count == 0 || node.Calls.Count == 0)
+            return;
+        var instructionIndexByOffset = instructions
+            .Select((instruction, index) => (instruction.Offset, index))
+            .ToDictionary(value => value.Offset, value => value.index);
+        var callsByOffset = node.Calls.ToDictionary(call => call.Offset);
+        foreach (var write in node.FieldWriteSites.Where(site =>
+                     site.Field.Type.EndsWith("[]", StringComparison.Ordinal)))
+        {
+            if (!instructionIndexByOffset.TryGetValue(write.Offset, out var storeIndex))
+                continue;
+            var valueIndex = PreviousValueInstruction(instructions, storeIndex - 1);
+            if (valueIndex < 0 ||
+                !callsByOffset.TryGetValue(instructions[valueIndex].Offset, out var provider) ||
+                provider.ParameterTypes.Count != 0 ||
+                provider.ReturnType != write.Field.Type)
+            {
+                continue;
+            }
+            node.ArrayFieldProviderAssignments.Add(new ArrayFieldProviderAssignment(
+                write.Field,
+                provider,
+                write.Offset));
+        }
+    }
+
+    private static bool ValueBeforeFieldStoreIsLocal(
+        IReadOnlyList<PcCompatIlInstruction> instructions,
+        IReadOnlyDictionary<int, int> instructionIndexByOffset,
+        int storeOffset,
+        int localIndex)
+    {
+        if (!instructionIndexByOffset.TryGetValue(storeOffset, out var storeIndex))
+            return false;
+        var valueIndex = PreviousValueInstruction(instructions, storeIndex - 1);
+        return valueIndex >= 0 &&
+               TryGetLoadLocalIndex(instructions[valueIndex], out var loaded) &&
+               loaded == localIndex;
+    }
+
+    private static bool TryFindEnclosingLoop(
+        IReadOnlyList<PcCompatIlInstruction> instructions,
+        int containedOffset,
+        out int loopStart,
+        out int loopEnd)
+    {
+        var candidates = instructions
+            .SelectMany(instruction => TryGetBranchTargets(instruction, out var targets)
+                ? targets.Where(target =>
+                        target <= containedOffset && instruction.Offset >= containedOffset)
+                    .Select(target => (Start: target, End: instruction.Offset))
+                : Array.Empty<(int Start, int End)>())
+            .OrderBy(value => value.End - value.Start)
+            .ThenBy(value => value.Start)
+            .ToArray();
+        if (candidates.Length == 0)
+        {
+            loopStart = 0;
+            loopEnd = 0;
+            return false;
+        }
+        loopStart = candidates[0].Start;
+        loopEnd = candidates[0].End;
+        return true;
+    }
+
+    private static IEnumerable<FieldAccess> FindArrayFieldsCachedForLoop(
+        MethodNode node,
+        IReadOnlyList<PcCompatIlInstruction> instructions,
+        IReadOnlyDictionary<int, int> instructionIndexByOffset,
+        int loopStart,
+        int loopEnd,
+        Func<string, bool> fieldTypePredicate)
+    {
+        foreach (var site in node.FieldReadSites.Where(site =>
+                     site.Offset < loopEnd && fieldTypePredicate(site.Field.Type)))
+        {
+            if (!instructionIndexByOffset.TryGetValue(site.Offset, out var readIndex))
+                continue;
+            var storeIndex = NextMeaningful(instructions, readIndex + 1);
+            if (storeIndex < 0 ||
+                !TryGetStoreLocalIndex(instructions[storeIndex], out var localIndex))
+            {
+                continue;
+            }
+            if (instructions.Any(instruction =>
+                    instruction.Offset >= loopStart && instruction.Offset <= loopEnd &&
+                    TryGetLoadLocalIndex(instruction, out var loaded) && loaded == localIndex))
+            {
+                yield return site.Field;
             }
         }
     }
@@ -581,6 +805,315 @@ public static class PcCompatKeyViewerBehaviorScanner
             .ToArray();
     }
 
+    private static IReadOnlyList<CrossMethodArrayProvider> FindCrossMethodArrayProviders(
+        IReadOnlyList<MethodNode> methods)
+    {
+        var byShape = methods
+            .GroupBy(MethodShape, StringComparer.Ordinal)
+            .ToDictionary(group => group.Key, group => group.ToArray(), StringComparer.Ordinal);
+        var assignments = methods
+            .SelectMany(method => method.ArrayFieldProviderAssignments.Select(assignment =>
+                (Method: method, Assignment: assignment)))
+            .ToArray();
+        var providers = new List<CrossMethodArrayProvider>();
+        foreach (var transactionMethod in methods.Where(method =>
+                     method.ArrayParameterInputTransactions.Count != 0))
+        {
+            foreach (var transaction in transactionMethod.ArrayParameterInputTransactions)
+            {
+                foreach (var caller in methods)
+                {
+                    foreach (var call in caller.Calls.Where(call =>
+                                 MethodShape(call) == MethodShape(transactionMethod)))
+                    {
+                        if (!TryGetCallArgumentOrigins(
+                                caller,
+                                call,
+                                transactionMethod,
+                                byShape,
+                                out var origins) ||
+                            transaction.ParameterIndex >= origins.Count)
+                        {
+                            continue;
+                        }
+
+                        var origin = origins[transaction.ParameterIndex];
+                        var laneBaseParameter = FindLaneBaseParameterIndex(
+                            transactionMethod,
+                            transaction);
+                        var consumerLaneBase = laneBaseParameter.HasValue
+                            ? origins[laneBaseParameter.Value].Int32Constant
+                            : null;
+                        if (origin.Call != null)
+                        {
+                            AddCrossMethodProvider(
+                                providers,
+                                byShape,
+                                transactionMethod,
+                                transaction,
+                                caller,
+                                origin.Call,
+                                null,
+                                call.Offset,
+                                consumerLaneBase);
+                            continue;
+                        }
+                        if (origin.Field == null)
+                            continue;
+                        foreach (var assignment in assignments.Where(value =>
+                                     value.Assignment.Field == origin.Field))
+                        {
+                            AddCrossMethodProvider(
+                                providers,
+                                byShape,
+                                transactionMethod,
+                                transaction,
+                                caller,
+                                assignment.Assignment.Provider,
+                                origin.Field,
+                                call.Offset,
+                                consumerLaneBase);
+                        }
+                    }
+                }
+            }
+        }
+        return providers
+            .DistinctBy(value =>
+                value.TransactionMethod.Id + "\0" + value.Provider.Id + "\0" +
+                (value.CacheField?.DeclaringType ?? string.Empty) + "\0" +
+                (value.CacheField?.Name ?? string.Empty) + "\0" +
+                (value.ConsumerLaneBase?.ToString(
+                    System.Globalization.CultureInfo.InvariantCulture) ?? "?"))
+            .OrderBy(value => value.TransactionMethod.Id, StringComparer.Ordinal)
+            .ThenBy(value => value.Provider.Id, StringComparer.Ordinal)
+            .ToArray();
+    }
+
+    private static void AddCrossMethodProvider(
+        ICollection<CrossMethodArrayProvider> destination,
+        IReadOnlyDictionary<string, MethodNode[]> byShape,
+        MethodNode transactionMethod,
+        ArrayParameterInputTransaction transaction,
+        MethodNode caller,
+        CallSite providerCall,
+        FieldAccess? cacheField,
+        int consumerCallOffset,
+        int? consumerLaneBase)
+    {
+        if (!byShape.TryGetValue(MethodShape(providerCall), out var candidates))
+            return;
+        foreach (var provider in candidates.Where(candidate =>
+                     candidate.ParameterTypes.Count == 0 &&
+                     candidate.ReturnType == transactionMethod.ParameterTypes[transaction.ParameterIndex]))
+        {
+            destination.Add(new CrossMethodArrayProvider(
+                transactionMethod,
+                transaction,
+                caller,
+                provider,
+                cacheField,
+                consumerCallOffset,
+                consumerLaneBase));
+        }
+    }
+
+    private static int? FindLaneBaseParameterIndex(
+        MethodNode method,
+        ArrayParameterInputTransaction transaction)
+    {
+        var candidates = new HashSet<int>();
+        var instructions = method.Instructions;
+        for (var index = 0; index < instructions.Count; ++index)
+        {
+            var instruction = instructions[index];
+            if (instruction.Offset < transaction.LoopStartOffset ||
+                instruction.Offset > transaction.LoopEndOffset ||
+                instruction.OpCode is var op &&
+                op != OpCodes.Add && op != OpCodes.Add_Ovf && op != OpCodes.Add_Ovf_Un)
+            {
+                continue;
+            }
+
+            var right = PreviousValueInstruction(instructions, index - 1);
+            var left = PreviousValueInstruction(instructions, right - 1);
+            if (left < 0 || right < 0)
+                continue;
+            if (TryGetLoadLocalIndex(instructions[left], out var leftLocal) &&
+                leftLocal == transaction.IndexLocal &&
+                TryGetLoadArgumentIndex(instructions[right], out var rightArgument))
+            {
+                AddLaneBaseParameter(method, transaction, rightArgument, candidates);
+            }
+            else if (TryGetLoadArgumentIndex(instructions[left], out var leftArgument) &&
+                     TryGetLoadLocalIndex(instructions[right], out var rightLocal) &&
+                     rightLocal == transaction.IndexLocal)
+            {
+                AddLaneBaseParameter(method, transaction, leftArgument, candidates);
+            }
+        }
+        return candidates.Count == 1 ? candidates.Single() : null;
+    }
+
+    private static void AddLaneBaseParameter(
+        MethodNode method,
+        ArrayParameterInputTransaction transaction,
+        int argumentIndex,
+        ISet<int> candidates)
+    {
+        var parameterIndex = argumentIndex - (method.IsStatic ? 0 : 1);
+        if (parameterIndex < 0 || parameterIndex >= method.ParameterTypes.Count ||
+            parameterIndex == transaction.ParameterIndex ||
+            method.ParameterTypes[parameterIndex] != "System.Int32")
+        {
+            return;
+        }
+        candidates.Add(parameterIndex);
+    }
+
+    private static bool TryGetCallArgumentOrigins(
+        MethodNode caller,
+        CallSite call,
+        MethodNode target,
+        IReadOnlyDictionary<string, MethodNode[]> byShape,
+        out IReadOnlyList<ValueOrigin> origins)
+    {
+        origins = Array.Empty<ValueOrigin>();
+        if (caller.Instructions.Count == 0)
+            return false;
+        var callIndex = FindInstructionAtOrAfter(caller.Instructions, call.Offset);
+        if (callIndex < 0 || caller.Instructions[callIndex].Offset != call.Offset)
+            return false;
+        var cursor = PreviousValueInstruction(caller.Instructions, callIndex - 1);
+        var values = new ValueOrigin[target.ParameterTypes.Count];
+        for (var parameter = target.ParameterTypes.Count - 1; parameter >= 0; --parameter)
+        {
+            if (!TryReadValueOrigin(caller, byShape, ref cursor, 0, out values[parameter]))
+                return false;
+        }
+        if (!target.IsStatic &&
+            !TryReadValueOrigin(caller, byShape, ref cursor, 0, out _))
+        {
+            return false;
+        }
+        origins = values;
+        return true;
+    }
+
+    private static bool TryReadValueOrigin(
+        MethodNode method,
+        IReadOnlyDictionary<string, MethodNode[]> byShape,
+        ref int cursor,
+        int depth,
+        out ValueOrigin origin)
+    {
+        origin = default;
+        if (depth > 24)
+            return false;
+        cursor = PreviousValueInstruction(method.Instructions, cursor);
+        if (cursor < 0)
+            return false;
+        var instruction = method.Instructions[cursor--];
+        var opCode = instruction.OpCode;
+        if (opCode == OpCodes.Ldfld || opCode == OpCodes.Ldflda)
+        {
+            var site = method.FieldReadSites.FirstOrDefault(value => value.Offset == instruction.Offset);
+            if (site == null ||
+                !TryReadValueOrigin(method, byShape, ref cursor, depth + 1, out _))
+            {
+                return false;
+            }
+            origin = new ValueOrigin(site.Field, null, null);
+            return true;
+        }
+        if (opCode == OpCodes.Ldsfld || opCode == OpCodes.Ldsflda)
+        {
+            var site = method.FieldReadSites.FirstOrDefault(value => value.Offset == instruction.Offset);
+            if (site == null)
+                return false;
+            origin = new ValueOrigin(site.Field, null, null);
+            return true;
+        }
+        if (opCode == OpCodes.Call || opCode == OpCodes.Callvirt)
+        {
+            var call = method.Calls.FirstOrDefault(value => value.Offset == instruction.Offset);
+            if (call == null)
+                return false;
+            var target = byShape.TryGetValue(MethodShape(call), out var candidates) &&
+                         candidates.Length == 1
+                ? candidates[0]
+                : null;
+            var parameterCount = target?.ParameterTypes.Count ?? call.ParameterTypes.Count;
+            for (var parameter = parameterCount - 1; parameter >= 0; --parameter)
+            {
+                if (!TryReadValueOrigin(method, byShape, ref cursor, depth + 1, out _))
+                    return false;
+            }
+            var isStatic = target?.IsStatic ?? opCode == OpCodes.Call;
+            if (!isStatic &&
+                !TryReadValueOrigin(method, byShape, ref cursor, depth + 1, out _))
+            {
+                return false;
+            }
+            origin = new ValueOrigin(
+                null,
+                call,
+                target != null && TryReadPureInt32Constant(target, out var getterConstant)
+                    ? getterConstant
+                    : null);
+            return true;
+        }
+        if (IsArrayElementAccess(opCode))
+        {
+            if (!TryReadValueOrigin(method, byShape, ref cursor, depth + 1, out _) ||
+                !TryReadValueOrigin(method, byShape, ref cursor, depth + 1, out origin))
+            {
+                return false;
+            }
+            return true;
+        }
+        if (opCode == OpCodes.Add || opCode == OpCodes.Add_Ovf ||
+            opCode == OpCodes.Add_Ovf_Un || opCode == OpCodes.Sub ||
+            opCode == OpCodes.Mul || opCode == OpCodes.Div || opCode == OpCodes.Div_Un)
+        {
+            return TryReadValueOrigin(method, byShape, ref cursor, depth + 1, out _) &&
+                   TryReadValueOrigin(method, byShape, ref cursor, depth + 1, out origin);
+        }
+        if (TryGetI4Constant(instruction, out var constant))
+        {
+            origin = new ValueOrigin(null, null, constant);
+            return true;
+        }
+        if (TryGetLoadArgumentIndex(instruction, out _) ||
+            TryGetLoadLocalIndex(instruction, out _) ||
+            opCode == OpCodes.Ldnull || opCode == OpCodes.Ldstr ||
+            opCode == OpCodes.Ldc_I8 || opCode == OpCodes.Ldc_R4 || opCode == OpCodes.Ldc_R8)
+        {
+            origin = default;
+            return true;
+        }
+        return false;
+    }
+
+    private static bool TryReadPureInt32Constant(MethodNode method, out int value)
+    {
+        value = 0;
+        if (!method.IsStatic || method.ParameterTypes.Count != 0 ||
+            method.ReturnType != "System.Int32" || method.Calls.Count != 0 ||
+            method.FieldReads.Count != 0 || method.FieldWrites.Count != 0 ||
+            method.HasConditionalBranch || method.HasBackEdge)
+        {
+            return false;
+        }
+
+        var meaningful = method.Instructions
+            .Where(instruction => instruction.OpCode != OpCodes.Nop)
+            .ToArray();
+        return meaningful.Length == 2 &&
+               TryGetI4Constant(meaningful[0], out value) &&
+               meaningful[1].OpCode == OpCodes.Ret;
+    }
+
     private static IReadOnlyList<PcCompatKeyViewerFeatureAdapter> BuildFeatures(
         PcModManifest manifest,
         IReadOnlyList<MethodNode> methods,
@@ -664,7 +1197,21 @@ public static class PcCompatKeyViewerBehaviorScanner
             .GroupBy(value => $"{value.Method.Id}|{value.Loop.Provider.DisplayName}|{value.Loop.LoopStartOffset:X4}|{value.Loop.IndexLocal}", StringComparer.Ordinal)
             .Select(group => group.First())
             .ToArray();
-        var laneEvidence = constants.Length != 0
+        var crossMethodProviders = FindCrossMethodArrayProviders(component);
+        var transactionMethods = crossMethodProviders
+            .Select(value => value.TransactionMethod)
+            .Distinct()
+            .OrderBy(value => value.Id, StringComparer.Ordinal)
+            .ToArray();
+        var laneEvidence = crossMethodProviders.Count != 0
+            ? Proven(crossMethodProviders.Select(value =>
+                $"{value.Provider.Id} -> " +
+                (value.CacheField == null
+                    ? "direct argument"
+                    : value.CacheField.DeclaringType + "." + value.CacheField.Name) +
+                $" -> {value.TransactionMethod.Id} parameter {value.Transaction.ParameterIndex}; " +
+                $"same-index Unity KeyCode query IL_{value.Transaction.InputCall.Offset:X4}"))
+            : constants.Length != 0
             ? Proven(constants.Select(value => $"constant input identity {value.Kind}:{value.Value}"))
             : indexedLoops.Length != 0
                 ? Probable(
@@ -717,8 +1264,12 @@ public static class PcCompatKeyViewerBehaviorScanner
                 }
             ];
 
-        var stateWriters = component.Where(HasTransitionWrite).ToArray();
-        var countWriters = component.Where(HasCountWrite).ToArray();
+        var stateWriters = transactionMethods.Length != 0
+            ? transactionMethods
+            : component.Where(HasTransitionWrite).ToArray();
+        var countWriters = transactionMethods.Length != 0
+            ? transactionMethods
+            : component.Where(HasCountWrite).ToArray();
         var monotonic = component.Where(UsesMonotonicClock).ToArray();
         var queueMethods = component.Where(UsesQueue).ToArray();
         var presentation = component.Where(UsesPresentationSink).ToArray();
@@ -727,21 +1278,26 @@ public static class PcCompatKeyViewerBehaviorScanner
         var rain = component.Where(HasRainEvidence).ToArray();
         var enable = component.Where(method => method.Name is "OnEnable" or "CompatEnable").ToArray();
         var disable = component.Where(method => method.Name is "OnDisable" or "CompatDisable").ToArray();
-        var listener = component.Where(method => method.HasBackEdge &&
-                                                 (method.Calls.Any(call =>
-                                                      seeds.Any(seed => MethodShape(seed.Call) == MethodShape(call))) ||
-                                                  method.FieldReads.Any())).ToArray();
+        var listener = transactionMethods.Length != 0
+            ? transactionMethods
+            : component.Where(method => method.HasBackEdge &&
+                                        (method.Calls.Any(call =>
+                                             seeds.Any(seed => MethodShape(seed.Call) == MethodShape(call))) ||
+                                         method.FieldReads.Any())).ToArray();
         var importedWin32Shapes = component
             .Where(method => TryClassifyPInvoke(method, out var kind) &&
                              kind == PcCompatKeyViewerInputProfileKind.Win32Polling)
             .Select(MethodShape)
             .ToHashSet(StringComparer.Ordinal);
-        var identityTransforms = component.Where(method =>
-            method.IdentityTransformKind ==
-                PcCompatKeyViewerIdentityTransformKind.UnityKeyCodeIdentity ||
-            method.IdentityTransformKind != null &&
-            method.IdentityTransformBridgeCalls.Any(call =>
-                importedWin32Shapes.Contains(MethodShape(call)))).ToArray();
+        var identityTransforms = transactionMethods.Length != 0
+            ? transactionMethods.Where(method => method.IdentityTransformKind ==
+                PcCompatKeyViewerIdentityTransformKind.UnityKeyCodeIdentity).ToArray()
+            : component.Where(method =>
+                method.IdentityTransformKind ==
+                    PcCompatKeyViewerIdentityTransformKind.UnityKeyCodeIdentity ||
+                method.IdentityTransformKind != null &&
+                method.IdentityTransformBridgeCalls.Any(call =>
+                    importedWin32Shapes.Contains(MethodShape(call)))).ToArray();
         var labelProviders = component.Where(method =>
             method.ReturnType == "System.String[]" &&
             method.ParameterTypes.Count == 0 &&
@@ -756,13 +1312,21 @@ public static class PcCompatKeyViewerBehaviorScanner
             .OrderBy(value => value, StringComparer.Ordinal)
             .ToArray();
 
-        var transitionEvidence = stateWriters.Length != 0 &&
+        var transitionEvidence = transactionMethods.Length != 0
+            ? Proven(transactionMethods.SelectMany(method =>
+                method.ArrayParameterInputTransactions.Select(transaction =>
+                    $"{method.Id}: Input.GetKey result local {transaction.ResultLocal} is compared with and written to held state inside IL_{transaction.LoopStartOffset:X4}..IL_{transaction.LoopEndOffset:X4}")))
+            : stateWriters.Length != 0 &&
                                  component.Any(method => method.HasConditionalBranch)
             ? Probable(
                 "conditional transition and held-state write are connected, but CFG control dependence is not lowered",
                 stateWriters.Select(method => method.Id))
             : Unsupported("no connected conditional held-state write was found");
-        var countEvidence = countWriters.Length != 0
+        var countEvidence = transactionMethods.Length != 0
+            ? Proven(transactionMethods.SelectMany(method =>
+                method.ArrayParameterInputTransactions.Select(transaction =>
+                    $"{method.Id}: rising-edge transaction increments integral state inside IL_{transaction.LoopStartOffset:X4}..IL_{transaction.LoopEndOffset:X4}")))
+            : countWriters.Length != 0
             ? Probable(
                 "increment/write behavior is connected to the input component, but lane/count dominance is not lowered",
                 countWriters.Select(method => method.Id))
@@ -782,7 +1346,10 @@ public static class PcCompatKeyViewerBehaviorScanner
                 "enable/disable lifecycle pair found; root object visibility side effects require lowering",
                 enable.Concat(disable).Select(method => method.Id))
             : Unsupported("no complete enable/disable visibility lifecycle was found");
-        var activationEvidence = listener.Length != 0
+        var activationEvidence = transactionMethods.Length != 0
+            ? Proven(transactionMethods.Select(method =>
+                $"{method.Id}: frame-polled input transaction is bounded by a verified array loop"))
+            : listener.Length != 0
             ? Probable(
                 "long-running input loop found; loop predicate field and cancellation semantics require lowering",
                 listener.Select(method => method.Id))
@@ -824,10 +1391,7 @@ public static class PcCompatKeyViewerBehaviorScanner
                     "string lane collection is connected to the feature, but exact lane-to-presentation dominance requires confirmation",
                     [labelProvider.Id]));
         }
-        AddRole(roles, "HeldState", stateWriters.FirstOrDefault(), transitionEvidence);
-        AddRole(roles, "CountState", countWriters.FirstOrDefault(), countEvidence);
         AddRole(roles, "FrameUpdater", presentation.FirstOrDefault(), presentationEvidence);
-        AddRole(roles, "KpsWindow", monotonic.FirstOrDefault(), kpsEvidence);
         AddRole(roles, "RainProducer", rain.FirstOrDefault(), rainEvidence);
         AddRole(roles, "EnableMethod", enable.FirstOrDefault(), visibilityEvidence);
         AddRole(roles, "DisableMethod", disable.FirstOrDefault(), visibilityEvidence);
@@ -846,12 +1410,104 @@ public static class PcCompatKeyViewerBehaviorScanner
             {
                 if (field.Type == "System.Boolean[]")
                     AddFieldRole(roles, "HeldState", indexedLoop.Method.AssemblyName, field, transitionEvidence);
-                else if (field.Type.EndsWith("[]", StringComparison.Ordinal) &&
-                         field.Type is "System.Int16[]" or "System.Int32[]" or "System.Int64[]" or
-                                       "System.UInt16[]" or "System.UInt32[]" or "System.UInt64[]")
+                else if (IsIntegralArray(field.Type))
                     AddFieldRole(roles, "CountState", indexedLoop.Method.AssemblyName, field, countEvidence);
             }
         }
+        foreach (var providerGroup in crossMethodProviders.GroupBy(
+                     provider => provider.Provider.Id,
+                     StringComparer.Ordinal))
+        {
+            var providers = providerGroup.ToArray();
+            var observedBases = providers
+                .Select(provider => provider.ConsumerLaneBase)
+                .Distinct()
+                .ToArray();
+            var consumerLaneBase = observedBases.Length == 1 ? observedBases[0] : null;
+            AddRole(
+                roles,
+                "BindingProvider",
+                providers[0].Provider,
+                laneEvidence,
+                consumerLaneBase);
+            foreach (var provider in providers.Where(provider => provider.CacheField != null))
+            {
+                AddFieldRole(
+                    roles,
+                    "LaneCollection",
+                    provider.Caller.AssemblyName,
+                    provider.CacheField!,
+                    laneEvidence);
+            }
+        }
+        foreach (var method in stateWriters)
+        {
+            var fields = transactionMethods.Length != 0
+                ? method.ArrayParameterInputTransactions
+                    .SelectMany(transaction => transaction.StateFields)
+                    .Distinct()
+                : method.FieldReads.Concat(method.FieldWrites).Distinct();
+            foreach (var field in fields)
+            {
+                if (field.Type is "System.Boolean" or "System.Boolean[]")
+                    AddFieldRole(roles, "HeldState", method.AssemblyName, field, transitionEvidence);
+            }
+        }
+        foreach (var method in countWriters)
+        {
+            var fields = transactionMethods.Length != 0
+                ? method.ArrayParameterInputTransactions
+                    .SelectMany(transaction => transaction.CountFields)
+                    .Distinct()
+                : method.FieldReads.Concat(method.FieldWrites).Distinct();
+            foreach (var field in fields)
+            {
+                if (IsIntegralArray(field.Type))
+                    AddFieldRole(roles, "CountState", method.AssemblyName, field, countEvidence);
+                else if (IsIntegral(field.Type))
+                    AddFieldRole(roles, "TotalState", method.AssemblyName, field, countEvidence);
+                else if (transactionMethods.Length == 0 && field.Type == "System.Boolean")
+                    AddFieldRole(
+                        roles,
+                        "PersistencePendingState",
+                        method.AssemblyName,
+                        field,
+                        persistenceEvidence);
+            }
+        }
+        foreach (var method in queueMethods)
+        {
+            foreach (var field in method.FieldReads.Concat(method.FieldWrites).Distinct())
+            {
+                if (field.Type.StartsWith("System.Collections.Generic.Queue", StringComparison.Ordinal))
+                    AddFieldRole(roles, "KpsWindow", method.AssemblyName, field, kpsEvidence);
+                else if (IsIntegral(field.Type))
+                    AddFieldRole(roles, "KpsState", method.AssemblyName, field, kpsEvidence);
+            }
+        }
+        foreach (var method in persistence)
+        {
+            foreach (var field in method.FieldReads.Concat(method.FieldWrites).Distinct())
+            {
+                if (IsIntegral(field.Type))
+                {
+                    AddFieldRole(
+                        roles,
+                        "PersistenceDirtyState",
+                        method.AssemblyName,
+                        field,
+                        persistenceEvidence);
+                }
+            }
+        }
+        var countStateTypes = roles
+            .Where(role => role.Role == "CountState" && role.MemberKind == "Field")
+            .Select(role => role.TypeName)
+            .ToHashSet(StringComparer.Ordinal);
+        var persistenceSink = component.FirstOrDefault(method =>
+            method.Name == "Save" && method.ParameterTypes.Count == 0 &&
+            method.ReturnType == "System.Void" && countStateTypes.Contains(method.TypeName));
+        AddRole(roles, "PersistenceSink", persistenceSink, persistenceEvidence);
 
         var featureHash = HashUtf8(string.Join("\n", seeds
             .Select(seed => seed.Call.DisplayName)
@@ -939,7 +1595,8 @@ public static class PcCompatKeyViewerBehaviorScanner
         ICollection<PcCompatKeyViewerRoleBinding> roles,
         string role,
         MethodNode? method,
-        PcCompatAdapterEvidence evidence)
+        PcCompatAdapterEvidence evidence,
+        int? consumerLaneBase = null)
     {
         if (method == null)
             return;
@@ -950,14 +1607,30 @@ public static class PcCompatKeyViewerBehaviorScanner
             TypeName = method.TypeName,
             MemberName = method.Name,
             MemberKind = "Method",
+            ConsumerLaneBase = consumerLaneBase,
             Evidence = evidence
         };
-        if (!roles.Any(existing => existing.Role == candidate.Role &&
-                                  existing.AssemblyName == candidate.AssemblyName &&
-                                  existing.TypeName == candidate.TypeName &&
-                                  existing.MemberName == candidate.MemberName &&
-                                  existing.MemberKind == candidate.MemberKind))
+        var existing = roles.FirstOrDefault(value =>
+            value.Role == candidate.Role &&
+            value.AssemblyName == candidate.AssemblyName &&
+            value.TypeName == candidate.TypeName &&
+            value.MemberName == candidate.MemberName &&
+            value.MemberKind == candidate.MemberKind);
+        if (existing == null)
+        {
             roles.Add(candidate);
+            return;
+        }
+        if (role != "BindingProvider" || !consumerLaneBase.HasValue ||
+            existing.ConsumerLaneBase.HasValue)
+        {
+            return;
+        }
+
+        // Local-loop discovery can add an unranked candidate before cross-method call-site analysis.
+        // Replace only that duplicate with the stronger lane-origin proof.
+        roles.Remove(existing);
+        roles.Add(candidate);
     }
 
     private static void AddFieldRole(
@@ -1055,6 +1728,16 @@ public static class PcCompatKeyViewerBehaviorScanner
             field.Type is "System.Int16" or "System.Int32" or "System.Int64" or
                           "System.UInt16" or "System.UInt32" or "System.UInt64" ||
             field.Type.EndsWith("[]", StringComparison.Ordinal)));
+
+    private static bool IsIntegral(string type)
+        => type is "System.Byte" or "System.SByte" or
+                   "System.Int16" or "System.UInt16" or
+                   "System.Int32" or "System.UInt32" or
+                   "System.Int64" or "System.UInt64";
+
+    private static bool IsIntegralArray(string type)
+        => type.EndsWith("[]", StringComparison.Ordinal) &&
+           IsIntegral(type[..^2]);
 
     private static bool UsesMonotonicClock(MethodNode method)
         => method.Calls.Any(call =>
@@ -1478,9 +2161,15 @@ public static class PcCompatKeyViewerBehaviorScanner
         public List<CallSite> Calls { get; } = [];
         public List<FieldAccess> FieldReads { get; } = [];
         public List<FieldAccess> FieldWrites { get; } = [];
+        public List<FieldAccessSite> FieldReadSites { get; } = [];
+        public List<FieldAccessSite> FieldWriteSites { get; } = [];
         public List<string> Strings { get; } = [];
         public List<IndexedArrayLoop> IndexedArrayLoops { get; } = [];
+        public List<ArrayParameterInputTransaction> ArrayParameterInputTransactions { get; } = [];
+        public List<ArrayFieldProviderAssignment> ArrayFieldProviderAssignments { get; } = [];
         public List<CallSite> IdentityTransformBridgeCalls { get; } = [];
+        public IReadOnlyList<PcCompatIlInstruction> Instructions { get; set; } =
+            Array.Empty<PcCompatIlInstruction>();
         public PcCompatKeyViewerIdentityTransformKind? IdentityTransformKind { get; set; }
         public int? IdentityTransformThreshold { get; set; }
         public int? IdentityTransformOffset { get; set; }
@@ -1505,6 +2194,7 @@ public static class PcCompatKeyViewerBehaviorScanner
     }
 
     private sealed record FieldAccess(string DeclaringType, string Name, string Type);
+    private sealed record FieldAccessSite(FieldAccess Field, int Offset);
     private sealed record InputSeed(
         int MethodIndex,
         PcCompatKeyViewerInputProfileKind Kind,
@@ -1519,6 +2209,36 @@ public static class PcCompatKeyViewerBehaviorScanner
         bool ProviderFeedsBooleanQuery,
         IReadOnlyList<FieldAccess> IndexedFields,
         IReadOnlyList<int> ProviderReadOffsets);
+
+    private sealed record ArrayParameterInputTransaction(
+        int ParameterIndex,
+        int ArgumentIndex,
+        int IndexLocal,
+        int ResultLocal,
+        int LoopStartOffset,
+        int LoopEndOffset,
+        CallSite InputCall,
+        IReadOnlyList<FieldAccess> StateFields,
+        IReadOnlyList<FieldAccess> CountFields);
+
+    private sealed record ArrayFieldProviderAssignment(
+        FieldAccess Field,
+        CallSite Provider,
+        int StoreOffset);
+
+    private sealed record CrossMethodArrayProvider(
+        MethodNode TransactionMethod,
+        ArrayParameterInputTransaction Transaction,
+        MethodNode Caller,
+        MethodNode Provider,
+        FieldAccess? CacheField,
+        int ConsumerCallOffset,
+        int? ConsumerLaneBase);
+
+    private readonly record struct ValueOrigin(
+        FieldAccess? Field,
+        CallSite? Call,
+        int? Int32Constant);
 
     private sealed class BehaviorGraph
     {

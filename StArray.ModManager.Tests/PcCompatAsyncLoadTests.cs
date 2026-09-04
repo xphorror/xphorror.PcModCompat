@@ -401,6 +401,66 @@ public class PcCompatAsyncLoadTests
     }
 
     [Test]
+    [NonParallelizable]
+    public void BackgroundPreparationIsOwnedUntilCancellationCompletes()
+    {
+        var root = CreateTempMod();
+        using var providerEntered = new ManualResetEventSlim();
+        using var providerExited = new ManualResetEventSlim();
+        var session = new ModRuntimeSession();
+        var key = session.BeginLoad(PcCompatRuntime.LoaderKind, "async-test");
+        var plugin = new PcCompatModPlugin(CreateManifest(root));
+        ModOwnedResourceRegistry.ClearForTests();
+        PcCompatResourceAssemblyCompile.RegisterProvider((_, token) =>
+        {
+            providerEntered.Set();
+            try
+            {
+                token.WaitHandle.WaitOne();
+                token.ThrowIfCancellationRequested();
+                throw new InvalidOperationException("unreachable");
+            }
+            finally
+            {
+                providerExited.Set();
+            }
+        });
+
+        try
+        {
+            using (HookHelper.EnterOwnerScope(key.OwnerId, session, key))
+                plugin.BeginLoad();
+            Assert.That(providerEntered.Wait(TimeSpan.FromSeconds(5)), Is.True);
+
+            var active = ModOwnedResourceRegistry.Snapshot(key, includeRetired: false);
+            Assert.Multiple(() =>
+            {
+                Assert.That(session.Snapshot().ActiveCallbacks, Is.EqualTo(1));
+                Assert.That(active, Has.Count.EqualTo(1));
+                Assert.That(active[0].Kind, Is.EqualTo(ModOwnedResourceKind.AsyncOperation));
+            });
+
+            plugin.CancelLoad();
+            Assert.That(providerExited.Wait(TimeSpan.FromSeconds(5)), Is.True);
+            Assert.That(
+                SpinWait.SpinUntil(
+                    () => session.Snapshot().ActiveCallbacks == 0,
+                    TimeSpan.FromSeconds(5)),
+                Is.True);
+            Assert.That(
+                ModOwnedResourceRegistry.Snapshot(key, includeRetired: false),
+                Is.Empty);
+        }
+        finally
+        {
+            plugin.CancelLoad();
+            PcCompatResourceAssemblyCompile.RegisterProvider(null);
+            ModOwnedResourceRegistry.ClearForTests();
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Test]
     public void RuntimeAssemblyPathFallsBackWhenCoreClrReportsEmptyLocation()
     {
         var root = Path.Combine(
@@ -589,7 +649,7 @@ public class PcCompatAsyncLoadTests
         var directory = new DirectoryInfo(TestContext.CurrentContext.TestDirectory);
         while (directory != null)
         {
-            if (File.Exists(Path.Combine(directory.FullName, "StArray.ModManager.slnx")))
+            if (Directory.Exists(Path.Combine(directory.FullName, "JipperResourcePack_release")))
                 return directory.FullName;
             directory = directory.Parent;
         }

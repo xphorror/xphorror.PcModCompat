@@ -1,5 +1,6 @@
 using ImGuiNET;
 using StArray.ModManager.Manager;
+using StArray.ModManager.Runtime;
 
 namespace StArray.ModManager.Behaviours;
 
@@ -15,6 +16,7 @@ public static class BehaviourManager
     private static readonly List<GameBehaviour> _behaviours = new();
     private static readonly List<GameBehaviour> _pendingAdd = new();
     private static readonly List<GameBehaviour> _pendingRemove = new();
+    private static readonly HashSet<GameBehaviour> _suspended = new();
     private static readonly object _lock = new();
 
     /// <summary>当前活跃的行为列表（只读快照）</summary>
@@ -40,6 +42,24 @@ public static class BehaviourManager
     /// </summary>
     public static T Add<T>(T behaviour) where T : GameBehaviour
     {
+        behaviour.OwnerId = HookHelper.CurrentOwnerId;
+        behaviour.RuntimeSession = HookHelper.CurrentRuntimeSession;
+        behaviour.RuntimeKey = HookHelper.CurrentRuntimeKey;
+        if (behaviour.RuntimeSession != null &&
+            !behaviour.RuntimeSession.CanRegisterOwnedResource(behaviour.RuntimeKey))
+        {
+            behaviour.IsDestroyed = true;
+            return behaviour;
+        }
+        if (behaviour.RuntimeSession != null &&
+            !ModOwnedResourceRegistry.TryRegister(
+                behaviour.RuntimeKey,
+                ModOwnedResourceKind.Behaviour,
+                $"instance=0x{System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(behaviour):X}"))
+        {
+            behaviour.IsDestroyed = true;
+            return behaviour;
+        }
         lock (_lock)
         {
             _pendingAdd.Add(behaviour);
@@ -83,6 +103,123 @@ public static class BehaviourManager
     }
 
     /// <summary>
+    /// Synchronously retires all behaviours created by one MOD. This prevents
+    /// a collectible native ALC from being kept alive by the frame scheduler.
+    /// </summary>
+    internal static void RetireOwner(string ownerId)
+    {
+        if (string.IsNullOrWhiteSpace(ownerId))
+            return;
+
+        GameBehaviour[] active;
+        lock (_lock)
+        {
+            active = _behaviours
+                .Concat(_pendingAdd)
+                .Where(behaviour => string.Equals(
+                    behaviour.OwnerId,
+                    ownerId,
+                    StringComparison.Ordinal))
+                .Distinct()
+                .ToArray();
+            foreach (var behaviour in active)
+                _behaviours.Remove(behaviour);
+            foreach (var behaviour in active)
+                _suspended.Remove(behaviour);
+
+            _pendingAdd.RemoveAll(behaviour => string.Equals(
+                behaviour.OwnerId,
+                ownerId,
+                StringComparison.Ordinal));
+            _pendingRemove.RemoveAll(behaviour => string.Equals(
+                behaviour.OwnerId,
+                ownerId,
+                StringComparison.Ordinal));
+        }
+
+        foreach (var behaviour in active)
+        {
+            if (behaviour.IsDestroyed)
+                continue;
+
+            behaviour.IsDestroyed = true;
+            if (behaviour.Awoken && behaviour.EnabledRaw)
+                SafeDisable(behaviour);
+            if (!behaviour.Started)
+                continue;
+
+            try { InvokeOwned(behaviour, behaviour.OnStop, cleanup: true); }
+            catch (Exception ex) { LogFault(behaviour, nameof(GameBehaviour.OnStop), ex); }
+        }
+
+        // OnDisable/OnStop may enqueue replacement behaviours. Retirement is a
+        // hard owner boundary, so those callbacks cannot repopulate the scheduler.
+        lock (_lock)
+        {
+            _pendingAdd.RemoveAll(behaviour => string.Equals(
+                behaviour.OwnerId,
+                ownerId,
+                StringComparison.Ordinal));
+            _pendingRemove.RemoveAll(behaviour => string.Equals(
+                behaviour.OwnerId,
+                ownerId,
+                StringComparison.Ordinal));
+        }
+    }
+
+    /// <summary>挂起永久 native hook MOD 的行为，保留实例以便重新启用。</summary>
+    internal static void SuspendOwner(string ownerId)
+    {
+        if (string.IsNullOrWhiteSpace(ownerId))
+            return;
+
+        GameBehaviour[] active;
+        lock (_lock)
+        {
+            active = _behaviours
+                .Concat(_pendingAdd)
+                .Where(behaviour => string.Equals(
+                    behaviour.OwnerId,
+                    ownerId,
+                    StringComparison.Ordinal) &&
+                    !behaviour.IsDestroyed &&
+                    behaviour.EnabledRaw)
+                .Distinct()
+                .ToArray();
+            foreach (var behaviour in active)
+                _suspended.Add(behaviour);
+        }
+
+        foreach (var behaviour in active)
+            behaviour.Enabled = false;
+    }
+
+    /// <summary>恢复之前由 SuspendOwner 挂起且仍存在的行为。</summary>
+    internal static void ResumeOwner(string ownerId)
+    {
+        if (string.IsNullOrWhiteSpace(ownerId))
+            return;
+
+        GameBehaviour[] suspended;
+        lock (_lock)
+        {
+            suspended = _suspended
+                .Where(behaviour => string.Equals(
+                    behaviour.OwnerId,
+                    ownerId,
+                    StringComparison.Ordinal) &&
+                    (_behaviours.Contains(behaviour) || _pendingAdd.Contains(behaviour)) &&
+                    !behaviour.IsDestroyed)
+                .ToArray();
+            foreach (var behaviour in suspended)
+                _suspended.Remove(behaviour);
+        }
+
+        foreach (var behaviour in suspended)
+            behaviour.Enabled = true;
+    }
+
+    /// <summary>
     /// 获取第一个指定类型的行为，若不存在返回 null。
     /// </summary>
     public static T? Get<T>() where T : GameBehaviour
@@ -115,14 +252,50 @@ public static class BehaviourManager
 
     internal static void SafeEnable(GameBehaviour b)
     {
-        try { b.OnEnable(); }
+        try { InvokeOwned(b, b.OnEnable); }
         catch (Exception ex) { LogFault(b, nameof(GameBehaviour.OnEnable), ex); }
     }
 
     internal static void SafeDisable(GameBehaviour b)
     {
-        try { b.OnDisable(); }
+        try { InvokeOwned(b, b.OnDisable, cleanup: true); }
         catch (Exception ex) { LogFault(b, nameof(GameBehaviour.OnDisable), ex); }
+    }
+
+    private static bool InvokeOwned(
+        GameBehaviour behaviour,
+        Action callback,
+        bool cleanup = false)
+    {
+        if (string.IsNullOrWhiteSpace(behaviour.OwnerId))
+        {
+            callback();
+            return true;
+        }
+
+        IDisposable? callbackLease = null;
+        if (behaviour.RuntimeSession != null)
+        {
+            var entered = cleanup
+                ? behaviour.RuntimeSession.TryEnterCleanupCallback(
+                    behaviour.RuntimeKey,
+                    out callbackLease)
+                : behaviour.RuntimeSession.TryEnterCallback(
+                    behaviour.RuntimeKey,
+                    out callbackLease);
+            if (!entered)
+                return false;
+        }
+
+        using (callbackLease)
+        using (behaviour.RuntimeSession != null
+                   ? HookHelper.EnterOwnerScope(
+                       behaviour.OwnerId,
+                       behaviour.RuntimeSession,
+                       behaviour.RuntimeKey)
+                   : HookHelper.EnterOwnerScope(behaviour.OwnerId))
+            callback();
+        return true;
     }
 
     private static GameBehaviour[] Snapshot()
@@ -149,7 +322,10 @@ public static class BehaviourManager
             _pendingAdd.Clear();
 
             foreach (var b in toRemove)
+            {
                 _behaviours.Remove(b);
+                _suspended.Remove(b);
+            }
             _behaviours.AddRange(toAdd);
         }
 
@@ -160,7 +336,7 @@ public static class BehaviourManager
             if (b.Awoken && b.EnabledRaw) SafeDisable(b);
             if (b.Started)
             {
-                try { b.OnStop(); }
+                try { InvokeOwned(b, b.OnStop, cleanup: true); }
                 catch (Exception ex) { LogFault(b, nameof(GameBehaviour.OnStop), ex); }
             }
         }
@@ -169,7 +345,14 @@ public static class BehaviourManager
         {
             if (b.IsDestroyed || b.Awoken) continue;
             b.Awoken = true; // 先置位：抛异常也不重复 Awake
-            try { b.OnAwake(); }
+            try
+            {
+                if (!InvokeOwned(b, b.OnAwake))
+                {
+                    b.IsDestroyed = true;
+                    continue;
+                }
+            }
             catch (Exception ex) { LogFault(b, nameof(GameBehaviour.OnAwake), ex); }
             if (b.EnabledRaw) SafeEnable(b);
         }
@@ -185,21 +368,21 @@ public static class BehaviourManager
         {
             if (b.IsDestroyed || !b.EnabledRaw || b.Started) continue;
             b.Started = true; // 先置位：Start 只尝试一次，抛异常也不会每帧重来
-            try { b.OnStart(); }
+            try { InvokeOwned(b, b.OnStart); }
             catch (Exception ex) { LogFault(b, nameof(GameBehaviour.OnStart), ex); }
         }
 
         foreach (var b in snapshot)
         {
             if (b.IsDestroyed || !b.EnabledRaw || !b.Started) continue;
-            try { b.OnUpdate(delta); }
+            try { InvokeOwned(b, () => b.OnUpdate(delta)); }
             catch (Exception ex) { LogFault(b, nameof(GameBehaviour.OnUpdate), ex); }
         }
 
         foreach (var b in snapshot)
         {
             if (b.IsDestroyed || !b.EnabledRaw || !b.Started) continue;
-            try { b.OnLateUpdate(delta); }
+            try { InvokeOwned(b, () => b.OnLateUpdate(delta)); }
             catch (Exception ex) { LogFault(b, nameof(GameBehaviour.OnLateUpdate), ex); }
         }
     }
@@ -210,7 +393,7 @@ public static class BehaviourManager
         foreach (var b in Snapshot())
         {
             if (b.IsDestroyed || !b.EnabledRaw || !b.Started) continue;
-            try { b.OnGUI(drawList); }
+            try { InvokeOwned(b, () => b.OnGUI(drawList)); }
             catch (Exception ex) { LogFault(b, nameof(GameBehaviour.OnGUI), ex); }
         }
     }

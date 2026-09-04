@@ -153,6 +153,7 @@ struct ParsedBundle {
     std::string compatibility;
     uint64_t required_capabilities = 0;
     uint32_t target_game_revision = 0;
+    std::array<uint8_t, 32> source_assembly_sha256{};
     std::vector<RuntimeTarget> targets;
     std::vector<UiObjectNode> ui_objects;
     std::vector<UiResourceBinding> ui_resources;

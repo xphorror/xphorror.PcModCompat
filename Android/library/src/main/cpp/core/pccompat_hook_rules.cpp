@@ -1,4 +1,5 @@
 #include <android/log.h>
+#include "pccompat_open_runtime.h"
 
 #include <algorithm>
 #include <array>
@@ -15,6 +16,7 @@
 #include <dlfcn.h>
 #include <elf.h>
 #include <fstream>
+#include <iterator>
 #include <link.h>
 #include <limits>
 #include <map>
@@ -33,9 +35,9 @@
 
 #include "hook_broker.h"
 #include "async_input_observer_bridge.h"
+#include "dobby_hook_internal.h"
 #include "hud_logic_worker.h"
 #include "il2cpp_foreign_thread_guard.h"
-#include "runtime_il2cpp_bridge.h"
 #include "native_rule_vm.h"
 #include "pccompat_recipe_binary.h"
 #include "pccompat_metadata_resolver.h"
@@ -45,6 +47,7 @@
 
 #define LOG_TAG "StArray.PcCompatRules"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
 extern "C" {
@@ -55,6 +58,11 @@ void modmanager_pccompat_start_hook_coordinator();
 }
 
 namespace {
+
+constexpr uint32_t kApplicationFocusKnown = 1u << 0;
+constexpr uint32_t kApplicationResumed = 1u << 1;
+constexpr uint32_t kApplicationWindowFocused = 1u << 2;
+std::atomic<uint32_t> g_application_focus_state{0};
 
 struct RuntimeRule {
     std::string id;
@@ -185,6 +193,18 @@ struct ResolvedMethodMetadata {
     bool is_generic = false;
 };
 
+struct PcModSessionToken {
+    uint64_t session_handle = 0;
+    uint64_t host_generation = 0;
+    uint64_t resource_generation = 0;
+
+    bool operator==(const PcModSessionToken &other) const {
+        return session_handle == other.session_handle &&
+               host_generation == other.host_generation &&
+               resource_generation == other.resource_generation;
+    }
+};
+
 struct RuntimeBundle {
     uint32_t bundle_id = 0;
     std::string path;
@@ -193,6 +213,7 @@ struct RuntimeBundle {
     std::string compatibility;
     bool recipe_presentation_enabled = true;
     uint64_t required_capabilities = 0;
+    PcModSessionToken pc_mod_session;
     std::vector<RuntimeTarget> targets;
     std::vector<starray::pccompat_recipe::UiObjectNode> ui_objects;
     std::vector<starray::pccompat_recipe::UiResourceBinding> ui_resources;
@@ -213,6 +234,7 @@ enum HookSlotState : int {
 struct HookSlotRuleRef {
     uint32_t bundle_id = 0;
     int target_id = 0;
+    PcModSessionToken pc_mod_session;
     std::string rule_id;
     std::string feature_id;
     int stage_code = -1;
@@ -272,6 +294,7 @@ struct HookSlot {
 
 struct OverlayRuntimeState {
     std::atomic<uint32_t> generation{1};
+    std::atomic<uint32_t> session_epoch{0};
     std::atomic<uint32_t> visible{0};
     std::atomic<uint32_t> practice{0};
     std::atomic<uint32_t> show_count{0};
@@ -323,14 +346,42 @@ struct OverlayRuntimeState {
     std::atomic<uint32_t> speed_multiplier_bits{0};
     std::atomic<uint32_t> planet_speed_bits{0};
     std::atomic<uint32_t> session_auto{0};
+    std::atomic<uint32_t> rdc_auto{0};
+    std::atomic<uint32_t> no_fail{0};
+    std::atomic<uint32_t> paused{0};
+    std::atomic<uint32_t> is_game_world{0};
+    std::atomic<uint32_t> song_pitch_bits{0};
+    std::atomic<uint64_t> conductor_add_offset_bits{0};
+    std::atomic<uint64_t> conductor_songposition_minusi_bits{0};
+    std::atomic<uint32_t> is_scn_game{0};
+    std::atomic<uint32_t> game_ready{0};
     std::atomic<uint32_t> input_state_generation{0};
     std::atomic<uint32_t> input_held_mask{0};
     std::atomic<uint32_t> input_last_down_mask{0};
     std::atomic<uint32_t> input_last_up_mask{0};
     std::atomic<uint32_t> input_total_count{0};
     std::atomic<uint32_t> input_kps_bits{0};
+    std::atomic<uint64_t> valid_game_snapshot_fields{0};
+    std::atomic<uintptr_t> controller_pointer{0};
+    std::atomic<uintptr_t> conductor_pointer{0};
+    std::atomic<uintptr_t> level_maker_pointer{0};
+    std::atomic<uintptr_t> current_floor_pointer{0};
+    std::atomic<uintptr_t> first_floor_pointer{0};
+    std::atomic<uintptr_t> song_pointer{0};
+    std::atomic<uintptr_t> planetary_system_pointer{0};
 };
 
+struct OwnerOverlaySession {
+    std::string mod_id;
+    uint64_t session_generation = 0;
+    OverlayRuntimeState state;
+    std::atomic<uint32_t> retired{0};
+    std::atomic<int64_t> last_timeline_poll_ms{0};
+    std::atomic<uint32_t> last_published_input_generation{0};
+    std::atomic<int64_t> last_margin_callback_ms{0};
+};
+
+#pragma pack(push, 4)
 struct PcCompatOverlaySnapshotV1 {
     uint32_t struct_size;
     uint32_t abi_version;
@@ -392,16 +443,56 @@ struct PcCompatOverlaySnapshotV1 {
     uint32_t input_total_count;
     float input_kps;
     float planet_speed;
+    uint32_t rdc_auto;
+    uint32_t no_fail;
+    uint32_t paused;
+    uint32_t is_game_world;
+    float song_pitch;
+    double conductor_add_offset;
+    double conductor_songposition_minusi;
+    uint32_t is_scn_game;
+    uint32_t game_ready;
+    uint32_t session_epoch;
+    uint64_t valid_game_snapshot_fields;
+    uint64_t controller_pointer;
+    uint64_t conductor_pointer;
+    uint64_t level_maker_pointer;
+    uint64_t current_floor_pointer;
+    uint64_t first_floor_pointer;
+    uint64_t song_pointer;
+    uint64_t planetary_system_pointer;
 };
+#pragma pack(pop)
 
 constexpr uint32_t kOverlaySnapshotAbiVersionV2 = 2;
 constexpr uint32_t kOverlaySnapshotV2Size = 160;
 constexpr uint32_t kOverlaySnapshotAbiVersionV3 = 3;
 constexpr uint32_t kOverlaySnapshotV3Size = 236;
-constexpr uint32_t kOverlaySnapshotAbiVersion = 4;
-static_assert(sizeof(PcCompatOverlaySnapshotV1) == 240);
+constexpr uint32_t kOverlaySnapshotAbiVersionV4 = 4;
+constexpr uint32_t kOverlaySnapshotV4Size = 240;
+constexpr uint32_t kOverlaySnapshotAbiVersionV5 = 5;
+constexpr uint32_t kOverlaySnapshotV5Size = 284;
+constexpr uint32_t kOverlaySnapshotAbiVersionV6 = 6;
+constexpr uint32_t kOverlaySnapshotV6Size = 288;
+constexpr uint32_t kOverlaySnapshotAbiVersion = 7;
+static_assert(sizeof(PcCompatOverlaySnapshotV1) == 352);
 static_assert(offsetof(PcCompatOverlaySnapshotV1, timeline_snapshot_count) == kOverlaySnapshotV2Size);
 static_assert(offsetof(PcCompatOverlaySnapshotV1, planet_speed) == kOverlaySnapshotV3Size);
+static_assert(offsetof(PcCompatOverlaySnapshotV1, rdc_auto) == kOverlaySnapshotV4Size);
+static_assert(offsetof(PcCompatOverlaySnapshotV1, valid_game_snapshot_fields) == kOverlaySnapshotV6Size);
+
+constexpr uint64_t kGameSnapshotProgress = 1ULL << 0;
+constexpr uint64_t kGameSnapshotCurrentSeqId = 1ULL << 1;
+constexpr uint64_t kGameSnapshotCheckpoints = 1ULL << 2;
+constexpr uint64_t kGameSnapshotFloor = 1ULL << 3;
+constexpr uint64_t kGameSnapshotAccuracy = 1ULL << 4;
+constexpr uint64_t kGameSnapshotBpm = 1ULL << 5;
+constexpr uint64_t kGameSnapshotTimeline = 1ULL << 6;
+constexpr uint64_t kGameSnapshotPlanetSpeed = 1ULL << 7;
+constexpr uint64_t kGameSnapshotState = 1ULL << 8;
+constexpr uint64_t kGameSnapshotConductor = 1ULL << 9;
+constexpr uint64_t kGameSnapshotSongPitch = 1ULL << 10;
+constexpr uint64_t kGameSnapshotPlayer = 1ULL << 11;
 
 #pragma pack(push, 4)
 struct PcCompatInputHudSnapshotV1 {
@@ -560,11 +651,20 @@ constexpr int kRuleOpManagedEventCallback = 21;
 // Keep in sync with PcCompatRuleOp.GameplayAcceptedObserve.
 constexpr int kRuleOpGameplayAcceptedObserve = 22;
 constexpr int kRuleOpManagedSynchronousPrefix = 23;
+// A synchronous prefix restricted to MOD-owned host component instances, used to forward a Unity
+// render callback to a managed component that has no IL2CPP class-table entry. Behaves exactly like
+// kRuleOpManagedSynchronousPrefix except for the instance prefilter below: the hook target
+// (UnityEngine.UI.RawImage::OnPopulateMesh) is also used by the game itself, and some of those uses
+// rebuild their mesh every frame. Without the filter each of those rebuilds would cross the
+// native->managed boundary and allocate an invocation struct just to be told it is not ours.
+// Keep in sync with PcCompatRuleOp.ManagedRenderCallback in PcCompatFeatureRecipe.cs.
+constexpr int kRuleOpManagedRenderCallback = 24;
 
 // Managed event queue: rule ids emitted by the importer look like
 // "managed_event:<patchId>:<callbackTypeFullName>:<callbackMethodName>".
 constexpr const char *kManagedEventRuleIdPrefix = "managed_event:";
 constexpr const char *kManagedPrefixRuleIdPrefix = "managed_prefix:";
+constexpr const char *kManagedRenderRuleIdPrefix = "managed_render:";
 constexpr size_t kManagedEventRingCapacity = 2048;
 constexpr size_t kManagedEventLifecycleReserve = 64;
 constexpr int kManagedEventMaxArgs = 6;
@@ -635,6 +735,7 @@ struct ManagedEventRing {
 
 struct ManagedEventDispatchTarget {
     std::shared_ptr<ManagedEventRing> ring;
+    PcModSessionToken pc_mod_session;
     uint32_t managed_event_id = 0;
     bool lifecycle_boundary = false;
 };
@@ -653,6 +754,10 @@ struct ManagedPrefixDispatchTarget {
     uint32_t bundle_id = 0;
     uint32_t managed_prefix_id = 0;
     std::shared_ptr<ManagedEventRing> ring;
+    PcModSessionToken pc_mod_session;
+    // Set for kRuleOpManagedRenderCallback: dispatch only when the instance is a registered
+    // MOD-owned host component. See g_managed_render_hosts.
+    bool owner_filtered = false;
 };
 using ManagedPrefixDispatchSnapshot = std::vector<ManagedPrefixDispatchTarget>;
 using ManagedPrefixCallback = int (*)(
@@ -661,6 +766,84 @@ using ManagedPrefixCallback = int (*)(
     PcCompatManagedPrefixInvocationV2 *invocation);
 std::atomic<ManagedPrefixCallback> g_managed_prefix_callback{nullptr};
 thread_local uint32_t g_managed_prefix_callback_depth = 0;
+
+// MOD-owned host component pointers, per MOD, published copy-on-write.
+//
+// Read on the hook hot path once per candidate call, so the reader takes no lock: it loads the
+// shared_ptr and searches the sorted vector it points at. Writers (AddComponent, component destroy,
+// session teardown) build a new vector and publish it, which is cheap because the registrations are
+// bounded by JipperKeyViewer's own rain pool ceiling of 64.
+//
+// The set is flat across MODs rather than per-MOD because the hook has only a raw instance pointer
+// and no way to know which MOD to ask. Ownership is still recorded so teardown can drop exactly one
+// MOD's entries.
+struct ManagedRenderHost {
+    uint64_t instance_ptr = 0;
+    uint32_t bundle_id = 0;
+};
+std::mutex g_managed_render_hosts_lock;
+std::shared_ptr<const std::vector<ManagedRenderHost>> g_managed_render_hosts;
+std::map<std::string, std::vector<uint64_t>> g_managed_render_hosts_by_mod;
+
+bool is_managed_render_host(uint64_t instance_ptr) {
+    if (instance_ptr == 0)
+        return false;
+    const auto hosts = std::atomic_load_explicit(
+        &g_managed_render_hosts,
+        std::memory_order_acquire);
+    if (!hosts || hosts->empty())
+        return false;
+    const auto found = std::lower_bound(
+        hosts->begin(),
+        hosts->end(),
+        instance_ptr,
+        [](const ManagedRenderHost &host, uint64_t value) {
+            return host.instance_ptr < value;
+        });
+    return found != hosts->end() && found->instance_ptr == instance_ptr;
+}
+
+// Rebuilds and publishes the flat sorted set from the per-MOD lists. Caller holds the lock.
+void republish_managed_render_hosts_locked() {
+    auto rebuilt = std::make_shared<std::vector<ManagedRenderHost>>();
+    for (const auto &entry : g_managed_render_hosts_by_mod) {
+        for (const uint64_t instance_ptr : entry.second)
+            rebuilt->push_back(ManagedRenderHost{.instance_ptr = instance_ptr, .bundle_id = 0});
+    }
+    std::sort(
+        rebuilt->begin(),
+        rebuilt->end(),
+        [](const ManagedRenderHost &a, const ManagedRenderHost &b) {
+            return a.instance_ptr < b.instance_ptr;
+        });
+    rebuilt->erase(
+        std::unique(
+            rebuilt->begin(),
+            rebuilt->end(),
+            [](const ManagedRenderHost &a, const ManagedRenderHost &b) {
+                return a.instance_ptr == b.instance_ptr;
+            }),
+        rebuilt->end());
+    std::atomic_store_explicit(
+        &g_managed_render_hosts,
+        std::shared_ptr<const std::vector<ManagedRenderHost>>(std::move(rebuilt)),
+        std::memory_order_release);
+}
+
+struct OwnerOverlayDispatchTarget {
+    std::shared_ptr<OwnerOverlaySession> session;
+    PcModSessionToken pc_mod_session;
+    uint64_t after_op_mask = 0;
+    std::vector<uint32_t> bundle_ids;
+};
+using OwnerOverlayDispatchSnapshot = std::vector<OwnerOverlayDispatchTarget>;
+
+struct SessionRuleMask {
+    PcModSessionToken pc_mod_session;
+    uint64_t before_op_mask = 0;
+    uint64_t after_op_mask = 0;
+};
+using SessionRuleMaskSnapshot = std::vector<SessionRuleMask>;
 
 struct DispatcherRuntimeSlot {
     std::atomic<void *> original{nullptr};
@@ -673,6 +856,8 @@ struct DispatcherRuntimeSlot {
     std::atomic<uint32_t> enabled{0};
     std::shared_ptr<const ManagedEventDispatchSnapshot> managed_event_after_rules;
     std::shared_ptr<const ManagedPrefixDispatchSnapshot> managed_prefix_before_rules;
+    std::shared_ptr<const OwnerOverlayDispatchSnapshot> owner_overlay_after_rules;
+    std::shared_ptr<const SessionRuleMaskSnapshot> session_rule_masks;
     bool permanently_bound = false;
     std::string bound_key;
     std::string bound_abi_kind;
@@ -680,6 +865,8 @@ struct DispatcherRuntimeSlot {
     void *bound_function = nullptr;
     void *detour_entry = nullptr;
 };
+
+bool pc_mod_session_token_active(const PcModSessionToken &session);
 
 struct DispatcherRuntimePage {
     int base_index = 0;
@@ -790,6 +977,27 @@ bool parse_managed_prefix_rule_id(const std::string &rule_id, uint32_t *managed_
     return true;
 }
 
+// Render-callback rule ids carry their own prefix so a malformed one cannot be silently accepted as
+// an ordinary prefix rule, which would drop the owner prefilter and dispatch on every game call.
+bool parse_managed_render_rule_id(const std::string &rule_id, uint32_t *managed_prefix_id) {
+    if (managed_prefix_id == nullptr)
+        return false;
+    *managed_prefix_id = 0;
+    const size_t prefix_length = std::strlen(kManagedRenderRuleIdPrefix);
+    if (rule_id.size() <= prefix_length + 1 ||
+        rule_id.compare(0, prefix_length, kManagedRenderRuleIdPrefix) != 0)
+        return false;
+
+    const char *cursor = rule_id.c_str() + prefix_length;
+    char *end = nullptr;
+    const unsigned long value = std::strtoul(cursor, &end, 10);
+    if (end == cursor || end == nullptr || *end != ':' || value == 0 || value > 0xFFFFFFu)
+        return false;
+
+    *managed_prefix_id = static_cast<uint32_t>(value);
+    return true;
+}
+
 void push_managed_event(ManagedEventRing *ring,
                         const PcCompatManagedEventV2 &event,
                         bool lifecycle_boundary);
@@ -819,6 +1027,10 @@ void reset_managed_event_state_locked() {
         std::atomic_store_explicit(
             &runtime.managed_prefix_before_rules,
             std::shared_ptr<const ManagedPrefixDispatchSnapshot>{},
+            std::memory_order_release);
+        std::atomic_store_explicit(
+            &runtime.owner_overlay_after_rules,
+            std::shared_ptr<const OwnerOverlayDispatchSnapshot>{},
             std::memory_order_release);
     });
     g_managed_event_registry_epoch.fetch_add(1, std::memory_order_acq_rel);
@@ -866,6 +1078,21 @@ size_t retire_managed_event_rings(const std::vector<uint32_t> &bundle_ids) {
 constexpr uint64_t kUnityHudStablePointMask =
     (1ULL << kRuleOpOverlayShow) |
     (1ULL << kRuleOpOverlayShowPractice) |
+    (1ULL << kRuleOpOverlayHide) |
+    (1ULL << kRuleOpOverlayUpdatePlayers) |
+    (1ULL << kRuleOpPublishMarginSnapshot) |
+    (1ULL << kRuleOpOverlayRecordHit) |
+    (1ULL << kRuleOpOverlayResetJudgement) |
+    (1ULL << kRuleOpOverlayRecordFloorMove) |
+    (1ULL << kRuleOpOverlayRecordPlayerHit) |
+    (1ULL << kRuleOpOverlayRecordDeath) |
+    (1ULL << kRuleOpOverlayRecordHitTiming) |
+    (1ULL << kRuleOpOverlayPollTelemetry);
+
+constexpr uint64_t kOwnerOverlayOpMask =
+    (1ULL << kRuleOpOverlayShow) |
+    (1ULL << kRuleOpOverlayShowPractice) |
+    (1ULL << kRuleOpOverlayHandleStateChange) |
     (1ULL << kRuleOpOverlayHide) |
     (1ULL << kRuleOpOverlayUpdatePlayers) |
     (1ULL << kRuleOpPublishMarginSnapshot) |
@@ -975,17 +1202,187 @@ std::map<std::string, std::map<uint32_t, ManagedPrefixOrderMetadata>>
     g_managed_postfix_order_plans;
 std::map<std::string, std::map<uint32_t, ManagedPrefixOrderMetadata>>
     g_managed_postfix_order_plan_staging;
-OverlayRuntimeState g_overlay_state;
+// This session is not an owner fallback. It holds official game facts sampled
+// once per native observation point. Owner sessions retain their own HUD
+// lifecycle, counters and presentation state; consumers such as JPOV read this
+// state directly instead of borrowing another MOD's projection.
+OwnerOverlaySession g_legacy_overlay_session;
+std::mutex g_owner_overlay_sessions_lock;
+std::map<std::string, std::shared_ptr<OwnerOverlaySession>> g_owner_overlay_sessions;
+std::atomic<uint64_t> g_owner_overlay_registry_generation{1};
+std::atomic<uint64_t> g_next_owner_overlay_session_generation{1};
+thread_local OwnerOverlaySession *g_active_owner_overlay_session = nullptr;
+
+OwnerOverlaySession &active_owner_overlay_session() {
+    return g_active_owner_overlay_session != nullptr
+        ? *g_active_owner_overlay_session
+        : g_legacy_overlay_session;
+}
+
+OverlayRuntimeState &active_overlay_state() {
+    return active_owner_overlay_session().state;
+}
+
+class OwnerOverlayScope final {
+public:
+    explicit OwnerOverlayScope(OwnerOverlaySession *session)
+        : previous_(g_active_owner_overlay_session) {
+        g_active_owner_overlay_session = session;
+    }
+
+    OwnerOverlayScope(const OwnerOverlayScope &) = delete;
+    OwnerOverlayScope &operator=(const OwnerOverlayScope &) = delete;
+
+    ~OwnerOverlayScope() {
+        g_active_owner_overlay_session = previous_;
+    }
+
+private:
+    OwnerOverlaySession *previous_ = nullptr;
+};
+
+std::shared_ptr<OwnerOverlaySession> get_or_create_owner_overlay_session(
+    const std::string &mod_id) {
+    if (mod_id.empty())
+        return {};
+    std::lock_guard<std::mutex> guard(g_owner_overlay_sessions_lock);
+    const auto found = g_owner_overlay_sessions.find(mod_id);
+    if (found != g_owner_overlay_sessions.end() &&
+        found->second != nullptr &&
+        found->second->retired.load(std::memory_order_acquire) == 0) {
+        return found->second;
+    }
+
+    auto session = std::make_shared<OwnerOverlaySession>();
+    session->mod_id = mod_id;
+    session->session_generation =
+        g_next_owner_overlay_session_generation.fetch_add(1, std::memory_order_relaxed);
+    uint32_t generation_seed = static_cast<uint32_t>(
+        session->session_generation ^ (session->session_generation >> 32u));
+    if (generation_seed == 0)
+        generation_seed = 1;
+    session->state.generation.store(generation_seed, std::memory_order_relaxed);
+    g_owner_overlay_sessions[mod_id] = session;
+    g_owner_overlay_registry_generation.fetch_add(1, std::memory_order_release);
+    return session;
+}
+
+std::shared_ptr<OwnerOverlaySession> owner_overlay_session_for_mod(
+    const char *mod_id) {
+    if (mod_id == nullptr || mod_id[0] == '\0')
+        return {};
+    struct ThreadCache {
+        uint64_t registry_generation = 0;
+        std::shared_ptr<OwnerOverlaySession> session;
+    };
+    static thread_local std::map<std::string, ThreadCache> caches;
+    auto [entry, inserted] = caches.try_emplace(mod_id);
+    auto &cache = entry->second;
+    const uint64_t generation =
+        g_owner_overlay_registry_generation.load(std::memory_order_acquire);
+    if (!inserted && cache.registry_generation == generation)
+        return cache.session;
+
+    {
+        std::lock_guard<std::mutex> guard(g_owner_overlay_sessions_lock);
+        const auto found = g_owner_overlay_sessions.find(entry->first);
+        cache.session = found != g_owner_overlay_sessions.end()
+            ? found->second
+            : std::shared_ptr<OwnerOverlaySession>{};
+    }
+    cache.registry_generation = generation;
+    return cache.session;
+}
+
+std::shared_ptr<OwnerOverlaySession> default_owner_overlay_session() {
+    std::lock_guard<std::mutex> guard(g_owner_overlay_sessions_lock);
+    std::shared_ptr<OwnerOverlaySession> fallback;
+    for (const auto &entry : g_owner_overlay_sessions) {
+        const auto &session = entry.second;
+        if (session == nullptr ||
+            session->retired.load(std::memory_order_acquire) != 0) {
+            continue;
+        }
+        if (fallback == nullptr)
+            fallback = session;
+        if (session->state.visible.load(std::memory_order_acquire) != 0)
+            return session;
+    }
+    return fallback;
+}
+
+OverlayRuntimeState &default_overlay_state_for_legacy_api() {
+    // Hold the selected owner for the duration of the exported scalar read,
+    // even if another thread retires it immediately after this lookup.
+    static thread_local std::shared_ptr<OwnerOverlaySession> selected;
+    selected = default_owner_overlay_session();
+    return selected != nullptr ? selected->state : g_legacy_overlay_session.state;
+}
+
+bool any_owner_overlay_visible() {
+    std::lock_guard<std::mutex> guard(g_owner_overlay_sessions_lock);
+    return std::any_of(
+        g_owner_overlay_sessions.begin(),
+        g_owner_overlay_sessions.end(),
+        [](const auto &entry) {
+            const auto &session = entry.second;
+            return session != nullptr &&
+                session->retired.load(std::memory_order_acquire) == 0 &&
+                session->state.visible.load(std::memory_order_acquire) != 0;
+        });
+}
+
+void retire_owner_overlay_session(const std::string &mod_id) {
+    if (mod_id.empty())
+        return;
+    std::shared_ptr<OwnerOverlaySession> retired;
+    {
+        std::lock_guard<std::mutex> guard(g_owner_overlay_sessions_lock);
+        const auto found = g_owner_overlay_sessions.find(mod_id);
+        if (found == g_owner_overlay_sessions.end())
+            return;
+        retired = found->second;
+        g_owner_overlay_sessions.erase(found);
+        g_owner_overlay_registry_generation.fetch_add(1, std::memory_order_release);
+    }
+    if (retired != nullptr) {
+        retired->retired.store(1, std::memory_order_release);
+        retired->state.visible.store(0, std::memory_order_release);
+        retired->state.generation.fetch_add(1, std::memory_order_release);
+    }
+}
+
+void clear_owner_overlay_sessions() {
+    std::vector<std::shared_ptr<OwnerOverlaySession>> retired;
+    {
+        std::lock_guard<std::mutex> guard(g_owner_overlay_sessions_lock);
+        retired.reserve(g_owner_overlay_sessions.size());
+        for (auto &entry : g_owner_overlay_sessions)
+            retired.push_back(std::move(entry.second));
+        g_owner_overlay_sessions.clear();
+        g_owner_overlay_registry_generation.fetch_add(1, std::memory_order_release);
+    }
+    for (const auto &session : retired) {
+        if (session == nullptr)
+            continue;
+        session->retired.store(1, std::memory_order_release);
+        session->state.visible.store(0, std::memory_order_release);
+        session->state.generation.fetch_add(1, std::memory_order_release);
+    }
+}
 using OverlayChangedCallback = void (*)(uint32_t generation);
 std::atomic<OverlayChangedCallback> g_overlay_changed_callback{nullptr};
+constexpr uint32_t kOverlayChangedCallbackDescriptorSlot = 0x3000F001u;
+constexpr uint32_t kManagedPrefixCallbackDescriptorSlot = 0x3000F002u;
 constexpr int64_t kMarginSnapshotCallbackIntervalMs = 50;
-std::atomic<int64_t> g_overlay_last_margin_callback_ms{0};
 std::mutex g_metadata_resolve_lock;
 Il2CppMetadataApi g_il2cpp_metadata;
 std::atomic<int32_t> g_margin_percent_acc_offset{-1};
 std::atomic<int32_t> g_margin_percent_x_acc_offset{-1};
 std::mutex g_hit_margin_metadata_lock;
 std::atomic<int32_t> g_margin_hit_counts_offset{-1};
+std::atomic<uint32_t> g_next_api_descriptor_slot{0x20000000u};
+std::atomic<uint32_t> g_next_scalar_descriptor_slot{0x40000000u};
 std::atomic<void *> g_mistakes_margin_trackers_field{nullptr};
 std::atomic<uintptr_t> g_margin_tracker_instance{0};
 
@@ -1023,25 +1420,69 @@ struct HitMarginSnapshotState {
 HitMarginSnapshotState g_hit_margin_snapshot;
 std::atomic<int64_t> g_last_hit_margin_fallback_poll_ms{0};
 std::atomic<int64_t> g_last_hit_margin_authoritative_publish_ms{0};
-std::atomic<uint32_t> g_resource_change_rabbit{1};
-std::atomic<uint32_t> g_resource_change_ball_color{1};
-std::atomic<uint32_t> g_resource_change_tile_color{1};
-std::atomic<float> g_resource_planet_r{0.8125f};
-std::atomic<float> g_resource_planet_g{0.70703125f};
-std::atomic<float> g_resource_planet_b{0.96875f};
-std::atomic<float> g_resource_planet_a{1.0f};
-std::atomic<float> g_resource_title_r{0.56640625f};
-std::atomic<float> g_resource_title_g{0.46875f};
-std::atomic<float> g_resource_title_b{0.6328125f};
-std::atomic<float> g_resource_title_a{1.0f};
-std::atomic<float> g_resource_tile_r{0.94921875f};
-std::atomic<float> g_resource_tile_g{0.87109375f};
-std::atomic<float> g_resource_tile_b{1.0f};
-std::atomic<float> g_resource_tile_a{1.0f};
+std::atomic<uint32_t> g_resource_change_rabbit{0};
+std::atomic<uint32_t> g_resource_change_ball_color{0};
+std::atomic<uint32_t> g_resource_change_tile_color{0};
+constexpr ColorValue kResourceDefaultPlanetColor{0.8125f, 0.70703125f, 0.96875f, 1.0f};
+constexpr ColorValue kResourceDefaultTitleColor{0.56640625f, 0.46875f, 0.6328125f, 1.0f};
+constexpr ColorValue kResourceDefaultTileColor{0.94921875f, 0.87109375f, 1.0f, 1.0f};
+std::atomic<float> g_resource_planet_r{kResourceDefaultPlanetColor.r};
+std::atomic<float> g_resource_planet_g{kResourceDefaultPlanetColor.g};
+std::atomic<float> g_resource_planet_b{kResourceDefaultPlanetColor.b};
+std::atomic<float> g_resource_planet_a{kResourceDefaultPlanetColor.a};
+std::atomic<float> g_resource_title_r{kResourceDefaultTitleColor.r};
+std::atomic<float> g_resource_title_g{kResourceDefaultTitleColor.g};
+std::atomic<float> g_resource_title_b{kResourceDefaultTitleColor.b};
+std::atomic<float> g_resource_title_a{kResourceDefaultTitleColor.a};
+std::atomic<float> g_resource_tile_r{kResourceDefaultTileColor.r};
+std::atomic<float> g_resource_tile_g{kResourceDefaultTileColor.g};
+std::atomic<float> g_resource_tile_b{kResourceDefaultTileColor.b};
+std::atomic<float> g_resource_tile_a{kResourceDefaultTileColor.a};
 std::mutex g_resource_state_lock;
 std::string g_resource_state_mod_id;
 int64_t g_resource_state_generation = 0;
 std::string g_resource_pack_name{"Jipper Resource Pack"};
+constexpr uint32_t kResourceContributionRabbit = 1u << 0;
+constexpr uint32_t kResourceContributionPlanet = 1u << 1;
+constexpr uint32_t kResourceContributionTile = 1u << 2;
+
+struct ResourceOwnerKey {
+    std::string mod_id;
+    int64_t session_generation = 0;
+
+    bool operator<(const ResourceOwnerKey &other) const {
+        if (mod_id != other.mod_id)
+            return mod_id < other.mod_id;
+        return session_generation < other.session_generation;
+    }
+};
+
+bool resource_owner_key_equal(
+    const ResourceOwnerKey &left,
+    const ResourceOwnerKey &right) {
+    return left.mod_id == right.mod_id &&
+           left.session_generation == right.session_generation;
+}
+
+struct ResourceContribution {
+    uint32_t feature_mask = 0;
+    ColorValue planet_color = kResourceDefaultPlanetColor;
+    ColorValue title_color = kResourceDefaultTitleColor;
+    ColorValue tile_color = kResourceDefaultTileColor;
+    std::string resource_pack_name;
+    uint64_t registration_sequence = 0;
+};
+
+struct ResourceEffectiveState {
+    bool present = false;
+    ResourceOwnerKey owner;
+    ResourceContribution contribution;
+};
+
+std::map<ResourceOwnerKey, ResourceContribution> g_resource_contributions;
+std::map<std::string, int64_t> g_resource_latest_generation_by_mod;
+uint64_t g_resource_contribution_sequence = 0;
+ResourceEffectiveState g_resource_effective_state;
 constexpr uint32_t kResourceRestoreRabbit = 1u << 0;
 constexpr uint32_t kResourceRestorePlanet = 1u << 1;
 constexpr uint32_t kResourceRestoreTile = 1u << 2;
@@ -1051,21 +1492,28 @@ void *g_resource_editor_handle = nullptr;
 void *g_resource_original_rabbit_sprite_handle = nullptr;
 std::vector<void *> g_resource_planet_handles;
 std::vector<void *> g_resource_floor_handles;
+std::set<void *> g_resource_planet_objects;
+std::set<void *> g_resource_floor_objects;
 void *g_resource_logo_text_handle = nullptr;
 std::mutex g_resource_asset_lock;
 std::string g_resource_rabbit_sprite_mod_id;
 int64_t g_resource_rabbit_sprite_generation = 0;
 void *g_resource_rabbit_sprite_handle = nullptr;
+struct ResourceSpriteContribution {
+    void *handle = nullptr;
+    uint64_t registration_sequence = 0;
+};
+std::map<ResourceOwnerKey, ResourceSpriteContribution> g_resource_sprite_contributions;
+std::map<std::string, int64_t> g_resource_sprite_latest_generation_by_mod;
+uint64_t g_resource_sprite_sequence = 0;
 std::mutex g_timeline_state_lock;
 std::vector<int32_t> g_checkpoint_seq_ids;
 std::string g_level_identity;
 int32_t g_session_start_seq_id = 0;
 bool g_session_start_seq_valid = false;
 bool g_floor_metadata_initialized = false;
-bool g_session_speed_initialized = false;
 bool g_music_has_played = false;
-std::atomic<int64_t> g_last_timeline_poll_ms{0};
-std::atomic<uint32_t> g_last_published_input_generation{0};
+std::atomic<uint32_t> g_shared_overlay_session_visible{0};
 std::mutex g_hook_coordinator_lock;
 std::condition_variable g_hook_coordinator_condition;
 std::once_flag g_hook_coordinator_once;
@@ -1080,6 +1528,18 @@ uint32_t float_to_bits(float value) {
 
 float bits_to_float(uint32_t bits) {
     float value = 0.0f;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+uint64_t double_to_bits(double value) {
+    uint64_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+double bits_to_double(uint64_t bits) {
+    double value = 0.0;
     std::memcpy(&value, &bits, sizeof(value));
     return value;
 }
@@ -1762,6 +2222,7 @@ HookSlotRuleRef make_rule_ref(const RuntimeBundle &bundle,
     HookSlotRuleRef ref{
         .bundle_id = bundle.bundle_id,
         .target_id = target.id,
+        .pc_mod_session = bundle.pc_mod_session,
         .rule_id = rule.id,
         .feature_id = rule.feature_id,
         .stage_code = rule.stage_code,
@@ -1784,6 +2245,10 @@ HookSlotRuleRef make_rule_ref(const RuntimeBundle &bundle,
                !parse_managed_prefix_rule_id(rule.id, &ref.managed_prefix_id)) {
         ref.enabled = false;
         ref.disabled_reason = "malformed managed prefix rule id";
+    } else if (rule.op_code == kRuleOpManagedRenderCallback &&
+               !parse_managed_render_rule_id(rule.id, &ref.managed_prefix_id)) {
+        ref.enabled = false;
+        ref.disabled_reason = "malformed managed render rule id";
     }
 
     if (ref.managed_prefix_id != 0) {
@@ -1900,6 +2365,7 @@ bool is_first_dispatcher_before_op_supported(int op_code) {
         case kRuleOpResourceOverridePlanetColorArg:
         case kRuleOpResourceSkipTileColorOriginal:
         case kRuleOpManagedSynchronousPrefix:
+        case kRuleOpManagedRenderCallback:
             return true;
         default:
             return false;
@@ -2070,6 +2536,30 @@ void rebuild_slots_locked() {
         sort_rule_refs(slot.replace_rules);
         sort_rule_refs(slot.after_rules);
 
+        if (slot.state == SlotResolved &&
+            slot_enabled_rule_count(slot) != 0 &&
+            slot.function != nullptr) {
+            uintptr_t protected_function = 0;
+            if (!PC_COMPAT_RESOLVE_ADDRESS(
+                    0,
+                    0,
+                    slot.slot_id,
+                    0 |
+                        0,
+                    reinterpret_cast<uintptr_t>(slot.function),
+                    &protected_function) ||
+                protected_function !=
+                    reinterpret_cast<uintptr_t>(slot.function)) {
+                slot.resolve_failed = true;
+                slot.state = SlotInstallFailed;
+                slot.install_blocked = true;
+                slot.status = "protected function descriptor resolve failed";
+            } else {
+                slot.function = reinterpret_cast<void *>(protected_function);
+                slot.status = "resolved through protected function descriptor";
+            }
+        }
+
         if (slot.state == SlotResolved && slot_enabled_rule_count(slot) == 0) {
             slot.state = SlotDisabledByCapability;
             slot.status = "all rules disabled";
@@ -2231,13 +2721,64 @@ void *resolve_il2cpp_symbol(const char *name) {
 }
 
 template <typename T>
+bool publish_protected_il2cpp_symbol(
+    T &destination,
+    const char *name,
+    void *candidate,
+    std::string &error) {
+    uint32_t descriptor_slot = g_next_api_descriptor_slot.fetch_add(
+        1, std::memory_order_relaxed);
+    if (descriptor_slot == 0) {
+        descriptor_slot = g_next_api_descriptor_slot.fetch_add(
+            1, std::memory_order_relaxed);
+    }
+    uintptr_t protected_address = 0;
+    if (!PC_COMPAT_RESOLVE_ADDRESS(
+            0,
+            0,
+            descriptor_slot,
+            0 |
+                0,
+            reinterpret_cast<uintptr_t>(candidate),
+            &protected_address) ||
+        protected_address != reinterpret_cast<uintptr_t>(candidate)) {
+        destination = nullptr;
+        if (error.empty()) {
+            error = std::string(
+                "protected IL2CPP metadata API descriptor failed: ") + name;
+        }
+        return false;
+    }
+
+    destination = reinterpret_cast<T>(protected_address);
+    return true;
+}
+
+template <typename T>
 bool load_il2cpp_symbol(T &destination, const char *name, std::string &error) {
-    destination = reinterpret_cast<T>(resolve_il2cpp_symbol(name));
-    if (destination != nullptr)
+    void *candidate = resolve_il2cpp_symbol(name);
+    if (candidate == nullptr) {
+        destination = nullptr;
+        if (error.empty())
+            error = std::string("missing IL2CPP metadata symbol: ") + name;
+        return false;
+    }
+    return publish_protected_il2cpp_symbol(
+        destination, name, candidate, error);
+}
+
+template <typename T>
+bool load_optional_il2cpp_symbol(
+    T &destination,
+    const char *name,
+    std::string &error) {
+    void *candidate = resolve_il2cpp_symbol(name);
+    if (candidate == nullptr) {
+        destination = nullptr;
         return true;
-    if (error.empty())
-        error = std::string("missing IL2CPP metadata symbol: ") + name;
-    return false;
+    }
+    return publish_protected_il2cpp_symbol(
+        destination, name, candidate, error);
 }
 
 bool load_il2cpp_metadata_api_locked(std::string &error) {
@@ -2245,78 +2786,90 @@ bool load_il2cpp_metadata_api_locked(std::string &error) {
         g_il2cpp_metadata.handle = dlopen("libil2cpp.so", RTLD_NOW | RTLD_NOLOAD);
     }
 
+    Il2CppMetadataApi resolved;
+    resolved.handle = g_il2cpp_metadata.handle;
     bool complete = true;
-    complete &= load_il2cpp_symbol(g_il2cpp_metadata.domain_get, "il2cpp_domain_get", error);
-    complete &= load_il2cpp_symbol(g_il2cpp_metadata.get_corlib, "il2cpp_get_corlib", error);
-    complete &= load_il2cpp_symbol(g_il2cpp_metadata.thread_attach, "il2cpp_thread_attach", error);
+    complete &= load_il2cpp_symbol(resolved.domain_get, "il2cpp_domain_get", error);
+    complete &= load_il2cpp_symbol(resolved.get_corlib, "il2cpp_get_corlib", error);
+    complete &= load_il2cpp_symbol(resolved.thread_attach, "il2cpp_thread_attach", error);
     complete &= load_il2cpp_symbol(
-        g_il2cpp_metadata.domain_get_assemblies,
+        resolved.domain_get_assemblies,
         "il2cpp_domain_get_assemblies",
         error);
     complete &= load_il2cpp_symbol(
-        g_il2cpp_metadata.assembly_get_image,
+        resolved.assembly_get_image,
         "il2cpp_assembly_get_image",
         error);
-    complete &= load_il2cpp_symbol(g_il2cpp_metadata.image_get_name, "il2cpp_image_get_name", error);
-    complete &= load_il2cpp_symbol(g_il2cpp_metadata.class_from_name, "il2cpp_class_from_name", error);
-    complete &= load_il2cpp_symbol(g_il2cpp_metadata.object_get_class, "il2cpp_object_get_class", error);
-    complete &= load_il2cpp_symbol(g_il2cpp_metadata.class_get_type, "il2cpp_class_get_type", error);
-    complete &= load_il2cpp_symbol(g_il2cpp_metadata.type_get_object, "il2cpp_type_get_object", error);
+    complete &= load_il2cpp_symbol(resolved.image_get_name, "il2cpp_image_get_name", error);
+    complete &= load_il2cpp_symbol(resolved.class_from_name, "il2cpp_class_from_name", error);
+    complete &= load_il2cpp_symbol(resolved.object_get_class, "il2cpp_object_get_class", error);
+    complete &= load_il2cpp_symbol(resolved.class_get_type, "il2cpp_class_get_type", error);
+    complete &= load_il2cpp_symbol(resolved.type_get_object, "il2cpp_type_get_object", error);
     complete &= load_il2cpp_symbol(
-        g_il2cpp_metadata.class_get_field_from_name,
+        resolved.class_get_field_from_name,
         "il2cpp_class_get_field_from_name",
         error);
-    complete &= load_il2cpp_symbol(g_il2cpp_metadata.class_get_methods, "il2cpp_class_get_methods", error);
-    complete &= load_il2cpp_symbol(g_il2cpp_metadata.field_get_offset, "il2cpp_field_get_offset", error);
+    complete &= load_il2cpp_symbol(resolved.class_get_methods, "il2cpp_class_get_methods", error);
+    complete &= load_il2cpp_symbol(resolved.field_get_offset, "il2cpp_field_get_offset", error);
     complete &= load_il2cpp_symbol(
-        g_il2cpp_metadata.field_static_get_value,
+        resolved.field_static_get_value,
         "il2cpp_field_static_get_value",
         error);
-    complete &= load_il2cpp_symbol(g_il2cpp_metadata.method_get_name, "il2cpp_method_get_name", error);
+    complete &= load_il2cpp_symbol(resolved.method_get_name, "il2cpp_method_get_name", error);
     complete &= load_il2cpp_symbol(
-        g_il2cpp_metadata.method_get_param_count,
+        resolved.method_get_param_count,
         "il2cpp_method_get_param_count",
         error);
-    complete &= load_il2cpp_symbol(g_il2cpp_metadata.method_get_param, "il2cpp_method_get_param", error);
+    complete &= load_il2cpp_symbol(resolved.method_get_param, "il2cpp_method_get_param", error);
     complete &= load_il2cpp_symbol(
-        g_il2cpp_metadata.method_get_return_type,
+        resolved.method_get_return_type,
         "il2cpp_method_get_return_type",
         error);
-    complete &= load_il2cpp_symbol(g_il2cpp_metadata.method_get_flags, "il2cpp_method_get_flags", error);
+    complete &= load_il2cpp_symbol(resolved.method_get_flags, "il2cpp_method_get_flags", error);
     complete &= load_il2cpp_symbol(
-        g_il2cpp_metadata.method_is_generic,
+        resolved.method_is_generic,
         "il2cpp_method_is_generic",
         error);
-    complete &= load_il2cpp_symbol(g_il2cpp_metadata.type_get_name, "il2cpp_type_get_name", error);
-    complete &= load_il2cpp_symbol(g_il2cpp_metadata.runtime_invoke, "il2cpp_runtime_invoke", error);
-    complete &= load_il2cpp_symbol(g_il2cpp_metadata.object_unbox, "il2cpp_object_unbox", error);
-    complete &= load_il2cpp_symbol(g_il2cpp_metadata.string_new, "il2cpp_string_new", error);
-    complete &= load_il2cpp_symbol(g_il2cpp_metadata.string_chars, "il2cpp_string_chars", error);
-    complete &= load_il2cpp_symbol(g_il2cpp_metadata.string_length, "il2cpp_string_length", error);
+    complete &= load_il2cpp_symbol(resolved.type_get_name, "il2cpp_type_get_name", error);
+    complete &= load_il2cpp_symbol(resolved.runtime_invoke, "il2cpp_runtime_invoke", error);
+    complete &= load_il2cpp_symbol(resolved.object_unbox, "il2cpp_object_unbox", error);
+    complete &= load_il2cpp_symbol(resolved.string_new, "il2cpp_string_new", error);
+    complete &= load_il2cpp_symbol(resolved.string_chars, "il2cpp_string_chars", error);
+    complete &= load_il2cpp_symbol(resolved.string_length, "il2cpp_string_length", error);
     complete &= load_il2cpp_symbol(
-        g_il2cpp_metadata.array_object_header_size,
+        resolved.array_object_header_size,
         "il2cpp_array_object_header_size",
         error);
     complete &= load_il2cpp_symbol(
-        g_il2cpp_metadata.array_length,
+        resolved.array_length,
         "il2cpp_array_length",
         error);
     // Object/array allocation is presentation-only functionality.  Keep it
     // optional so a game build that omits one export can still load ordinary
     // fixed-op hook rules; the UnityMain factory will fail closed instead.
-    g_il2cpp_metadata.object_new = reinterpret_cast<Il2CppMetadataApi::ObjectNewFn>(
-        resolve_il2cpp_symbol("il2cpp_object_new"));
-    g_il2cpp_metadata.array_new = reinterpret_cast<Il2CppMetadataApi::ArrayNewFn>(
-        resolve_il2cpp_symbol("il2cpp_array_new"));
-    complete &= load_il2cpp_symbol(g_il2cpp_metadata.gchandle_new, "il2cpp_gchandle_new", error);
+    complete &= load_optional_il2cpp_symbol(
+        resolved.object_new,
+        "il2cpp_object_new",
+        error);
+    complete &= load_optional_il2cpp_symbol(
+        resolved.array_new,
+        "il2cpp_array_new",
+        error);
+    complete &= load_il2cpp_symbol(resolved.gchandle_new, "il2cpp_gchandle_new", error);
     complete &= load_il2cpp_symbol(
-        g_il2cpp_metadata.gchandle_get_target,
+        resolved.gchandle_get_target,
         "il2cpp_gchandle_get_target",
         error);
-    complete &= load_il2cpp_symbol(g_il2cpp_metadata.gchandle_free, "il2cpp_gchandle_free", error);
-    g_il2cpp_metadata.free_memory = reinterpret_cast<Il2CppMetadataApi::FreeFn>(
-        resolve_il2cpp_symbol("il2cpp_free"));
-    return complete;
+    complete &= load_il2cpp_symbol(resolved.gchandle_free, "il2cpp_gchandle_free", error);
+    complete &= load_optional_il2cpp_symbol(
+        resolved.free_memory,
+        "il2cpp_free",
+        error);
+    if (!complete)
+        return false;
+
+    g_il2cpp_metadata = std::move(resolved);
+    return true;
 }
 
 bool refresh_il2cpp_images_locked(std::string &error) {
@@ -2422,7 +2975,24 @@ int32_t find_field_offset(void *klass, const char *primary_name, const char *fal
     const size_t offset = g_il2cpp_metadata.field_get_offset(field);
     if (offset == 0 || offset > 0x10000u)
         return -1;
-    return static_cast<int32_t>(offset);
+    uint32_t descriptor_slot = g_next_scalar_descriptor_slot.fetch_add(
+        1, std::memory_order_relaxed);
+    if (descriptor_slot == 0) {
+        descriptor_slot = g_next_scalar_descriptor_slot.fetch_add(
+            1, std::memory_order_relaxed);
+    }
+    uint64_t protected_offset = 0;
+    if (!PC_COMPAT_RESOLVE_SCALAR(
+            0,
+            0,
+            descriptor_slot,
+            static_cast<uint64_t>(offset),
+            &protected_offset) ||
+        protected_offset != static_cast<uint64_t>(offset) ||
+        protected_offset > static_cast<uint64_t>(INT32_MAX)) {
+        return -1;
+    }
+    return static_cast<int32_t>(protected_offset);
 }
 
 bool resolve_margin_tracker_offsets(void *klass, std::string &error) {
@@ -3056,10 +3626,15 @@ struct TelemetryRuntimeCache {
     void *audio_clip_klass = nullptr;
     void *scr_controller_get_instance = nullptr;
     void *scr_controller_get_planetary_system = nullptr;
+    void *scr_controller_get_curr_floor = nullptr;
+    void *scr_controller_get_paused = nullptr;
     void *scr_conductor_get_instance = nullptr;
     void *scr_conductor_get_songposition_minusi = nullptr;
     void *scr_level_maker_get_instance = nullptr;
     void *rdc_get_auto = nullptr;
+    void *ado_base_get_controller = nullptr;
+    void *ado_base_get_conductor = nullptr;
+    void *ado_base_get_is_scn_game = nullptr;
     void *ado_base_get_is_official_level = nullptr;
     void *ado_base_get_current_level = nullptr;
     void *ado_base_get_level_path = nullptr;
@@ -3076,8 +3651,10 @@ struct TelemetryRuntimeCache {
     int32_t scr_controller_current_seq_id_offset = -1;
     int32_t scr_controller_current_state_offset = -1;
     int32_t scr_controller_no_fail_offset = -1;
+    int32_t scr_controller_first_floor_offset = -1;
     int32_t scr_conductor_song_offset = -1;
     int32_t scr_conductor_add_offset_offset = -1;
+    int32_t scr_conductor_is_game_world_offset = -1;
     int32_t scr_level_maker_list_floors_offset = -1;
     int32_t scr_floor_seq_id_offset = -1;
     int32_t scr_floor_entry_time_offset = -1;
@@ -3097,6 +3674,185 @@ bool g_telemetry_cache_building = false;
 
 bool ensure_resource_runtime_cache(std::string &error);
 bool ensure_telemetry_runtime_cache(std::string &error);
+
+bool resource_color_equal(const ColorValue &left, const ColorValue &right) {
+    return left.r == right.r &&
+           left.g == right.g &&
+           left.b == right.b &&
+           left.a == right.a;
+}
+
+ResourceEffectiveState select_resource_effective_state_locked() {
+    ResourceEffectiveState selected;
+    for (const auto &[owner, contribution] : g_resource_contributions) {
+        if (contribution.feature_mask == 0)
+            continue;
+        if (!selected.present ||
+            contribution.registration_sequence >
+                selected.contribution.registration_sequence) {
+            selected.present = true;
+            selected.owner = owner;
+            selected.contribution = contribution;
+        }
+    }
+    return selected;
+}
+
+bool resource_feature_enabled(
+    const ResourceEffectiveState &state,
+    uint32_t feature) {
+    return state.present && (state.contribution.feature_mask & feature) != 0;
+}
+
+uint32_t resource_transition_mask(
+    const ResourceEffectiveState &previous,
+    const ResourceEffectiveState &next) {
+    const bool owner_changed =
+        previous.present != next.present ||
+        (previous.present &&
+         !resource_owner_key_equal(previous.owner, next.owner));
+    uint32_t mask = 0;
+
+    if (owner_changed ||
+        resource_feature_enabled(previous, kResourceContributionRabbit) !=
+            resource_feature_enabled(next, kResourceContributionRabbit)) {
+        if (resource_feature_enabled(previous, kResourceContributionRabbit) ||
+            resource_feature_enabled(next, kResourceContributionRabbit)) {
+            mask |= kResourceRestoreRabbit;
+        }
+    }
+
+    const bool planet_changed =
+        owner_changed ||
+        resource_feature_enabled(previous, kResourceContributionPlanet) !=
+            resource_feature_enabled(next, kResourceContributionPlanet) ||
+        !resource_color_equal(
+            previous.contribution.planet_color,
+            next.contribution.planet_color) ||
+        !resource_color_equal(
+            previous.contribution.title_color,
+            next.contribution.title_color) ||
+        previous.contribution.resource_pack_name !=
+            next.contribution.resource_pack_name;
+    if (planet_changed && (previous.present || next.present))
+        mask |= kResourceRestorePlanet;
+
+    const bool tile_changed =
+        owner_changed ||
+        resource_feature_enabled(previous, kResourceContributionTile) !=
+            resource_feature_enabled(next, kResourceContributionTile) ||
+        !resource_color_equal(
+            previous.contribution.tile_color,
+            next.contribution.tile_color);
+    if (tile_changed &&
+        (resource_feature_enabled(previous, kResourceContributionTile) ||
+         resource_feature_enabled(next, kResourceContributionTile))) {
+        mask |= kResourceRestoreTile;
+    }
+    return mask;
+}
+
+uint32_t publish_resource_effective_state_locked() {
+    const ResourceEffectiveState previous = g_resource_effective_state;
+    const ResourceEffectiveState next = select_resource_effective_state_locked();
+    const uint32_t transition_mask = resource_transition_mask(previous, next);
+    g_resource_effective_state = next;
+
+    const ResourceContribution &contribution = next.contribution;
+    g_resource_change_rabbit.store(
+        resource_feature_enabled(next, kResourceContributionRabbit) ? 1u : 0u,
+        std::memory_order_release);
+    g_resource_change_ball_color.store(
+        resource_feature_enabled(next, kResourceContributionPlanet) ? 1u : 0u,
+        std::memory_order_release);
+    g_resource_change_tile_color.store(
+        resource_feature_enabled(next, kResourceContributionTile) ? 1u : 0u,
+        std::memory_order_release);
+    g_resource_planet_r.store(contribution.planet_color.r, std::memory_order_release);
+    g_resource_planet_g.store(contribution.planet_color.g, std::memory_order_release);
+    g_resource_planet_b.store(contribution.planet_color.b, std::memory_order_release);
+    g_resource_planet_a.store(contribution.planet_color.a, std::memory_order_release);
+    g_resource_title_r.store(contribution.title_color.r, std::memory_order_release);
+    g_resource_title_g.store(contribution.title_color.g, std::memory_order_release);
+    g_resource_title_b.store(contribution.title_color.b, std::memory_order_release);
+    g_resource_title_a.store(contribution.title_color.a, std::memory_order_release);
+    g_resource_tile_r.store(contribution.tile_color.r, std::memory_order_release);
+    g_resource_tile_g.store(contribution.tile_color.g, std::memory_order_release);
+    g_resource_tile_b.store(contribution.tile_color.b, std::memory_order_release);
+    g_resource_tile_a.store(contribution.tile_color.a, std::memory_order_release);
+
+    g_resource_state_mod_id = next.present ? next.owner.mod_id : std::string{};
+    g_resource_state_generation = next.present
+        ? next.owner.session_generation
+        : 0;
+    const std::string resource_pack_name = next.present
+        ? contribution.resource_pack_name
+        : std::string{};
+    g_resource_pack_name = resource_pack_name;
+    if (transition_mask != 0) {
+        g_resource_pending_restore_mask.fetch_or(
+            transition_mask,
+            std::memory_order_release);
+    }
+    return transition_mask;
+}
+
+bool refresh_resource_rabbit_sprite_projection_locked() {
+    ResourceOwnerKey active_owner;
+    bool active = false;
+    {
+        // Lock ordering is asset -> state. State publishers release their lock
+        // before requesting a projection refresh.
+        std::lock_guard<std::mutex> state_guard(g_resource_state_lock);
+        active = resource_feature_enabled(
+            g_resource_effective_state,
+            kResourceContributionRabbit);
+        if (active)
+            active_owner = g_resource_effective_state.owner;
+    }
+
+    void *next_handle = nullptr;
+    if (active) {
+        auto sprite = g_resource_sprite_contributions.find(active_owner);
+        if (sprite == g_resource_sprite_contributions.end() &&
+            active_owner.session_generation <= 0) {
+            for (auto candidate = g_resource_sprite_contributions.begin();
+                 candidate != g_resource_sprite_contributions.end();
+                 ++candidate) {
+                if (candidate->first.mod_id != active_owner.mod_id)
+                    continue;
+                if (sprite == g_resource_sprite_contributions.end() ||
+                    candidate->second.registration_sequence >
+                        sprite->second.registration_sequence) {
+                    sprite = candidate;
+                }
+            }
+        }
+        if (sprite != g_resource_sprite_contributions.end()) {
+            next_handle = sprite->second.handle;
+            active_owner = sprite->first;
+        }
+    }
+    const bool changed = next_handle != g_resource_rabbit_sprite_handle;
+    g_resource_rabbit_sprite_handle = next_handle;
+    g_resource_rabbit_sprite_mod_id = next_handle != nullptr
+        ? active_owner.mod_id
+        : std::string{};
+    g_resource_rabbit_sprite_generation = next_handle != nullptr
+        ? active_owner.session_generation
+        : 0;
+    if (changed) {
+        g_resource_pending_restore_mask.fetch_or(
+            kResourceRestoreRabbit,
+            std::memory_order_release);
+    }
+    return changed;
+}
+
+bool refresh_resource_rabbit_sprite_projection() {
+    std::lock_guard<std::mutex> guard(g_resource_asset_lock);
+    return refresh_resource_rabbit_sprite_projection_locked();
+}
 
 ColorValue resource_planet_color() {
     return {
@@ -3141,6 +3897,11 @@ bool resource_change_ball_color_enabled() {
 
 bool resource_change_tile_color_enabled() {
     return g_resource_change_tile_color.load(std::memory_order_acquire) != 0;
+}
+
+bool resource_has_active_contribution() {
+    std::lock_guard<std::mutex> guard(g_resource_state_lock);
+    return g_resource_effective_state.present;
 }
 
 bool find_method_by_identity(void *klass,
@@ -3423,11 +4184,11 @@ void publish_controller_progress_snapshot() {
     }
 
     void *controller = invoke_object_noargs(get_instance);
-    float progress = bits_to_float(g_overlay_state.progress_bits.load(std::memory_order_acquire));
+    float progress = bits_to_float(active_overlay_state().progress_bits.load(std::memory_order_acquire));
     if (!read_controller_percent_complete(controller, progress))
         return;
     progress = std::clamp(progress, 0.0f, 1.0f);
-    g_overlay_state.progress_bits.store(float_to_bits(progress), std::memory_order_release);
+    active_overlay_state().progress_bits.store(float_to_bits(progress), std::memory_order_release);
 }
 
 bool ensure_resource_runtime_cache(std::string &error) {
@@ -3710,10 +4471,8 @@ bool ensure_telemetry_runtime_cache(std::string &error) {
     cache.assembly_csharp = find_assembly_image("Assembly-CSharp");
     cache.unity_core = find_assembly_image("UnityEngine.CoreModule");
     cache.unity_audio = find_assembly_image("UnityEngine.AudioModule");
-    if (cache.assembly_csharp == nullptr ||
-        cache.unity_core == nullptr ||
-        cache.unity_audio == nullptr) {
-        cache.error = "required images for overlay telemetry are unavailable";
+    if (cache.assembly_csharp == nullptr) {
+        cache.error = "Assembly-CSharp image for overlay telemetry is unavailable";
         commit_failure();
         g_telemetry_cache_condition.notify_all();
         error = cache.error;
@@ -3728,22 +4487,24 @@ bool ensure_telemetry_runtime_cache(std::string &error) {
     cache.ado_base_klass = find_class(cache.assembly_csharp, "", "ADOBase");
     cache.rdc_klass = find_class(cache.assembly_csharp, "", "RDC");
     cache.planetary_system_klass = find_class(cache.assembly_csharp, "", "PlanetarySystem");
-    cache.component_klass = find_class(cache.unity_core, "UnityEngine", "Component");
-    cache.time_klass = find_class(cache.unity_core, "UnityEngine", "Time");
-    cache.audio_source_klass = find_class(cache.unity_audio, "UnityEngine", "AudioSource");
-    cache.audio_clip_klass = find_class(cache.unity_audio, "UnityEngine", "AudioClip");
+    cache.component_klass = cache.unity_core == nullptr
+        ? nullptr
+        : find_class(cache.unity_core, "UnityEngine", "Component");
+    cache.time_klass = cache.unity_core == nullptr
+        ? nullptr
+        : find_class(cache.unity_core, "UnityEngine", "Time");
+    cache.audio_source_klass = cache.unity_audio == nullptr
+        ? nullptr
+        : find_class(cache.unity_audio, "UnityEngine", "AudioSource");
+    cache.audio_clip_klass = cache.unity_audio == nullptr
+        ? nullptr
+        : find_class(cache.unity_audio, "UnityEngine", "AudioClip");
     if (cache.scr_controller_klass == nullptr ||
         cache.scr_conductor_klass == nullptr ||
         cache.scr_level_maker_klass == nullptr ||
         cache.scr_floor_klass == nullptr ||
-        cache.ffx_checkpoint_klass == nullptr ||
-        cache.ado_base_klass == nullptr ||
-        cache.rdc_klass == nullptr ||
-        cache.planetary_system_klass == nullptr ||
-        cache.component_klass == nullptr ||
-        cache.audio_source_klass == nullptr ||
-        cache.audio_clip_klass == nullptr) {
-        cache.error = "required classes for overlay telemetry are unavailable";
+        cache.ado_base_klass == nullptr) {
+        cache.error = "core gameplay classes for overlay telemetry are unavailable";
         commit_failure();
         g_telemetry_cache_condition.notify_all();
         error = cache.error;
@@ -3756,10 +4517,14 @@ bool ensure_telemetry_runtime_cache(std::string &error) {
         find_field_offset(cache.scr_controller_klass, "currentState", nullptr);
     cache.scr_controller_no_fail_offset =
         find_field_offset(cache.scr_controller_klass, "noFail", nullptr);
+    cache.scr_controller_first_floor_offset =
+        find_field_offset(cache.scr_controller_klass, "firstFloor", nullptr);
     cache.scr_conductor_song_offset =
         find_field_offset(cache.scr_conductor_klass, "song", nullptr);
     cache.scr_conductor_add_offset_offset =
         find_field_offset(cache.scr_conductor_klass, "addoffset", nullptr);
+    cache.scr_conductor_is_game_world_offset =
+        find_field_offset(cache.scr_conductor_klass, "isGameWorld", nullptr);
     cache.scr_level_maker_list_floors_offset =
         find_field_offset(cache.scr_level_maker_klass, "listFloors", nullptr);
     cache.scr_floor_seq_id_offset =
@@ -3772,7 +4537,9 @@ bool ensure_telemetry_runtime_cache(std::string &error) {
         g_il2cpp_metadata.class_get_field_from_name(
             cache.scr_controller_klass,
             "checkpointsUsed");
-    const void *checkpoint_type = g_il2cpp_metadata.class_get_type(cache.ffx_checkpoint_klass);
+    const void *checkpoint_type = cache.ffx_checkpoint_klass == nullptr
+        ? nullptr
+        : g_il2cpp_metadata.class_get_type(cache.ffx_checkpoint_klass);
     cache.ffx_checkpoint_type_object = checkpoint_type == nullptr
         ? nullptr
         : g_il2cpp_metadata.type_get_object(checkpoint_type);
@@ -3780,15 +4547,11 @@ bool ensure_telemetry_runtime_cache(std::string &error) {
     if (cache.scr_controller_current_seq_id_offset < 0 ||
         cache.scr_controller_current_state_offset < 0 ||
         cache.scr_controller_no_fail_offset < 0 ||
-        cache.scr_conductor_song_offset < 0 ||
-        cache.scr_conductor_add_offset_offset < 0 ||
+        cache.scr_conductor_is_game_world_offset < 0 ||
         cache.scr_level_maker_list_floors_offset < 0 ||
         cache.scr_floor_seq_id_offset < 0 ||
-        cache.scr_floor_entry_time_offset < 0 ||
-        cache.planetary_system_speed_offset < 0 ||
-        cache.scr_controller_checkpoints_used_field == nullptr ||
-        cache.ffx_checkpoint_type_object == nullptr) {
-        cache.error = "required fields for overlay telemetry are unavailable";
+        cache.scr_floor_entry_time_offset < 0) {
+        cache.error = "core gameplay fields for overlay telemetry are unavailable";
         commit_failure();
         g_telemetry_cache_condition.notify_all();
         error = cache.error;
@@ -3797,27 +4560,60 @@ bool ensure_telemetry_runtime_cache(std::string &error) {
 
     bool ok = true;
     ok &= find_method_by_identity(cache.scr_controller_klass, "scrController", "get_instance", "scrController", {}, true, &cache.scr_controller_get_instance, cache.error);
-    ok &= find_method_by_identity(cache.scr_controller_klass, "scrController", "get_planetarySystem", "PlanetarySystem", {}, false, &cache.scr_controller_get_planetary_system, cache.error);
+    ok &= find_method_by_identity(cache.scr_controller_klass, "scrController", "get_paused", "System.Boolean", {}, false, &cache.scr_controller_get_paused, cache.error);
     ok &= find_method_by_identity(cache.scr_conductor_klass, "scrConductor", "get_instance", "scrConductor", {}, true, &cache.scr_conductor_get_instance, cache.error);
-    ok &= find_method_by_identity(cache.scr_conductor_klass, "scrConductor", "get_songposition_minusi", "System.Double", {}, false, &cache.scr_conductor_get_songposition_minusi, cache.error);
     ok &= find_method_by_identity(cache.scr_level_maker_klass, "scrLevelMaker", "get_instance", "scrLevelMaker", {}, true, &cache.scr_level_maker_get_instance, cache.error);
-    ok &= find_method_by_identity(cache.rdc_klass, "RDC", "get_auto", "System.Boolean", {}, true, &cache.rdc_get_auto, cache.error);
-    ok &= find_method_by_identity(cache.ado_base_klass, "ADOBase", "get_isOfficialLevel", "System.Boolean", {}, true, &cache.ado_base_get_is_official_level, cache.error);
-    ok &= find_method_by_identity(cache.ado_base_klass, "ADOBase", "get_currentLevel", "System.String", {}, true, &cache.ado_base_get_current_level, cache.error);
-    ok &= find_method_by_identity(cache.ado_base_klass, "ADOBase", "get_levelPath", "System.String", {}, true, &cache.ado_base_get_level_path, cache.error);
-    ok &= find_method_by_identity(cache.component_klass, "UnityEngine.Component", "GetComponent", "UnityEngine.Component", {"System.Type"}, false, &cache.component_get_component, cache.error);
-    ok &= find_method_by_identity(cache.audio_source_klass, "UnityEngine.AudioSource", "get_time", "System.Single", {}, false, &cache.audio_source_get_time, cache.error);
-    ok &= find_method_by_identity(cache.audio_source_klass, "UnityEngine.AudioSource", "get_clip", "UnityEngine.AudioClip", {}, false, &cache.audio_source_get_clip, cache.error);
-    ok &= find_method_by_identity(cache.audio_source_klass, "UnityEngine.AudioSource", "get_pitch", "System.Single", {}, false, &cache.audio_source_get_pitch, cache.error);
-    ok &= find_method_by_identity(cache.audio_clip_klass, "UnityEngine.AudioClip", "get_length", "System.Single", {}, false, &cache.audio_clip_get_length, cache.error);
+    ok &= find_method_by_identity(cache.ado_base_klass, "ADOBase", "get_controller", "scrController", {}, true, &cache.ado_base_get_controller, cache.error);
+    ok &= find_method_by_identity(cache.ado_base_klass, "ADOBase", "get_conductor", "scrConductor", {}, true, &cache.ado_base_get_conductor, cache.error);
+    ok &= find_method_by_identity(cache.ado_base_klass, "ADOBase", "get_isScnGame", "System.Boolean", {}, true, &cache.ado_base_get_is_scn_game, cache.error);
     if (!ok) {
         if (cache.error.empty())
-            cache.error = "required methods for overlay telemetry are unavailable";
+            cache.error = "core gameplay methods for overlay telemetry are unavailable";
         commit_failure();
         g_telemetry_cache_condition.notify_all();
         error = cache.error;
         return false;
     }
+
+    const auto resolve_optional = [](
+        void *klass,
+        const char *type_name,
+        const char *method_name,
+        const char *return_type,
+        std::initializer_list<const char *> parameter_types,
+        bool is_static,
+        void **target) {
+        if (klass == nullptr)
+            return;
+        std::string optional_error;
+        if (!find_method_by_identity(
+                klass,
+                type_name,
+                method_name,
+                return_type,
+                parameter_types,
+                is_static,
+                target,
+                optional_error)) {
+            LOGI("optional telemetry member unavailable: %s.%s: %s",
+                 type_name,
+                 method_name,
+                 optional_error.c_str());
+        }
+    };
+
+    resolve_optional(cache.scr_controller_klass, "scrController", "get_planetarySystem", "PlanetarySystem", {}, false, &cache.scr_controller_get_planetary_system);
+    resolve_optional(cache.scr_controller_klass, "scrController", "get_currFloor", "scrFloor", {}, false, &cache.scr_controller_get_curr_floor);
+    resolve_optional(cache.scr_conductor_klass, "scrConductor", "get_songposition_minusi", "System.Double", {}, false, &cache.scr_conductor_get_songposition_minusi);
+    resolve_optional(cache.rdc_klass, "RDC", "get_auto", "System.Boolean", {}, true, &cache.rdc_get_auto);
+    resolve_optional(cache.ado_base_klass, "ADOBase", "get_isOfficialLevel", "System.Boolean", {}, true, &cache.ado_base_get_is_official_level);
+    resolve_optional(cache.ado_base_klass, "ADOBase", "get_currentLevel", "System.String", {}, true, &cache.ado_base_get_current_level);
+    resolve_optional(cache.ado_base_klass, "ADOBase", "get_levelPath", "System.String", {}, true, &cache.ado_base_get_level_path);
+    resolve_optional(cache.component_klass, "UnityEngine.Component", "GetComponent", "UnityEngine.Component", {"System.Type"}, false, &cache.component_get_component);
+    resolve_optional(cache.audio_source_klass, "UnityEngine.AudioSource", "get_time", "System.Single", {}, false, &cache.audio_source_get_time);
+    resolve_optional(cache.audio_source_klass, "UnityEngine.AudioSource", "get_clip", "UnityEngine.AudioClip", {}, false, &cache.audio_source_get_clip);
+    resolve_optional(cache.audio_source_klass, "UnityEngine.AudioSource", "get_pitch", "System.Single", {}, false, &cache.audio_source_get_pitch);
+    resolve_optional(cache.audio_clip_klass, "UnityEngine.AudioClip", "get_length", "System.Single", {}, false, &cache.audio_clip_get_length);
 
     if (cache.time_klass != nullptr) {
         std::string time_error;
@@ -4133,9 +4929,12 @@ bool refresh_floor_metadata(const TelemetryRuntimeCache &cache,
         if (index == view.size - 1)
             read_instance_value(floor, cache.scr_floor_entry_time_offset, map_total_time);
 
-        void *args[] = {cache.ffx_checkpoint_type_object};
-        if (invoke_il2cpp_method(cache.component_get_component, floor, args) != nullptr)
-            checkpoints.push_back(seq_id);
+        if (cache.component_get_component != nullptr &&
+            cache.ffx_checkpoint_type_object != nullptr) {
+            void *args[] = {cache.ffx_checkpoint_type_object};
+            if (invoke_il2cpp_method(cache.component_get_component, floor, args) != nullptr)
+                checkpoints.push_back(seq_id);
+        }
     }
     std::sort(checkpoints.begin(), checkpoints.end());
 
@@ -4152,20 +4951,20 @@ bool refresh_floor_metadata(const TelemetryRuntimeCache &cache,
         ? std::clamp(static_cast<float>(start_seq_id) / static_cast<float>(view.size), 0.0f, 1.0f)
         : 0.0f;
     bool changed = false;
-    changed |= atomic_store_if_changed(g_overlay_state.floor_count, view.size);
+    changed |= atomic_store_if_changed(active_overlay_state().floor_count, view.size);
     changed |= atomic_store_if_changed(
-        g_overlay_state.map_total_time_bits,
+        active_overlay_state().map_total_time_bits,
         float_to_bits(std::isfinite(map_total_time) && map_total_time > 0.0
             ? static_cast<float>(map_total_time)
             : 0.0f));
     changed |= atomic_store_if_changed(
-        g_overlay_state.total_checkpoints,
+        active_overlay_state().total_checkpoints,
         static_cast<int32_t>(checkpoints.size()));
     changed |= atomic_store_if_changed(
-        g_overlay_state.current_checkpoint,
+        active_overlay_state().current_checkpoint,
         current_checkpoint_index(current_seq_id));
     changed |= atomic_store_if_changed(
-        g_overlay_state.start_progress_bits,
+        active_overlay_state().start_progress_bits,
         float_to_bits(start_progress));
     return changed;
 }
@@ -4186,30 +4985,33 @@ bool publish_input_state(bool force) {
         ? completed.source_generation
         : producer.generation;
     const uint32_t published_generation =
-        g_last_published_input_generation.load(std::memory_order_acquire);
+        active_owner_overlay_session().last_published_input_generation.load(
+            std::memory_order_acquire);
     if (!force && raw_generation == published_generation)
         return false;
 
     bool changed = false;
     changed |= atomic_store_if_changed(
-        g_overlay_state.input_state_generation,
+        active_overlay_state().input_state_generation,
         raw_generation);
     changed |= atomic_store_if_changed(
-        g_overlay_state.input_held_mask,
+        active_overlay_state().input_held_mask,
         completed_current ? completed.held_mask : producer.held_mask);
     changed |= atomic_store_if_changed(
-        g_overlay_state.input_last_down_mask,
+        active_overlay_state().input_last_down_mask,
         completed_current ? completed.last_down_mask : producer.last_down_mask);
     changed |= atomic_store_if_changed(
-        g_overlay_state.input_last_up_mask,
+        active_overlay_state().input_last_up_mask,
         completed_current ? completed.last_up_mask : producer.last_up_mask);
     changed |= atomic_store_if_changed(
-        g_overlay_state.input_total_count,
+        active_overlay_state().input_total_count,
         completed_current ? completed.total_count : producer.total_count);
     changed |= atomic_store_if_changed(
-        g_overlay_state.input_kps_bits,
+        active_overlay_state().input_kps_bits,
         float_to_bits(completed_current ? completed.kps : producer.kps));
-    g_last_published_input_generation.store(raw_generation, std::memory_order_release);
+    active_owner_overlay_session().last_published_input_generation.store(
+        raw_generation,
+        std::memory_order_release);
     return changed;
 }
 
@@ -4230,30 +5032,108 @@ bool poll_overlay_telemetry(void *controller, bool force) {
 
     const int64_t now_ms = steady_time_ms();
     constexpr int64_t kTimelinePollIntervalMs = 100;
-    const int64_t last_poll_ms = g_last_timeline_poll_ms.load(std::memory_order_acquire);
+    const int64_t last_poll_ms =
+        active_owner_overlay_session().last_timeline_poll_ms.load(
+            std::memory_order_acquire);
     const bool timeline_due = force ||
         last_poll_ms == 0 ||
         now_ms - last_poll_ms >= kTimelinePollIntervalMs;
 
     bool changed = false;
     if (timeline_due) {
-        g_last_timeline_poll_ms.store(now_ms, std::memory_order_release);
+        active_owner_overlay_session().last_timeline_poll_ms.store(
+            now_ms,
+            std::memory_order_release);
         refresh_input_kps(now_ms);
     }
     changed |= publish_input_state(force || timeline_due);
     if (!timeline_due)
         return changed;
 
+    void *controller_instance = invoke_object_noargs(cache.scr_controller_get_instance);
+    void *ado_controller = invoke_object_noargs(cache.ado_base_get_controller);
     if (controller == nullptr)
-        controller = invoke_object_noargs(cache.scr_controller_get_instance);
-    void *conductor = invoke_object_noargs(cache.scr_conductor_get_instance);
+        controller = controller_instance != nullptr ? controller_instance : ado_controller;
+    void *conductor_instance = invoke_object_noargs(cache.scr_conductor_get_instance);
+    void *ado_conductor = invoke_object_noargs(cache.ado_base_get_conductor);
+    void *conductor = conductor_instance != nullptr ? conductor_instance : ado_conductor;
     void *level_maker = invoke_object_noargs(cache.scr_level_maker_get_instance);
-    if (controller == nullptr || conductor == nullptr || level_maker == nullptr)
+    void *song = read_object_field(conductor, cache.scr_conductor_song_offset);
+    void *planetary_system = controller == nullptr
+        ? nullptr
+        : invoke_object_noargs(
+            cache.scr_controller_get_planetary_system,
+            controller);
+    void *current_floor = controller == nullptr
+        ? nullptr
+        : invoke_object_noargs(
+            cache.scr_controller_get_curr_floor,
+            controller);
+    void *first_floor = read_object_field(
+        controller,
+        cache.scr_controller_first_floor_offset);
+    changed |= atomic_store_if_changed(
+        active_overlay_state().controller_pointer,
+        reinterpret_cast<uintptr_t>(controller));
+    changed |= atomic_store_if_changed(
+        active_overlay_state().conductor_pointer,
+        reinterpret_cast<uintptr_t>(conductor));
+    changed |= atomic_store_if_changed(
+        active_overlay_state().level_maker_pointer,
+        reinterpret_cast<uintptr_t>(level_maker));
+    changed |= atomic_store_if_changed(
+        active_overlay_state().song_pointer,
+        reinterpret_cast<uintptr_t>(song));
+    changed |= atomic_store_if_changed(
+        active_overlay_state().planetary_system_pointer,
+        reinterpret_cast<uintptr_t>(planetary_system));
+    changed |= atomic_store_if_changed(
+        active_overlay_state().current_floor_pointer,
+        reinterpret_cast<uintptr_t>(current_floor));
+    changed |= atomic_store_if_changed(
+        active_overlay_state().first_floor_pointer,
+        reinterpret_cast<uintptr_t>(first_floor));
+    uint8_t is_game_world = 0;
+    read_instance_value(
+        conductor,
+        cache.scr_conductor_is_game_world_offset,
+        is_game_world);
+    const bool is_scn_game = invoke_bool_noargs(cache.ado_base_get_is_scn_game, false);
+    const bool game_ready =
+        controller != nullptr &&
+        conductor != nullptr &&
+        level_maker != nullptr &&
+        is_game_world != 0;
+    changed |= atomic_store_if_changed(
+        active_overlay_state().is_scn_game,
+        is_scn_game ? 1u : 0u);
+    changed |= atomic_store_if_changed(
+        active_overlay_state().game_ready,
+        game_ready ? 1u : 0u);
+    changed |= atomic_store_if_changed(
+        active_overlay_state().is_game_world,
+        is_game_world != 0 ? 1u : 0u);
+
+    uint64_t valid_fields = kGameSnapshotState;
+    if (active_overlay_state().accuracy_snapshot_count.load(std::memory_order_acquire) != 0)
+        valid_fields |= kGameSnapshotAccuracy;
+    if (active_overlay_state().bpm_snapshot_count.load(std::memory_order_acquire) != 0)
+        valid_fields |= kGameSnapshotBpm;
+
+    if (controller == nullptr || conductor == nullptr || level_maker == nullptr) {
+        changed |= atomic_store_if_changed(
+            active_overlay_state().valid_game_snapshot_fields,
+            valid_fields);
         return changed;
+    }
 
     FloorListView floors;
-    if (!read_floor_list_view(cache, level_maker, floors))
+    if (!read_floor_list_view(cache, level_maker, floors)) {
+        changed |= atomic_store_if_changed(
+            active_overlay_state().valid_game_snapshot_fields,
+            valid_fields);
         return changed;
+    }
 
     int32_t current_seq_id = 0;
     int32_t current_state = 0;
@@ -4261,6 +5141,20 @@ bool poll_overlay_telemetry(void *controller, bool force) {
     read_instance_value(controller, cache.scr_controller_current_seq_id_offset, current_seq_id);
     read_instance_value(controller, cache.scr_controller_current_state_offset, current_state);
     read_instance_value(controller, cache.scr_controller_no_fail_offset, no_fail);
+    if (current_floor == nullptr)
+        current_floor = floor_at(floors, current_seq_id);
+    if (first_floor == nullptr)
+        first_floor = floor_at(floors, 0);
+    changed |= atomic_store_if_changed(
+        active_overlay_state().current_floor_pointer,
+        reinterpret_cast<uintptr_t>(current_floor));
+    changed |= atomic_store_if_changed(
+        active_overlay_state().first_floor_pointer,
+        reinterpret_cast<uintptr_t>(first_floor));
+    const bool paused = invoke_bool_noargs_on(
+        cache.scr_controller_get_paused,
+        controller,
+        false);
 
     bool metadata_initialized = false;
     {
@@ -4268,12 +5162,11 @@ bool poll_overlay_telemetry(void *controller, bool force) {
         metadata_initialized = g_floor_metadata_initialized;
     }
     if (!metadata_initialized ||
-        g_overlay_state.floor_count.load(std::memory_order_acquire) != floors.size) {
+        active_overlay_state().floor_count.load(std::memory_order_acquire) != floors.size) {
         changed |= refresh_floor_metadata(cache, floors, current_seq_id);
         capture_level_identity(cache);
     }
 
-    void *song = read_object_field(conductor, cache.scr_conductor_song_offset);
     float music_time = 0.0f;
     float music_total_time = 0.0f;
     float song_pitch = 1.0f;
@@ -4288,6 +5181,8 @@ bool poll_overlay_telemetry(void *controller, bool force) {
         music_time = 0.0f;
     if (!std::isfinite(music_total_time) || music_total_time < 0.0f)
         music_total_time = 0.0f;
+    if (!std::isfinite(song_pitch))
+        song_pitch = 1.0f;
     {
         std::lock_guard<std::mutex> guard(g_timeline_state_lock);
         if (music_time > 0.0f)
@@ -4304,11 +5199,16 @@ bool poll_overlay_telemetry(void *controller, bool force) {
         cache.scr_conductor_get_songposition_minusi,
         conductor,
         0.0);
+    if (!std::isfinite(add_offset))
+        add_offset = 0.0;
+    const double finite_song_position = std::isfinite(song_position)
+        ? song_position
+        : 0.0;
     const float map_total_time = bits_to_float(
-        g_overlay_state.map_total_time_bits.load(std::memory_order_acquire));
+        active_overlay_state().map_total_time_bits.load(std::memory_order_acquire));
     float map_time = current_state == 1
         ? 0.0f
-        : static_cast<float>(add_offset + song_position);
+        : static_cast<float>(add_offset + finite_song_position);
     if (!std::isfinite(map_time))
         map_time = 0.0f;
     map_time = std::clamp(map_time, 0.0f, std::max(0.0f, map_total_time));
@@ -4338,7 +5238,7 @@ bool poll_overlay_telemetry(void *controller, bool force) {
         }
     }
     if (std::isfinite(song_position)) {
-        clock_anchor.song_position_seconds = song_position;
+        clock_anchor.song_position_seconds = finite_song_position;
         clock_anchor.valid_mask |= starray::hud_logic::ClockAnchorSongPosition;
     }
     if (song != nullptr && std::isfinite(music_time)) {
@@ -4360,34 +5260,51 @@ bool poll_overlay_telemetry(void *controller, bool force) {
 
     bool timeline_changed = false;
     timeline_changed |= atomic_store_if_changed(
-        g_overlay_state.music_time_bits,
+        active_overlay_state().music_time_bits,
         float_to_bits(music_time));
     timeline_changed |= atomic_store_if_changed(
-        g_overlay_state.music_total_time_bits,
+        active_overlay_state().music_total_time_bits,
         float_to_bits(music_total_time));
     timeline_changed |= atomic_store_if_changed(
-        g_overlay_state.map_time_bits,
+        active_overlay_state().map_time_bits,
         float_to_bits(map_time));
     timeline_changed |= atomic_store_if_changed(
-        g_overlay_state.checkpoints_used,
+        active_overlay_state().checkpoints_used,
         checkpoints_used);
     timeline_changed |= atomic_store_if_changed(
-        g_overlay_state.current_checkpoint,
+        active_overlay_state().current_checkpoint,
         checkpoint_index);
     timeline_changed |= atomic_store_if_changed(
-        g_overlay_state.current_seq_id,
+        active_overlay_state().current_seq_id,
         current_seq_id);
     timeline_changed |= atomic_store_if_changed(
-        g_overlay_state.progress_bits,
+        active_overlay_state().progress_bits,
         float_to_bits(progress));
 
-    const bool session_auto = invoke_bool_noargs(cache.rdc_get_auto, false) || no_fail != 0;
-    if (session_auto)
-        timeline_changed |= atomic_store_if_changed(g_overlay_state.session_auto, 1u);
+    const bool rdc_auto = invoke_bool_noargs(cache.rdc_get_auto, false);
+    timeline_changed |= atomic_store_if_changed(
+        active_overlay_state().rdc_auto,
+        rdc_auto ? 1u : 0u);
+    timeline_changed |= atomic_store_if_changed(
+        active_overlay_state().no_fail,
+        no_fail != 0 ? 1u : 0u);
+    timeline_changed |= atomic_store_if_changed(
+        active_overlay_state().paused,
+        paused ? 1u : 0u);
+    timeline_changed |= atomic_store_if_changed(
+        active_overlay_state().song_pitch_bits,
+        float_to_bits(song_pitch));
+    timeline_changed |= atomic_store_if_changed(
+        active_overlay_state().conductor_add_offset_bits,
+        double_to_bits(add_offset));
+    timeline_changed |= atomic_store_if_changed(
+        active_overlay_state().conductor_songposition_minusi_bits,
+        double_to_bits(finite_song_position));
 
-    void *planetary_system = invoke_object_noargs(
-        cache.scr_controller_get_planetary_system,
-        controller);
+    const bool session_auto = rdc_auto || no_fail != 0;
+    if (session_auto)
+        timeline_changed |= atomic_store_if_changed(active_overlay_state().session_auto, 1u);
+
     double planet_speed = 1.0;
     read_instance_value(
         planetary_system,
@@ -4400,27 +5317,36 @@ bool poll_overlay_telemetry(void *controller, bool force) {
         planet_speed_value = 1.0f;
     // Planet speed is live level state; variable-speed events must reach TBPM.
     timeline_changed |= atomic_store_if_changed(
-        g_overlay_state.planet_speed_bits,
+        active_overlay_state().planet_speed_bits,
         float_to_bits(planet_speed_value));
 
-    bool initialize_speed = false;
-    {
-        std::lock_guard<std::mutex> guard(g_timeline_state_lock);
-        initialize_speed = !g_session_speed_initialized;
-    }
+    const bool initialize_speed =
+        active_overlay_state().speed_multiplier_bits.load(std::memory_order_acquire) == 0;
     if (initialize_speed) {
         float multiplier = song_pitch * planet_speed_value;
         if (!std::isfinite(multiplier) || multiplier <= 0.0f)
             multiplier = 1.0f;
         timeline_changed |= atomic_store_if_changed(
-            g_overlay_state.speed_multiplier_bits,
+            active_overlay_state().speed_multiplier_bits,
             float_to_bits(multiplier));
-        std::lock_guard<std::mutex> guard(g_timeline_state_lock);
-        g_session_speed_initialized = true;
     }
 
     if (timeline_changed)
-        g_overlay_state.timeline_snapshot_count.fetch_add(1, std::memory_order_relaxed);
+        active_overlay_state().timeline_snapshot_count.fetch_add(1, std::memory_order_relaxed);
+    valid_fields |= kGameSnapshotProgress |
+        kGameSnapshotCurrentSeqId |
+        kGameSnapshotCheckpoints |
+        kGameSnapshotFloor |
+        kGameSnapshotTimeline |
+        kGameSnapshotState |
+        kGameSnapshotConductor |
+        kGameSnapshotSongPitch |
+        kGameSnapshotPlayer;
+    if (planetary_system != nullptr && cache.planetary_system_speed_offset >= 0)
+        valid_fields |= kGameSnapshotPlanetSpeed;
+    timeline_changed |= atomic_store_if_changed(
+        active_overlay_state().valid_game_snapshot_fields,
+        valid_fields);
     return changed || timeline_changed;
 }
 
@@ -4440,89 +5366,142 @@ void disable_dispatcher_runtime_slot(int index) {
         &runtime->managed_prefix_before_rules,
         std::shared_ptr<const ManagedPrefixDispatchSnapshot>{},
         std::memory_order_release);
+    std::atomic_store_explicit(
+        &runtime->owner_overlay_after_rules,
+        std::shared_ptr<const OwnerOverlayDispatchSnapshot>{},
+        std::memory_order_release);
+    std::atomic_store_explicit(
+        &runtime->session_rule_masks,
+        std::shared_ptr<const SessionRuleMaskSnapshot>{},
+        std::memory_order_release);
     runtime->slot_id.store(0, std::memory_order_release);
     runtime->target_kind.store(kTargetKindUnknown, std::memory_order_release);
     runtime->call_count.store(0, std::memory_order_release);
     runtime->fault_count.store(0, std::memory_order_release);
 }
 
-void reset_overlay_session_metrics() {
-    clear_hit_margin_snapshot();
-    g_overlay_last_margin_callback_ms.store(0, std::memory_order_release);
-    g_overlay_state.judgement_hit_count.store(0, std::memory_order_release);
-    g_overlay_state.judgement_reset_count.store(0, std::memory_order_release);
-    g_overlay_state.last_hit_margin.store(0, std::memory_order_release);
-    g_overlay_state.floor_move_count.store(0, std::memory_order_release);
-    g_overlay_state.last_floor_exit_angle_bits.store(float_to_bits(0.0f), std::memory_order_release);
-    g_overlay_state.last_floor_move_hit_margin.store(0, std::memory_order_release);
-    g_overlay_state.player_hit_count.store(0, std::memory_order_release);
-    g_overlay_state.last_player_hit_is_auto.store(0, std::memory_order_release);
-    g_overlay_state.death_count.store(0, std::memory_order_release);
-    g_overlay_state.last_death_overload.store(0, std::memory_order_release);
-    g_overlay_state.last_death_multipress.store(0, std::memory_order_release);
-    g_overlay_state.last_death_hitbox.store(0, std::memory_order_release);
-    g_overlay_state.hit_timing_count.store(0, std::memory_order_release);
-    g_overlay_state.last_hit_timing_ms_bits.store(float_to_bits(0.0f), std::memory_order_release);
-    g_overlay_state.last_hit_timing_margin.store(0, std::memory_order_release);
-    g_overlay_state.accuracy_snapshot_count.store(0, std::memory_order_release);
-    g_overlay_state.percent_acc_bits.store(float_to_bits(0.0f), std::memory_order_release);
-    g_overlay_state.percent_x_acc_bits.store(float_to_bits(0.0f), std::memory_order_release);
-    g_overlay_state.progress_bits.store(float_to_bits(0.0f), std::memory_order_release);
-    g_overlay_state.combo_count.store(0, std::memory_order_release);
-    g_overlay_state.bpm_snapshot_count.store(0, std::memory_order_release);
-    g_overlay_state.tile_bpm_bits.store(float_to_bits(0.0f), std::memory_order_release);
-    g_overlay_state.kps_bits.store(float_to_bits(0.0f), std::memory_order_release);
-    g_overlay_state.timeline_snapshot_count.store(0, std::memory_order_release);
-    g_overlay_state.music_time_bits.store(float_to_bits(0.0f), std::memory_order_release);
-    g_overlay_state.music_total_time_bits.store(float_to_bits(0.0f), std::memory_order_release);
-    g_overlay_state.map_time_bits.store(float_to_bits(0.0f), std::memory_order_release);
-    g_overlay_state.map_total_time_bits.store(float_to_bits(0.0f), std::memory_order_release);
-    g_overlay_state.checkpoints_used.store(0, std::memory_order_release);
-    g_overlay_state.current_checkpoint.store(0, std::memory_order_release);
-    g_overlay_state.total_checkpoints.store(0, std::memory_order_release);
-    g_overlay_state.current_seq_id.store(0, std::memory_order_release);
-    g_overlay_state.floor_count.store(0, std::memory_order_release);
-    g_overlay_state.start_progress_bits.store(float_to_bits(0.0f), std::memory_order_release);
-    g_overlay_state.speed_multiplier_bits.store(float_to_bits(0.0f), std::memory_order_release);
-    g_overlay_state.planet_speed_bits.store(float_to_bits(0.0f), std::memory_order_release);
-    g_overlay_state.session_auto.store(0, std::memory_order_release);
-    g_overlay_state.input_state_generation.store(0, std::memory_order_release);
-    g_overlay_state.input_held_mask.store(0, std::memory_order_release);
-    g_overlay_state.input_last_down_mask.store(0, std::memory_order_release);
-    g_overlay_state.input_last_up_mask.store(0, std::memory_order_release);
-    g_overlay_state.input_total_count.store(0, std::memory_order_release);
-    g_overlay_state.input_kps_bits.store(float_to_bits(0.0f), std::memory_order_release);
-    g_last_timeline_poll_ms.store(0, std::memory_order_release);
-    g_last_published_input_generation.store(0, std::memory_order_release);
+void reset_owner_overlay_session_metrics() {
+    active_owner_overlay_session().last_margin_callback_ms.store(
+        0,
+        std::memory_order_release);
+    active_overlay_state().judgement_hit_count.store(0, std::memory_order_release);
+    active_overlay_state().judgement_reset_count.store(0, std::memory_order_release);
+    active_overlay_state().last_hit_margin.store(0, std::memory_order_release);
+    active_overlay_state().floor_move_count.store(0, std::memory_order_release);
+    active_overlay_state().last_floor_exit_angle_bits.store(float_to_bits(0.0f), std::memory_order_release);
+    active_overlay_state().last_floor_move_hit_margin.store(0, std::memory_order_release);
+    active_overlay_state().player_hit_count.store(0, std::memory_order_release);
+    active_overlay_state().last_player_hit_is_auto.store(0, std::memory_order_release);
+    active_overlay_state().death_count.store(0, std::memory_order_release);
+    active_overlay_state().last_death_overload.store(0, std::memory_order_release);
+    active_overlay_state().last_death_multipress.store(0, std::memory_order_release);
+    active_overlay_state().last_death_hitbox.store(0, std::memory_order_release);
+    active_overlay_state().hit_timing_count.store(0, std::memory_order_release);
+    active_overlay_state().last_hit_timing_ms_bits.store(float_to_bits(0.0f), std::memory_order_release);
+    active_overlay_state().last_hit_timing_margin.store(0, std::memory_order_release);
+    active_overlay_state().accuracy_snapshot_count.store(0, std::memory_order_release);
+    active_overlay_state().percent_acc_bits.store(float_to_bits(0.0f), std::memory_order_release);
+    active_overlay_state().percent_x_acc_bits.store(float_to_bits(0.0f), std::memory_order_release);
+    active_overlay_state().progress_bits.store(float_to_bits(0.0f), std::memory_order_release);
+    active_overlay_state().combo_count.store(0, std::memory_order_release);
+    active_overlay_state().bpm_snapshot_count.store(0, std::memory_order_release);
+    active_overlay_state().tile_bpm_bits.store(float_to_bits(0.0f), std::memory_order_release);
+    active_overlay_state().kps_bits.store(float_to_bits(0.0f), std::memory_order_release);
+    active_overlay_state().timeline_snapshot_count.store(0, std::memory_order_release);
+    active_overlay_state().music_time_bits.store(float_to_bits(0.0f), std::memory_order_release);
+    active_overlay_state().music_total_time_bits.store(float_to_bits(0.0f), std::memory_order_release);
+    active_overlay_state().map_time_bits.store(float_to_bits(0.0f), std::memory_order_release);
+    active_overlay_state().map_total_time_bits.store(float_to_bits(0.0f), std::memory_order_release);
+    active_overlay_state().checkpoints_used.store(0, std::memory_order_release);
+    active_overlay_state().current_checkpoint.store(0, std::memory_order_release);
+    active_overlay_state().total_checkpoints.store(0, std::memory_order_release);
+    active_overlay_state().current_seq_id.store(0, std::memory_order_release);
+    active_overlay_state().floor_count.store(0, std::memory_order_release);
+    active_overlay_state().start_progress_bits.store(float_to_bits(0.0f), std::memory_order_release);
+    active_overlay_state().speed_multiplier_bits.store(float_to_bits(0.0f), std::memory_order_release);
+    active_overlay_state().planet_speed_bits.store(float_to_bits(0.0f), std::memory_order_release);
+    active_overlay_state().session_auto.store(0, std::memory_order_release);
+    active_overlay_state().rdc_auto.store(0, std::memory_order_release);
+    active_overlay_state().no_fail.store(0, std::memory_order_release);
+    active_overlay_state().paused.store(0, std::memory_order_release);
+    active_overlay_state().is_game_world.store(0, std::memory_order_release);
+    active_overlay_state().song_pitch_bits.store(float_to_bits(1.0f), std::memory_order_release);
+    active_overlay_state().conductor_add_offset_bits.store(double_to_bits(0.0), std::memory_order_release);
+    active_overlay_state().conductor_songposition_minusi_bits.store(double_to_bits(0.0), std::memory_order_release);
+    active_overlay_state().is_scn_game.store(0, std::memory_order_release);
+    active_overlay_state().game_ready.store(0, std::memory_order_release);
+    active_overlay_state().input_state_generation.store(0, std::memory_order_release);
+    active_overlay_state().input_held_mask.store(0, std::memory_order_release);
+    active_overlay_state().input_last_down_mask.store(0, std::memory_order_release);
+    active_overlay_state().input_last_up_mask.store(0, std::memory_order_release);
+    active_overlay_state().input_total_count.store(0, std::memory_order_release);
+    active_overlay_state().input_kps_bits.store(float_to_bits(0.0f), std::memory_order_release);
+    active_overlay_state().valid_game_snapshot_fields.store(0, std::memory_order_release);
+    active_overlay_state().controller_pointer.store(0, std::memory_order_release);
+    active_overlay_state().conductor_pointer.store(0, std::memory_order_release);
+    active_overlay_state().level_maker_pointer.store(0, std::memory_order_release);
+    active_overlay_state().current_floor_pointer.store(0, std::memory_order_release);
+    active_overlay_state().first_floor_pointer.store(0, std::memory_order_release);
+    active_overlay_state().song_pointer.store(0, std::memory_order_release);
+    active_overlay_state().planetary_system_pointer.store(0, std::memory_order_release);
+    active_owner_overlay_session().last_timeline_poll_ms.store(
+        0,
+        std::memory_order_release);
+    active_owner_overlay_session().last_published_input_generation.store(
+        0,
+        std::memory_order_release);
+}
+
+void reset_shared_overlay_session_facts() {
     {
-        std::lock_guard<std::mutex> guard(g_timeline_state_lock);
-        g_checkpoint_seq_ids.clear();
-        g_level_identity.clear();
-        g_session_start_seq_id = 0;
-        g_session_start_seq_valid = false;
-        g_floor_metadata_initialized = false;
-        g_session_speed_initialized = false;
-        g_music_has_played = false;
+        OwnerOverlayScope shared_scope(&g_legacy_overlay_session);
+        auto &shared = active_overlay_state();
+        shared.session_epoch.fetch_add(1, std::memory_order_acq_rel);
+        shared.visible.store(0, std::memory_order_release);
+        shared.practice.store(0, std::memory_order_release);
+        shared.show_count.store(0, std::memory_order_release);
+        shared.hide_count.store(0, std::memory_order_release);
+        shared.player_update_count.store(0, std::memory_order_release);
+        shared.state_change_count.store(0, std::memory_order_release);
+        shared.last_op.store(0xFFFFFFFFu, std::memory_order_release);
+        shared.last_target_kind.store(kTargetKindUnknown, std::memory_order_release);
+        shared.player_count.store(0, std::memory_order_release);
+        shared.last_seq_id.store(0, std::memory_order_release);
+        shared.last_is_restart.store(0, std::memory_order_release);
+        shared.last_wipe_direction.store(0, std::memory_order_release);
+        shared.last_reset_to_editor.store(0, std::memory_order_release);
+        shared.attempt_count.store(0, std::memory_order_release);
+        reset_owner_overlay_session_metrics();
+        shared.generation.fetch_add(1, std::memory_order_release);
     }
+    clear_hit_margin_snapshot();
+    std::lock_guard<std::mutex> guard(g_timeline_state_lock);
+    g_checkpoint_seq_ids.clear();
+    g_level_identity.clear();
+    g_session_start_seq_id = 0;
+    g_session_start_seq_valid = false;
+    g_floor_metadata_initialized = false;
+    g_music_has_played = false;
 }
 
 void reset_overlay_runtime_state() {
-    g_overlay_state.visible.store(0, std::memory_order_release);
-    g_overlay_state.practice.store(0, std::memory_order_release);
-    g_overlay_state.show_count.store(0, std::memory_order_release);
-    g_overlay_state.hide_count.store(0, std::memory_order_release);
-    g_overlay_state.player_update_count.store(0, std::memory_order_release);
-    g_overlay_state.state_change_count.store(0, std::memory_order_release);
-    g_overlay_state.last_op.store(0xFFFFFFFFu, std::memory_order_release);
-    g_overlay_state.last_target_kind.store(kTargetKindUnknown, std::memory_order_release);
-    g_overlay_state.player_count.store(0, std::memory_order_release);
-    g_overlay_state.last_seq_id.store(0, std::memory_order_release);
-    g_overlay_state.last_is_restart.store(0, std::memory_order_release);
-    g_overlay_state.last_wipe_direction.store(0, std::memory_order_release);
-    g_overlay_state.last_reset_to_editor.store(0, std::memory_order_release);
-    g_overlay_state.attempt_count.store(0, std::memory_order_release);
-    reset_overlay_session_metrics();
-    g_overlay_state.generation.fetch_add(1, std::memory_order_release);
+    active_overlay_state().visible.store(0, std::memory_order_release);
+    active_overlay_state().practice.store(0, std::memory_order_release);
+    active_overlay_state().show_count.store(0, std::memory_order_release);
+    active_overlay_state().hide_count.store(0, std::memory_order_release);
+    active_overlay_state().player_update_count.store(0, std::memory_order_release);
+    active_overlay_state().state_change_count.store(0, std::memory_order_release);
+    active_overlay_state().last_op.store(0xFFFFFFFFu, std::memory_order_release);
+    active_overlay_state().last_target_kind.store(kTargetKindUnknown, std::memory_order_release);
+    active_overlay_state().player_count.store(0, std::memory_order_release);
+    active_overlay_state().last_seq_id.store(0, std::memory_order_release);
+    active_overlay_state().last_is_restart.store(0, std::memory_order_release);
+    active_overlay_state().last_wipe_direction.store(0, std::memory_order_release);
+    active_overlay_state().last_reset_to_editor.store(0, std::memory_order_release);
+    active_overlay_state().attempt_count.store(0, std::memory_order_release);
+    reset_owner_overlay_session_metrics();
+    reset_shared_overlay_session_facts();
+    active_overlay_state().generation.fetch_add(1, std::memory_order_release);
 }
 
 uint32_t target_kind_for_slot(const HookSlot &slot) {
@@ -4604,7 +5583,8 @@ ManagedPrefixDispatchSnapshot build_managed_prefix_dispatch_snapshot(
     nodes.reserve(rules.size());
     for (const auto &rule : rules) {
         if (rule.enabled &&
-            rule.op_code == kRuleOpManagedSynchronousPrefix &&
+            (rule.op_code == kRuleOpManagedSynchronousPrefix ||
+             rule.op_code == kRuleOpManagedRenderCallback) &&
             rule.managed_prefix_id != 0) {
             nodes.push_back(&rule);
         }
@@ -4687,6 +5667,9 @@ ManagedPrefixDispatchSnapshot build_managed_prefix_dispatch_snapshot(
                 .bundle_id = nodes[selected]->bundle_id,
                 .managed_prefix_id = nodes[selected]->managed_prefix_id,
                 .ring = ring->second,
+                .pc_mod_session = nodes[selected]->pc_mod_session,
+                .owner_filtered =
+                    nodes[selected]->op_code == kRuleOpManagedRenderCallback,
             });
         }
         for (const auto next : outgoing[selected]) {
@@ -4793,6 +5776,7 @@ ManagedEventDispatchSnapshot build_managed_event_dispatch_snapshot(
         if (ring != g_managed_event_rings.end() && ring->second != nullptr) {
             snapshot.push_back(ManagedEventDispatchTarget{
                 .ring = ring->second,
+                .pc_mod_session = rule->pc_mod_session,
                 .managed_event_id = rule->managed_event_id,
                 .lifecycle_boundary = is_managed_event_lifecycle_boundary(target_kind),
             });
@@ -4805,6 +5789,67 @@ ManagedEventDispatchSnapshot build_managed_event_dispatch_snapshot(
     return snapshot;
 }
 
+OwnerOverlayDispatchSnapshot build_owner_overlay_dispatch_snapshot(
+    const std::vector<HookSlotRuleRef> &rules) {
+    struct Builder {
+        std::string mod_id;
+        PcModSessionToken pc_mod_session;
+        uint64_t mask = 0;
+        std::shared_ptr<OwnerOverlaySession> session;
+    };
+    std::vector<Builder> builders;
+    for (const auto &rule : rules) {
+        if (!rule.enabled || rule.op_code < 0 || rule.op_code >= 63)
+            continue;
+        const uint64_t op_mask = 1ULL << static_cast<uint32_t>(rule.op_code);
+        if ((op_mask & kOwnerOverlayOpMask) == 0)
+            continue;
+        const auto bundle = std::find_if(
+            g_state.bundles.begin(),
+            g_state.bundles.end(),
+            [&rule](const RuntimeBundle &candidate) {
+                return candidate.bundle_id == rule.bundle_id;
+            });
+        if (bundle == g_state.bundles.end() || bundle->mod_id.empty())
+            continue;
+        auto builder = std::find_if(
+            builders.begin(), builders.end(),
+            [&bundle](const Builder &candidate) {
+                return candidate.mod_id == bundle->mod_id &&
+                       candidate.pc_mod_session == bundle->pc_mod_session;
+            });
+        if (builder == builders.end()) {
+            builders.push_back(Builder{
+                .mod_id = bundle->mod_id,
+                .pc_mod_session = bundle->pc_mod_session,
+                .session = get_or_create_owner_overlay_session(bundle->mod_id),
+            });
+            builder = std::prev(builders.end());
+        }
+        builder->mask |= op_mask;
+    }
+
+    OwnerOverlayDispatchSnapshot snapshot;
+    snapshot.reserve(builders.size());
+    for (auto &builder : builders) {
+        if (builder.mask == 0 || builder.session == nullptr)
+            continue;
+        OwnerOverlayDispatchTarget target{
+            .session = std::move(builder.session),
+            .pc_mod_session = builder.pc_mod_session,
+            .after_op_mask = builder.mask,
+        };
+        for (const auto &bundle : g_state.bundles) {
+            if (bundle.mod_id == builder.mod_id &&
+                bundle.pc_mod_session == builder.pc_mod_session) {
+                target.bundle_ids.push_back(bundle.bundle_id);
+            }
+        }
+        snapshot.push_back(std::move(target));
+    }
+    return snapshot;
+}
+
 void publish_managed_dispatch_snapshots_locked(const HookSlot &slot, bool enabled) {
     auto *runtime = dispatcher_runtime_slot(slot.dispatcher_index);
     if (runtime == nullptr)
@@ -4812,12 +5857,43 @@ void publish_managed_dispatch_snapshots_locked(const HookSlot &slot, bool enable
 
     auto event_snapshot = std::make_shared<ManagedEventDispatchSnapshot>();
     auto prefix_snapshot = std::make_shared<ManagedPrefixDispatchSnapshot>();
+    auto overlay_snapshot = std::make_shared<OwnerOverlayDispatchSnapshot>();
+    auto session_mask_snapshot = std::make_shared<SessionRuleMaskSnapshot>();
     if (enabled) {
+        *overlay_snapshot = build_owner_overlay_dispatch_snapshot(slot.after_rules);
         std::lock_guard<std::mutex> managed_events_guard(g_managed_events_lock);
         *event_snapshot = build_managed_event_dispatch_snapshot(
             slot.after_rules,
             target_kind_for_slot(slot));
         *prefix_snapshot = build_managed_prefix_dispatch_snapshot(slot.before_rules);
+        const auto append_session_masks = [&session_mask_snapshot](
+            const std::vector<HookSlotRuleRef> &rules,
+            bool before) {
+            for (const auto &rule : rules) {
+                if (!rule.enabled || rule.op_code < 0 || rule.op_code >= 63 ||
+                    rule.pc_mod_session.session_handle == 0) {
+                    continue;
+                }
+                auto binding = std::find_if(
+                    session_mask_snapshot->begin(), session_mask_snapshot->end(),
+                    [&rule](const SessionRuleMask &candidate) {
+                        return candidate.pc_mod_session == rule.pc_mod_session;
+                    });
+                if (binding == session_mask_snapshot->end()) {
+                    session_mask_snapshot->push_back(SessionRuleMask{
+                        .pc_mod_session = rule.pc_mod_session,
+                    });
+                    binding = std::prev(session_mask_snapshot->end());
+                }
+                const uint64_t op_mask = 1ULL << static_cast<uint32_t>(rule.op_code);
+                if (before)
+                    binding->before_op_mask |= op_mask;
+                else
+                    binding->after_op_mask |= op_mask;
+            }
+        };
+        append_session_masks(slot.before_rules, true);
+        append_session_masks(slot.after_rules, false);
     }
     std::atomic_store_explicit(
         &runtime->managed_event_after_rules,
@@ -4827,6 +5903,15 @@ void publish_managed_dispatch_snapshots_locked(const HookSlot &slot, bool enable
     std::atomic_store_explicit(
         &runtime->managed_prefix_before_rules,
         std::shared_ptr<const ManagedPrefixDispatchSnapshot>(std::move(prefix_snapshot)),
+        std::memory_order_release);
+    std::atomic_store_explicit(
+        &runtime->owner_overlay_after_rules,
+        std::shared_ptr<const OwnerOverlayDispatchSnapshot>(std::move(overlay_snapshot)),
+        std::memory_order_release);
+    std::atomic_store_explicit(
+        &runtime->session_rule_masks,
+        std::shared_ptr<const SessionRuleMaskSnapshot>(
+            std::move(session_mask_snapshot)),
         std::memory_order_release);
 }
 
@@ -5090,7 +6175,7 @@ void push_managed_event(ManagedEventRing *ring,
 // owning bundle's ring. No Unity API and no g_lock access on this path.
 void enqueue_managed_event_rules(int dispatcher_index, const FixedOpArgs &args) {
     auto *runtime = dispatcher_runtime_slot(dispatcher_index);
-    if (runtime == nullptr)
+    if (runtime == nullptr || runtime->enabled.load(std::memory_order_acquire) == 0)
         return;
 
     const auto targets = std::atomic_load_explicit(
@@ -5120,7 +6205,8 @@ void enqueue_managed_event_rules(int dispatcher_index, const FixedOpArgs &args) 
         std::memory_order_relaxed);
     for (size_t target_index = 0; target_index < targets->size(); ++target_index) {
         const auto &target = (*targets)[target_index];
-        if (target.ring == nullptr ||
+        if (!pc_mod_session_token_active(target.pc_mod_session) ||
+            target.ring == nullptr ||
             target.ring->retired.load(std::memory_order_acquire) != 0 ||
             (target.ring->enabled.load(std::memory_order_acquire) == 0 &&
              !target.lifecycle_boundary)) {
@@ -5137,7 +6223,7 @@ void enqueue_managed_event_rules(int dispatcher_index, const FixedOpArgs &args) 
 
 bool run_managed_prefix_rules(int dispatcher_index, FixedOpArgs &args) {
     auto *runtime = dispatcher_runtime_slot(dispatcher_index);
-    if (runtime == nullptr)
+    if (runtime == nullptr || runtime->enabled.load(std::memory_order_acquire) == 0)
         return false;
 
     const auto targets = std::atomic_load_explicit(
@@ -5151,6 +6237,21 @@ bool run_managed_prefix_rules(int dispatcher_index, FixedOpArgs &args) {
         runtime->fault_count.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
+
+    // Before any invocation struct is built. When every target is owner-filtered - the render
+    // callback case - and the instance is not a registered MOD host, there is nothing to do and the
+    // game's own calls fall straight through to the original.
+    const uint64_t instance_ptr = reinterpret_cast<uint64_t>(
+        reinterpret_cast<uintptr_t>(args.instance));
+    bool any_dispatchable = false;
+    for (const auto &target : *targets) {
+        if (!target.owner_filtered || is_managed_render_host(instance_ptr)) {
+            any_dispatchable = true;
+            break;
+        }
+    }
+    if (!any_dispatchable)
+        return false;
 
     ++g_managed_prefix_callback_depth;
     PcCompatManagedPrefixInvocationV2 invocation{};
@@ -5170,7 +6271,12 @@ bool run_managed_prefix_rules(int dispatcher_index, FixedOpArgs &args) {
         invocation.arguments[index] = args.raw_args[index];
 
     for (const auto &target : *targets) {
-        if (target.ring == nullptr)
+        if (!pc_mod_session_token_active(target.pc_mod_session) ||
+            target.ring == nullptr)
+            continue;
+        // Re-checked per target rather than hoisted: a mixed slot can hold both an ordinary prefix
+        // and a render callback, and only the latter is instance-scoped.
+        if (target.owner_filtered && !is_managed_render_host(instance_ptr))
             continue;
         {
             std::lock_guard<std::mutex> prefix_lock(
@@ -5198,6 +6304,8 @@ bool run_managed_prefix_rules(int dispatcher_index, FixedOpArgs &args) {
     args.managed_run_original = invocation.run_original;
     args.managed_result_valid = invocation.result_valid;
     args.managed_result_value = invocation.result_value;
+    args.instance = reinterpret_cast<void *>(
+        static_cast<uintptr_t>(invocation.instance_ptr));
     for (uint32_t index = 0; index < invocation.argument_count; ++index)
         args.raw_args[index] = invocation.arguments[index];
     --g_managed_prefix_callback_depth;
@@ -5308,16 +6416,21 @@ void *new_resource_handle(void *object) {
         : nullptr;
 }
 
-void track_resource_object(std::vector<void *> &handles, void *object) {
+void track_resource_object(
+    std::vector<void *> &handles,
+    std::set<void *> &objects,
+    void *object) {
     if (object == nullptr || g_il2cpp_metadata.gchandle_get_target == nullptr)
         return;
     std::lock_guard<std::mutex> guard(g_resource_tracked_lock);
-    for (void *handle : handles) {
-        if (g_il2cpp_metadata.gchandle_get_target(handle) == object)
-            return;
-    }
-    if (void *handle = new_resource_handle(object); handle != nullptr)
+    const auto inserted = objects.insert(object);
+    if (!inserted.second)
+        return;
+    if (void *handle = new_resource_handle(object); handle != nullptr) {
         handles.push_back(handle);
+    } else {
+        objects.erase(inserted.first);
+    }
 }
 
 void track_resource_single(void *&slot, void *object) {
@@ -5355,7 +6468,7 @@ void apply_resource_floor_color(void *floor) {
     }
     if (method != nullptr)
         invoke_void_color(method, floor, resource_tile_color());
-    track_resource_object(g_resource_floor_handles, floor);
+    track_resource_object(g_resource_floor_handles, g_resource_floor_objects, floor);
 }
 
 void apply_resource_planet_color(void *planet) {
@@ -5389,7 +6502,7 @@ void apply_resource_planet_color(void *planet) {
     const auto color = resource_planet_color();
     invoke_void_color(set_planet_color, renderer, color);
     invoke_void_color(set_tail_color, renderer, color);
-    track_resource_object(g_resource_planet_handles, planet);
+    track_resource_object(g_resource_planet_handles, g_resource_planet_objects, planet);
 }
 
 void apply_resource_logo_text(void *logo_text) {
@@ -5487,30 +6600,36 @@ void apply_resource_logo_text(void *logo_text) {
 
     void *clone_name = g_il2cpp_metadata.string_new("JipperResourcepack Logo");
     void *find_clone_args[] = {clone_name};
-    if (invoke_il2cpp_method(transform_find, hit_space, find_clone_args) != nullptr)
-        return;
-
-    void *education_name = g_il2cpp_metadata.string_new("Education Edition");
-    void *find_education_args[] = {education_name};
-    void *education_transform = invoke_il2cpp_method(
+    void *clone_transform = invoke_il2cpp_method(
         transform_find,
         hit_space,
-        find_education_args);
-    void *education_game_object = education_transform != nullptr
-        ? invoke_object_noargs(component_get_game_object, education_transform)
+        find_clone_args);
+    void *clone = clone_transform != nullptr
+        ? invoke_object_noargs(component_get_game_object, clone_transform)
         : nullptr;
-    if (education_game_object == nullptr || object_instantiate == nullptr)
-        return;
+    if (clone == nullptr) {
+        void *education_name = g_il2cpp_metadata.string_new("Education Edition");
+        void *find_education_args[] = {education_name};
+        void *education_transform = invoke_il2cpp_method(
+            transform_find,
+            hit_space,
+            find_education_args);
+        void *education_game_object = education_transform != nullptr
+            ? invoke_object_noargs(component_get_game_object, education_transform)
+            : nullptr;
+        if (education_game_object == nullptr || object_instantiate == nullptr)
+            return;
 
-    void *instantiate_args[] = {education_game_object};
-    void *clone = invoke_il2cpp_method(object_instantiate, nullptr, instantiate_args);
-    if (clone == nullptr)
-        return;
-    void *clone_transform = invoke_object_noargs(game_object_get_transform, clone);
-    if (clone_transform != nullptr && transform_set_parent != nullptr) {
-        bool world_position_stays = false;
-        void *parent_args[] = {hit_space, &world_position_stays};
-        invoke_il2cpp_method(transform_set_parent, clone_transform, parent_args);
+        void *instantiate_args[] = {education_game_object};
+        clone = invoke_il2cpp_method(object_instantiate, nullptr, instantiate_args);
+        if (clone == nullptr)
+            return;
+        clone_transform = invoke_object_noargs(game_object_get_transform, clone);
+        if (clone_transform != nullptr && transform_set_parent != nullptr) {
+            bool world_position_stays = false;
+            void *parent_args[] = {hit_space, &world_position_stays};
+            invoke_il2cpp_method(transform_set_parent, clone_transform, parent_args);
+        }
     }
     if (game_object_set_active != nullptr) {
         bool active = true;
@@ -5585,26 +6704,83 @@ void apply_resource_editor_rabbit(void *editor) {
         return;
 
     void *current = get_sprite != nullptr ? invoke_object_noargs(get_sprite, image) : nullptr;
-    {
-        std::lock_guard<std::mutex> guard(g_resource_tracked_lock);
-        void *tracked_editor = g_resource_editor_handle != nullptr &&
-                               g_il2cpp_metadata.gchandle_get_target != nullptr
-            ? g_il2cpp_metadata.gchandle_get_target(g_resource_editor_handle)
-            : nullptr;
-        if (tracked_editor != editor) {
-            free_resource_handle(g_resource_editor_handle);
-            free_resource_handle(g_resource_original_rabbit_sprite_handle);
-            g_resource_editor_handle = new_resource_handle(editor);
-            g_resource_original_rabbit_sprite_handle = nullptr;
+    if (current != sprite) {
+        {
+            std::lock_guard<std::mutex> guard(g_resource_tracked_lock);
+            void *tracked_editor = g_resource_editor_handle != nullptr &&
+                                   g_il2cpp_metadata.gchandle_get_target != nullptr
+                ? g_il2cpp_metadata.gchandle_get_target(g_resource_editor_handle)
+                : nullptr;
+            if (tracked_editor != editor) {
+                free_resource_handle(g_resource_editor_handle);
+                free_resource_handle(g_resource_original_rabbit_sprite_handle);
+                g_resource_editor_handle = new_resource_handle(editor);
+                g_resource_original_rabbit_sprite_handle = nullptr;
+            }
+            if (current != nullptr && current != sprite &&
+                g_resource_original_rabbit_sprite_handle == nullptr)
+                g_resource_original_rabbit_sprite_handle = new_resource_handle(current);
         }
-        if (current != nullptr && current != sprite &&
-            g_resource_original_rabbit_sprite_handle == nullptr)
-            g_resource_original_rabbit_sprite_handle = new_resource_handle(current);
-    }
 
-    void *args[] = {sprite};
-    invoke_il2cpp_method(set_sprite, image, args);
-    invoke_void_color(set_color, image, resource_rabbit_color(resource_auto_enabled()));
+        void *args[] = {sprite};
+        invoke_il2cpp_method(set_sprite, image, args);
+    }
+    if (set_color != nullptr)
+        invoke_void_color(set_color, image, resource_rabbit_color(resource_auto_enabled()));
+}
+
+void set_resource_logo_clone_active(void *logo_text, bool active) {
+    if (logo_text == nullptr)
+        return;
+
+    void *component_get_game_object = nullptr;
+    void *component_get_transform = nullptr;
+    void *transform_get_parent = nullptr;
+    void *transform_find = nullptr;
+    void *game_object_set_active = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(g_resource_cache_lock);
+        component_get_game_object = g_resource_cache.component_get_game_object;
+        component_get_transform = g_resource_cache.component_get_transform;
+        transform_get_parent = g_resource_cache.transform_get_parent;
+        transform_find = g_resource_cache.transform_find;
+        game_object_set_active = g_resource_cache.game_object_set_active;
+    }
+    if (component_get_game_object == nullptr ||
+        component_get_transform == nullptr ||
+        transform_get_parent == nullptr ||
+        transform_find == nullptr ||
+        game_object_set_active == nullptr ||
+        g_il2cpp_metadata.string_new == nullptr)
+        return;
+
+    void *logo_transform = invoke_object_noargs(component_get_transform, logo_text);
+    void *parent = logo_transform != nullptr
+        ? invoke_object_noargs(transform_get_parent, logo_transform)
+        : nullptr;
+    parent = parent != nullptr
+        ? invoke_object_noargs(transform_get_parent, parent)
+        : nullptr;
+    if (parent == nullptr)
+        return;
+
+    void *hit_space_name = g_il2cpp_metadata.string_new("Hit Space");
+    void *find_hit_args[] = {hit_space_name};
+    void *hit_space = invoke_il2cpp_method(transform_find, parent, find_hit_args);
+    if (hit_space == nullptr)
+        return;
+    void *clone_name = g_il2cpp_metadata.string_new("JipperResourcepack Logo");
+    void *find_clone_args[] = {clone_name};
+    void *clone_transform = invoke_il2cpp_method(transform_find, hit_space, find_clone_args);
+    void *clone = clone_transform != nullptr
+        ? invoke_object_noargs(component_get_game_object, clone_transform)
+        : nullptr;
+    if (clone == nullptr)
+        return;
+
+    bool next_active = active;
+    void *active_args[] = {&next_active};
+    invoke_il2cpp_method(game_object_set_active, clone, active_args);
 }
 
 int apply_pending_resource_changer_state() {
@@ -5636,11 +6812,14 @@ int apply_pending_resource_changer_state() {
         }
         if ((mask & kResourceRestorePlanet) != 0) {
             planets.swap(g_resource_planet_handles);
+            g_resource_planet_objects.clear();
             logo_handle = g_resource_logo_text_handle;
             g_resource_logo_text_handle = nullptr;
         }
-        if ((mask & kResourceRestoreTile) != 0)
+        if ((mask & kResourceRestoreTile) != 0) {
             floors.swap(g_resource_floor_handles);
+            g_resource_floor_objects.clear();
+        }
     }
 
     int restored = 0;
@@ -5672,6 +6851,8 @@ int apply_pending_resource_changer_state() {
     }
     free_resource_handle(editor_handle);
     free_resource_handle(original_rabbit_handle);
+    if (editor != nullptr && resource_change_rabbit_enabled())
+        apply_resource_editor_rabbit(editor);
 
     int32_t renderer_offset = -1;
     int32_t is_red_offset = -1;
@@ -5701,6 +6882,8 @@ int apply_pending_resource_changer_state() {
             invoke_il2cpp_method(load_planet_color, renderer, args);
             ++restored;
         }
+        if (planet != nullptr && resource_change_ball_color_enabled())
+            apply_resource_planet_color(planet);
         free_resource_handle(handle);
     }
     for (void *handle : floors) {
@@ -5714,6 +6897,8 @@ int apply_pending_resource_changer_state() {
                 ColorValue{0.675f, 0.675f, 0.766f, 1.0f});
             ++restored;
         }
+        if (floor != nullptr && resource_change_tile_color_enabled())
+            apply_resource_floor_color(floor);
         free_resource_handle(handle);
     }
     void *logo = logo_handle != nullptr && g_il2cpp_metadata.gchandle_get_target != nullptr
@@ -5722,6 +6907,12 @@ int apply_pending_resource_changer_state() {
     if (logo != nullptr && update_logo_colors != nullptr) {
         invoke_il2cpp_method(update_logo_colors, logo, nullptr);
         ++restored;
+    }
+    if (logo != nullptr) {
+        if (resource_has_active_contribution())
+            apply_resource_logo_text(logo);
+        else
+            set_resource_logo_clone_active(logo, false);
     }
     free_resource_handle(logo_handle);
     return restored;
@@ -5732,11 +6923,13 @@ void release_resource_scene_handles() {
     {
         std::lock_guard<std::mutex> guard(g_resource_tracked_lock);
         handles.swap(g_resource_planet_handles);
+        g_resource_planet_objects.clear();
         handles.insert(
             handles.end(),
             g_resource_floor_handles.begin(),
             g_resource_floor_handles.end());
         g_resource_floor_handles.clear();
+        g_resource_floor_objects.clear();
         if (g_resource_logo_text_handle != nullptr) {
             handles.push_back(g_resource_logo_text_handle);
             g_resource_logo_text_handle = nullptr;
@@ -5759,6 +6952,46 @@ uint32_t dispatcher_target_kind(int dispatcher_index) {
         : kTargetKindUnknown;
 }
 
+bool pc_mod_session_token_active(const PcModSessionToken &session) {
+    return session.session_handle == 0 ||
+        pccompat_session_active(
+            session.session_handle,
+            session.host_generation,
+            session.resource_generation) == 1;
+}
+
+bool load_active_session_rule_masks(const DispatcherRuntimeSlot *runtime,
+                                    uint64_t *before_mask,
+                                    uint64_t *after_mask) {
+    if (runtime == nullptr || before_mask == nullptr || after_mask == nullptr)
+        return false;
+    *before_mask = 0;
+    *after_mask = 0;
+    const auto bindings = std::atomic_load_explicit(
+        &runtime->session_rule_masks, std::memory_order_acquire);
+    if (bindings == nullptr || bindings->empty()) {
+        *before_mask = runtime->before_op_mask.load(std::memory_order_acquire);
+        *after_mask = runtime->after_op_mask.load(std::memory_order_acquire);
+        return (*before_mask | *after_mask) != 0;
+    }
+    bool active = false;
+    for (const auto &binding : *bindings) {
+        if (!pc_mod_session_token_active(binding.pc_mod_session))
+            continue;
+        *before_mask |= binding.before_op_mask;
+        *after_mask |= binding.after_op_mask;
+        active = true;
+    }
+    return active;
+}
+
+bool pc_mod_resource_session_active(const char *mod_id,
+                                    int64_t resource_generation) {
+    if (mod_id == nullptr || *mod_id == '\0' || resource_generation <= 0)
+        return false;
+    return true;
+}
+
 bool run_fixed_before_ops(int dispatcher_index, const FixedBeforeArgs &args) {
     auto *runtime = dispatcher_runtime_slot(dispatcher_index);
     if (runtime == nullptr)
@@ -5767,10 +7000,12 @@ bool run_fixed_before_ops(int dispatcher_index, const FixedBeforeArgs &args) {
     if (g_resource_pending_restore_mask.load(std::memory_order_acquire) != 0)
         apply_pending_resource_changer_state();
 
-    if (runtime->enabled.load(std::memory_order_acquire) == 0)
+    uint64_t mask = 0;
+    uint64_t unused_after_mask = 0;
+    if (runtime->enabled.load(std::memory_order_acquire) == 0 ||
+        !load_active_session_rule_masks(runtime, &mask, &unused_after_mask))
         return false;
 
-    const uint64_t mask = runtime->before_op_mask.load(std::memory_order_acquire);
     if (mask == 0)
         return false;
 
@@ -5805,33 +7040,54 @@ bool run_fixed_before_ops(int dispatcher_index, const FixedBeforeArgs &args) {
     return skip_original;
 }
 
-void begin_overlay_session(bool practice,
-                           int32_t start_seq_id,
-                           bool has_start_seq) {
+void begin_shared_overlay_session(
+    int32_t start_seq_id,
+    bool has_start_seq,
+    bool is_restart) {
+    OwnerOverlayScope shared_scope(&g_legacy_overlay_session);
     starray::realtime::begin_session(starray::realtime::monotonic_now_ns());
-    reset_overlay_session_metrics();
+    reset_shared_overlay_session_facts();
     {
         std::lock_guard<std::mutex> guard(g_timeline_state_lock);
         g_session_start_seq_id = start_seq_id;
         g_session_start_seq_valid = has_start_seq;
     }
-    g_overlay_state.visible.store(1, std::memory_order_release);
-    g_overlay_state.practice.store(practice ? 1u : 0u, std::memory_order_release);
+    g_shared_overlay_session_visible.store(1, std::memory_order_release);
+    active_overlay_state().visible.store(1, std::memory_order_release);
+    active_overlay_state().last_seq_id.store(start_seq_id, std::memory_order_release);
+    active_overlay_state().last_is_restart.store(is_restart ? 1u : 0u, std::memory_order_release);
+    active_overlay_state().show_count.fetch_add(1, std::memory_order_relaxed);
+    active_overlay_state().attempt_count.fetch_add(1, std::memory_order_relaxed);
+    active_overlay_state().last_op.store(kRuleOpOverlayShow, std::memory_order_release);
     poll_overlay_telemetry(nullptr, true);
+    active_overlay_state().generation.fetch_add(1, std::memory_order_release);
+}
+
+void begin_overlay_session(bool practice) {
+    reset_owner_overlay_session_metrics();
+    active_overlay_state().visible.store(1, std::memory_order_release);
+    active_overlay_state().practice.store(practice ? 1u : 0u, std::memory_order_release);
+}
+
+void retire_shared_overlay_session() {
+    OwnerOverlayScope shared_scope(&g_legacy_overlay_session);
+    if (g_shared_overlay_session_visible.exchange(0, std::memory_order_acq_rel) == 0)
+        return;
+    // Realtime sessions are generation boundaries. Move to an empty generation
+    // so completed input snapshots cannot be reused by the next gameplay attempt.
+    starray::realtime::begin_session(starray::realtime::monotonic_now_ns());
+    reset_shared_overlay_session_facts();
+    release_resource_scene_handles();
 }
 
 bool retire_overlay_session() {
     const bool was_visible =
-        g_overlay_state.visible.exchange(0, std::memory_order_acq_rel) != 0;
-    g_overlay_state.practice.store(0, std::memory_order_release);
+        active_overlay_state().visible.exchange(0, std::memory_order_acq_rel) != 0;
+    active_overlay_state().practice.store(0, std::memory_order_release);
     if (!was_visible)
         return false;
 
-    // Realtime sessions are generation boundaries. Move to an empty generation
-    // so completed input snapshots cannot be reused by the next gameplay attempt.
-    starray::realtime::begin_session(starray::realtime::monotonic_now_ns());
-    reset_overlay_session_metrics();
-    release_resource_scene_handles();
+    reset_owner_overlay_session_metrics();
     return true;
 }
 
@@ -5848,16 +7104,16 @@ bool publish_margin_snapshot(void *tracker) {
     const uint32_t percent_acc_bits = float_to_bits(percent_acc);
     const uint32_t percent_x_acc_bits = float_to_bits(percent_x_acc);
     const uint32_t old_percent_acc_bits =
-        g_overlay_state.percent_acc_bits.load(std::memory_order_acquire);
+        active_overlay_state().percent_acc_bits.load(std::memory_order_acquire);
     const uint32_t old_percent_x_acc_bits =
-        g_overlay_state.percent_x_acc_bits.load(std::memory_order_acquire);
+        active_overlay_state().percent_x_acc_bits.load(std::memory_order_acquire);
     const uint32_t old_snapshot_count =
-        g_overlay_state.accuracy_snapshot_count.load(std::memory_order_acquire);
+        active_overlay_state().accuracy_snapshot_count.load(std::memory_order_acquire);
 
-    g_overlay_state.percent_acc_bits.store(percent_acc_bits, std::memory_order_release);
-    g_overlay_state.percent_x_acc_bits.store(percent_x_acc_bits, std::memory_order_release);
+    active_overlay_state().percent_acc_bits.store(percent_acc_bits, std::memory_order_release);
+    active_overlay_state().percent_x_acc_bits.store(percent_x_acc_bits, std::memory_order_release);
     g_margin_tracker_instance.store(reinterpret_cast<uintptr_t>(tracker), std::memory_order_release);
-    g_overlay_state.accuracy_snapshot_count.fetch_add(1, std::memory_order_relaxed);
+    active_overlay_state().accuracy_snapshot_count.fetch_add(1, std::memory_order_relaxed);
     return old_snapshot_count == 0 ||
            old_percent_acc_bits != percent_acc_bits ||
            old_percent_x_acc_bits != percent_x_acc_bits;
@@ -5868,11 +7124,11 @@ void record_combo_from_margin(int32_t hit_margin) {
     constexpr int32_t kHitMarginAuto = 10;
 
     if (hit_margin == kHitMarginPerfect || hit_margin == kHitMarginAuto) {
-        g_overlay_state.combo_count.fetch_add(1, std::memory_order_relaxed);
+        active_overlay_state().combo_count.fetch_add(1, std::memory_order_relaxed);
         return;
     }
 
-    g_overlay_state.combo_count.store(0, std::memory_order_release);
+    active_overlay_state().combo_count.store(0, std::memory_order_release);
 }
 
 void record_bpm_snapshot(float bpm_times_speed, float conductor_pitch) {
@@ -5885,203 +7141,207 @@ void record_bpm_snapshot(float bpm_times_speed, float conductor_pitch) {
 
     const float tile_bpm = bpm_times_speed * conductor_pitch;
     const float kps = tile_bpm / 60.0f;
-    g_overlay_state.tile_bpm_bits.store(float_to_bits(tile_bpm), std::memory_order_release);
-    g_overlay_state.kps_bits.store(float_to_bits(kps), std::memory_order_release);
-    g_overlay_state.bpm_snapshot_count.fetch_add(1, std::memory_order_relaxed);
+    active_overlay_state().tile_bpm_bits.store(float_to_bits(tile_bpm), std::memory_order_release);
+    active_overlay_state().kps_bits.store(float_to_bits(kps), std::memory_order_release);
+    active_overlay_state().bpm_snapshot_count.fetch_add(1, std::memory_order_relaxed);
 }
 
-void run_fixed_after_ops(int dispatcher_index, const FixedOpArgs &args) {
-    auto *runtime = dispatcher_runtime_slot(dispatcher_index);
-    if (runtime == nullptr)
-        return;
+// Owner snapshots carry local HUD state. Mirror only official game facts from
+// the shared sampler so native metadata/getter work is never repeated per MOD.
+bool project_shared_game_facts_to_owner() {
+    auto &owner = active_overlay_state();
+    auto &shared = g_legacy_overlay_session.state;
+    if (&owner == &shared)
+        return false;
 
-    if (g_resource_pending_restore_mask.load(std::memory_order_acquire) != 0)
-        apply_pending_resource_changer_state();
+    bool changed = false;
+    const auto copy = [&changed](auto &destination, const auto &source) {
+        changed |= atomic_store_if_changed(
+            destination,
+            source.load(std::memory_order_acquire));
+    };
 
-    if (runtime->enabled.load(std::memory_order_acquire) == 0)
-        return;
+    copy(owner.player_count, shared.player_count);
+    copy(owner.last_seq_id, shared.last_seq_id);
+    copy(owner.last_is_restart, shared.last_is_restart);
+    copy(owner.accuracy_snapshot_count, shared.accuracy_snapshot_count);
+    copy(owner.percent_acc_bits, shared.percent_acc_bits);
+    copy(owner.percent_x_acc_bits, shared.percent_x_acc_bits);
+    copy(owner.progress_bits, shared.progress_bits);
+    copy(owner.bpm_snapshot_count, shared.bpm_snapshot_count);
+    copy(owner.tile_bpm_bits, shared.tile_bpm_bits);
+    copy(owner.kps_bits, shared.kps_bits);
+    copy(owner.timeline_snapshot_count, shared.timeline_snapshot_count);
+    copy(owner.session_epoch, shared.session_epoch);
+    copy(owner.music_time_bits, shared.music_time_bits);
+    copy(owner.music_total_time_bits, shared.music_total_time_bits);
+    copy(owner.map_time_bits, shared.map_time_bits);
+    copy(owner.map_total_time_bits, shared.map_total_time_bits);
+    copy(owner.checkpoints_used, shared.checkpoints_used);
+    copy(owner.current_checkpoint, shared.current_checkpoint);
+    copy(owner.total_checkpoints, shared.total_checkpoints);
+    copy(owner.current_seq_id, shared.current_seq_id);
+    copy(owner.floor_count, shared.floor_count);
+    copy(owner.start_progress_bits, shared.start_progress_bits);
+    copy(owner.speed_multiplier_bits, shared.speed_multiplier_bits);
+    copy(owner.session_auto, shared.session_auto);
+    copy(owner.input_state_generation, shared.input_state_generation);
+    copy(owner.input_held_mask, shared.input_held_mask);
+    copy(owner.input_last_down_mask, shared.input_last_down_mask);
+    copy(owner.input_last_up_mask, shared.input_last_up_mask);
+    copy(owner.input_total_count, shared.input_total_count);
+    copy(owner.input_kps_bits, shared.input_kps_bits);
+    copy(owner.planet_speed_bits, shared.planet_speed_bits);
+    copy(owner.rdc_auto, shared.rdc_auto);
+    copy(owner.no_fail, shared.no_fail);
+    copy(owner.paused, shared.paused);
+    copy(owner.is_game_world, shared.is_game_world);
+    copy(owner.song_pitch_bits, shared.song_pitch_bits);
+    copy(owner.conductor_add_offset_bits, shared.conductor_add_offset_bits);
+    copy(owner.conductor_songposition_minusi_bits, shared.conductor_songposition_minusi_bits);
+    copy(owner.is_scn_game, shared.is_scn_game);
+    copy(owner.game_ready, shared.game_ready);
+    return changed;
+}
 
-    const uint64_t mask = runtime->after_op_mask.load(std::memory_order_acquire);
+bool run_owner_overlay_after_ops(
+    uint64_t mask,
+    const FixedOpArgs &args,
+    const std::vector<uint32_t> &bundle_ids) {
+    mask &= kOwnerOverlayOpMask;
     if (mask == 0)
-        return;
+        return false;
 
-    const uint32_t call_count = runtime->call_count.fetch_add(1, std::memory_order_relaxed) + 1;
     const uint64_t poll_mask = 1ULL << kRuleOpOverlayPollTelemetry;
-    const uint64_t gameplay_accepted_mask = 1ULL << kRuleOpGameplayAcceptedObserve;
     const uint64_t start_mask =
         (1ULL << kRuleOpOverlayShow) |
         (1ULL << kRuleOpOverlayShowPractice);
     const uint64_t hide_mask = 1ULL << kRuleOpOverlayHide;
     bool state_changed =
-        (mask & ~(poll_mask | start_mask | hide_mask | gameplay_accepted_mask)) != 0;
-    if ((mask & ~gameplay_accepted_mask) != 0)
-        g_overlay_state.last_target_kind.store(args.target_kind, std::memory_order_release);
+        (mask & ~(poll_mask | start_mask | hide_mask)) != 0;
+    if (mask != 0)
+        active_overlay_state().last_target_kind.store(args.target_kind, std::memory_order_release);
 
     if ((mask & (1ULL << kRuleOpOverlayShow)) != 0) {
         if (args.has_play_args) {
-            g_overlay_state.last_seq_id.store(args.seq_id, std::memory_order_release);
-            g_overlay_state.last_is_restart.store(args.is_restart ? 1u : 0u, std::memory_order_release);
+            active_overlay_state().last_seq_id.store(args.seq_id, std::memory_order_release);
+            active_overlay_state().last_is_restart.store(args.is_restart ? 1u : 0u, std::memory_order_release);
         }
-        begin_overlay_session(false, args.seq_id, args.has_play_args);
-        publish_controller_progress_snapshot();
-        g_overlay_state.attempt_count.fetch_add(1, std::memory_order_relaxed);
-        g_overlay_state.show_count.fetch_add(1, std::memory_order_relaxed);
-        g_overlay_state.last_op.store(kRuleOpOverlayShow, std::memory_order_release);
+        begin_overlay_session(false);
+        active_overlay_state().attempt_count.fetch_add(1, std::memory_order_relaxed);
+        active_overlay_state().show_count.fetch_add(1, std::memory_order_relaxed);
+        active_overlay_state().last_op.store(kRuleOpOverlayShow, std::memory_order_release);
         state_changed = true;
     }
     if ((mask & (1ULL << kRuleOpOverlayShowPractice)) != 0) {
-        begin_overlay_session(true, 0, false);
-        publish_controller_progress_snapshot();
-        g_overlay_state.attempt_count.fetch_add(1, std::memory_order_relaxed);
-        g_overlay_state.show_count.fetch_add(1, std::memory_order_relaxed);
-        g_overlay_state.last_op.store(kRuleOpOverlayShowPractice, std::memory_order_release);
+        begin_overlay_session(true);
+        active_overlay_state().attempt_count.fetch_add(1, std::memory_order_relaxed);
+        active_overlay_state().show_count.fetch_add(1, std::memory_order_relaxed);
+        active_overlay_state().last_op.store(kRuleOpOverlayShowPractice, std::memory_order_release);
         state_changed = true;
     }
     if ((mask & (1ULL << kRuleOpOverlayHandleStateChange)) != 0) {
-        g_overlay_state.state_change_count.fetch_add(1, std::memory_order_relaxed);
-        g_overlay_state.last_op.store(kRuleOpOverlayHandleStateChange, std::memory_order_release);
+        active_overlay_state().state_change_count.fetch_add(1, std::memory_order_relaxed);
+        active_overlay_state().last_op.store(kRuleOpOverlayHandleStateChange, std::memory_order_release);
     }
     if ((mask & (1ULL << kRuleOpOverlayHide)) != 0) {
         if (args.has_wipe_direction)
-            g_overlay_state.last_wipe_direction.store(args.wipe_direction, std::memory_order_release);
+            active_overlay_state().last_wipe_direction.store(args.wipe_direction, std::memory_order_release);
         if (args.has_reset_to_editor)
-            g_overlay_state.last_reset_to_editor.store(args.reset_to_editor ? 1u : 0u, std::memory_order_release);
+            active_overlay_state().last_reset_to_editor.store(args.reset_to_editor ? 1u : 0u, std::memory_order_release);
         if (retire_overlay_session()) {
-            g_overlay_state.hide_count.fetch_add(1, std::memory_order_relaxed);
-            g_overlay_state.last_op.store(kRuleOpOverlayHide, std::memory_order_release);
+            active_overlay_state().hide_count.fetch_add(1, std::memory_order_relaxed);
+            active_overlay_state().last_op.store(kRuleOpOverlayHide, std::memory_order_release);
             state_changed = true;
         }
     }
     if ((mask & (1ULL << kRuleOpOverlayUpdatePlayers)) != 0) {
         if (args.has_player_count)
-            g_overlay_state.player_count.store(args.player_count, std::memory_order_release);
-        g_overlay_state.player_update_count.fetch_add(1, std::memory_order_relaxed);
-        g_overlay_state.last_op.store(kRuleOpOverlayUpdatePlayers, std::memory_order_release);
+            active_overlay_state().player_count.store(args.player_count, std::memory_order_release);
+        active_overlay_state().player_update_count.fetch_add(1, std::memory_order_relaxed);
+        active_overlay_state().last_op.store(kRuleOpOverlayUpdatePlayers, std::memory_order_release);
     }
-    const bool session_active = g_overlay_state.visible.load(std::memory_order_acquire) != 0;
+    const bool session_active = active_overlay_state().visible.load(std::memory_order_acquire) != 0;
     bool margin_snapshot_changed = false;
-    if ((mask & ((1ULL << kRuleOpOverlayShow) |
-                 (1ULL << kRuleOpOverlayShowPractice) |
-                 (1ULL << kRuleOpOverlayUpdatePlayers))) != 0 ||
-        (args.instance != nullptr &&
-         (mask & ((1ULL << kRuleOpOverlayRecordHit) |
-                  (1ULL << kRuleOpOverlayResetJudgement) |
-                  (1ULL << kRuleOpPublishMarginSnapshot))) != 0)) {
-        // Always resolve the current static player-0 tracker first. SetPlayerCount
-        // replaces the tracker object, while AddHit/Reset mutate its count array.
-        const bool tracker_method =
-            args.target_kind == kTargetKindMarginTrackerAddHit ||
-            args.target_kind == kTargetKindMarginTrackerReset ||
-            args.target_kind == kTargetKindMarginTrackerCalculatePercentAcc;
-        if (publish_hit_margin_snapshot(tracker_method ? args.instance : nullptr)) {
-            g_last_hit_margin_authoritative_publish_ms.store(
-                steady_time_ms(),
-                std::memory_order_release);
-        }
-    }
     if (session_active && (mask & (1ULL << kRuleOpPublishMarginSnapshot)) != 0) {
         margin_snapshot_changed = publish_margin_snapshot(args.instance);
-        g_overlay_state.last_op.store(kRuleOpPublishMarginSnapshot, std::memory_order_release);
+        active_overlay_state().last_op.store(kRuleOpPublishMarginSnapshot, std::memory_order_release);
     }
     if (session_active && (mask & (1ULL << kRuleOpOverlayRecordHit)) != 0) {
         if (args.has_hit_margin) {
-            g_overlay_state.last_hit_margin.store(args.hit_margin, std::memory_order_release);
+            active_overlay_state().last_hit_margin.store(args.hit_margin, std::memory_order_release);
             record_combo_from_margin(args.hit_margin);
         }
-        g_overlay_state.judgement_hit_count.fetch_add(1, std::memory_order_relaxed);
-        g_overlay_state.last_op.store(kRuleOpOverlayRecordHit, std::memory_order_release);
+        active_overlay_state().judgement_hit_count.fetch_add(1, std::memory_order_relaxed);
+        active_overlay_state().last_op.store(kRuleOpOverlayRecordHit, std::memory_order_release);
     }
     if (session_active && (mask & (1ULL << kRuleOpOverlayResetJudgement)) != 0) {
-        g_overlay_state.judgement_reset_count.fetch_add(1, std::memory_order_relaxed);
-        g_overlay_state.last_hit_margin.store(0, std::memory_order_release);
-        g_overlay_state.combo_count.store(0, std::memory_order_release);
-        g_overlay_state.last_op.store(kRuleOpOverlayResetJudgement, std::memory_order_release);
+        active_overlay_state().judgement_reset_count.fetch_add(1, std::memory_order_relaxed);
+        active_overlay_state().last_hit_margin.store(0, std::memory_order_release);
+        active_overlay_state().combo_count.store(0, std::memory_order_release);
+        active_overlay_state().last_op.store(kRuleOpOverlayResetJudgement, std::memory_order_release);
     }
     if (session_active && (mask & (1ULL << kRuleOpOverlayRecordFloorMove)) != 0) {
         if (args.has_floor_exit_angle)
-            g_overlay_state.last_floor_exit_angle_bits.store(float_to_bits(args.floor_exit_angle), std::memory_order_release);
+            active_overlay_state().last_floor_exit_angle_bits.store(float_to_bits(args.floor_exit_angle), std::memory_order_release);
         if (args.has_floor_move_hit_margin)
-            g_overlay_state.last_floor_move_hit_margin.store(args.floor_move_hit_margin, std::memory_order_release);
-        publish_controller_progress_snapshot();
-        g_overlay_state.floor_move_count.fetch_add(1, std::memory_order_relaxed);
-        g_overlay_state.last_op.store(kRuleOpOverlayRecordFloorMove, std::memory_order_release);
+            active_overlay_state().last_floor_move_hit_margin.store(args.floor_move_hit_margin, std::memory_order_release);
+        active_overlay_state().floor_move_count.fetch_add(1, std::memory_order_relaxed);
+        active_overlay_state().last_op.store(kRuleOpOverlayRecordFloorMove, std::memory_order_release);
     }
     if (session_active && (mask & (1ULL << kRuleOpOverlayRecordPlayerHit)) != 0) {
         if (args.has_player_hit_is_auto)
-            g_overlay_state.last_player_hit_is_auto.store(args.player_hit_is_auto ? 1u : 0u, std::memory_order_release);
-        g_overlay_state.player_hit_count.fetch_add(1, std::memory_order_relaxed);
-        g_overlay_state.last_op.store(kRuleOpOverlayRecordPlayerHit, std::memory_order_release);
+            active_overlay_state().last_player_hit_is_auto.store(args.player_hit_is_auto ? 1u : 0u, std::memory_order_release);
+        active_overlay_state().player_hit_count.fetch_add(1, std::memory_order_relaxed);
+        active_overlay_state().last_op.store(kRuleOpOverlayRecordPlayerHit, std::memory_order_release);
     }
     if (session_active && (mask & (1ULL << kRuleOpOverlayRecordDeath)) != 0) {
         if (args.has_death_args) {
-            g_overlay_state.last_death_overload.store(args.death_overload ? 1u : 0u, std::memory_order_release);
-            g_overlay_state.last_death_multipress.store(args.death_multipress ? 1u : 0u, std::memory_order_release);
-            g_overlay_state.last_death_hitbox.store(args.death_hitbox ? 1u : 0u, std::memory_order_release);
+            active_overlay_state().last_death_overload.store(args.death_overload ? 1u : 0u, std::memory_order_release);
+            active_overlay_state().last_death_multipress.store(args.death_multipress ? 1u : 0u, std::memory_order_release);
+            active_overlay_state().last_death_hitbox.store(args.death_hitbox ? 1u : 0u, std::memory_order_release);
         }
-        g_overlay_state.death_count.fetch_add(1, std::memory_order_relaxed);
-        g_overlay_state.last_op.store(kRuleOpOverlayRecordDeath, std::memory_order_release);
+        active_overlay_state().death_count.fetch_add(1, std::memory_order_relaxed);
+        active_overlay_state().last_op.store(kRuleOpOverlayRecordDeath, std::memory_order_release);
     }
     if (session_active && (mask & (1ULL << kRuleOpOverlayRecordHitTiming)) != 0) {
         if (args.has_hit_timing) {
-            g_overlay_state.last_hit_timing_ms_bits.store(float_to_bits(args.hit_timing_ms), std::memory_order_release);
-            g_overlay_state.last_hit_timing_margin.store(args.hit_timing_margin, std::memory_order_release);
+            active_overlay_state().last_hit_timing_ms_bits.store(float_to_bits(args.hit_timing_ms), std::memory_order_release);
+            active_overlay_state().last_hit_timing_margin.store(args.hit_timing_margin, std::memory_order_release);
             record_bpm_snapshot(args.bpm_times_speed, args.conductor_pitch);
         }
-        g_overlay_state.hit_timing_count.fetch_add(1, std::memory_order_relaxed);
-        g_overlay_state.last_op.store(kRuleOpOverlayRecordHitTiming, std::memory_order_release);
+        active_overlay_state().hit_timing_count.fetch_add(1, std::memory_order_relaxed);
+        active_overlay_state().last_op.store(kRuleOpOverlayRecordHitTiming, std::memory_order_release);
     }
-    if (session_active && (mask & poll_mask) != 0) {
-        if (poll_overlay_telemetry(args.instance, false)) {
+    if ((mask & (poll_mask | start_mask)) != 0) {
+        if (project_shared_game_facts_to_owner()) {
             state_changed = true;
-            g_overlay_state.last_op.store(kRuleOpOverlayPollTelemetry, std::memory_order_release);
+            active_overlay_state().last_op.store(kRuleOpOverlayPollTelemetry, std::memory_order_release);
         }
     }
-    if ((mask & (1ULL << kRuleOpResourceApplyEditorRabbit)) != 0) {
-        apply_resource_editor_rabbit(args.instance);
-        g_overlay_state.last_op.store(kRuleOpResourceApplyEditorRabbit, std::memory_order_release);
-    }
-    if ((mask & (1ULL << kRuleOpResourceApplyFloorColor)) != 0) {
-        apply_resource_floor_color(args.instance);
-        g_overlay_state.last_op.store(kRuleOpResourceApplyFloorColor, std::memory_order_release);
-    }
-    if ((mask & (1ULL << kRuleOpResourceApplyPlanetColor)) != 0) {
-        apply_resource_planet_color(args.instance);
-        g_overlay_state.last_op.store(kRuleOpResourceApplyPlanetColor, std::memory_order_release);
-    }
-    if ((mask & (1ULL << kRuleOpResourceApplyLogoText)) != 0) {
-        apply_resource_logo_text(args.instance);
-        g_overlay_state.last_op.store(kRuleOpResourceApplyLogoText, std::memory_order_release);
-    }
-    if ((mask & gameplay_accepted_mask) != 0 &&
-        args.has_bool_result &&
-        args.bool_result &&
-        args.has_gameplay_input_args) {
-        starray::realtime::observe_gameplay_accepted(
-            args.gameplay_input_is_auto,
-            args.gameplay_input_state,
-            starray::realtime::monotonic_now_ns(),
-            starray::async_input_bridge::test_macro_enabled());
-    }
-
-    // A managed callback may immediately read reverse-patch state. Queue it only
-    // after every native publisher above has committed the matching snapshot.
-    if ((mask & (1ULL << kRuleOpManagedEventCallback)) != 0)
-        enqueue_managed_event_rules(dispatcher_index, args);
-
     if (!state_changed)
-        return;
+        return false;
 
     const uint32_t generation =
-        g_overlay_state.generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+        active_overlay_state().generation.fetch_add(1, std::memory_order_acq_rel) + 1;
 
     const uint64_t visibility_mask =
         (1ULL << kRuleOpOverlayShow) |
         (1ULL << kRuleOpOverlayShowPractice) |
         (1ULL << kRuleOpOverlayHide);
     if ((mask & visibility_mask) != 0) {
-        starray::ui_recipe_runtime::publish_overlay_state(
-            generation,
-            g_overlay_state.visible.load(std::memory_order_acquire) != 0);
+        const bool visible =
+            active_overlay_state().visible.load(std::memory_order_acquire) != 0;
+        if (bundle_ids.empty()) {
+            starray::ui_recipe_runtime::publish_overlay_state(generation, visible);
+        } else {
+            for (const uint32_t bundle_id : bundle_ids) {
+                starray::ui_recipe_runtime::publish_bundle_overlay_state(
+                    bundle_id,
+                    generation,
+                    visible);
+            }
+        }
     }
 
     // GetHitMargin/CalculatePercentAcc/MoveToNextFloor can all run during one
@@ -6096,10 +7356,13 @@ void run_fixed_after_ops(int dispatcher_index, const FixedOpArgs &args) {
             if (margin_snapshot_changed) {
                 const int64_t now_ms = steady_time_ms();
                 const int64_t last_ms =
-                    g_overlay_last_margin_callback_ms.load(std::memory_order_acquire);
+                    active_owner_overlay_session().last_margin_callback_ms.load(
+                        std::memory_order_acquire);
                 if (last_ms == 0 ||
                     now_ms - last_ms >= kMarginSnapshotCallbackIntervalMs) {
-                    g_overlay_last_margin_callback_ms.store(now_ms, std::memory_order_release);
+                    active_owner_overlay_session().last_margin_callback_ms.store(
+                        now_ms,
+                        std::memory_order_release);
                     notify_mask = (1ULL << kRuleOpPublishMarginSnapshot);
                 }
             }
@@ -6112,14 +7375,168 @@ void run_fixed_after_ops(int dispatcher_index, const FixedOpArgs &args) {
             callback(generation);
     }
 
+    return true;
+}
+
+void run_shared_after_ops(
+    int dispatcher_index,
+    uint64_t mask,
+    const FixedOpArgs &args) {
+    (void)dispatcher_index;
+    OwnerOverlayScope shared_scope(&g_legacy_overlay_session);
+    bool shared_changed = false;
+    const uint64_t start_mask =
+        (1ULL << kRuleOpOverlayShow) |
+        (1ULL << kRuleOpOverlayShowPractice);
+    if ((mask & start_mask) != 0)
+        begin_shared_overlay_session(
+            args.seq_id,
+            args.has_play_args,
+            args.is_restart);
+    if ((mask & (1ULL << kRuleOpOverlayHide)) != 0)
+        retire_shared_overlay_session();
+
+    if ((mask & (1ULL << kRuleOpOverlayUpdatePlayers)) != 0) {
+        if (args.has_player_count) {
+            shared_changed |= atomic_store_if_changed(
+                active_overlay_state().player_count,
+                args.player_count);
+        }
+        active_overlay_state().player_update_count.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    if ((mask & ((1ULL << kRuleOpOverlayShow) |
+                 (1ULL << kRuleOpOverlayShowPractice) |
+                 (1ULL << kRuleOpOverlayUpdatePlayers))) != 0 ||
+        (args.instance != nullptr &&
+         (mask & ((1ULL << kRuleOpOverlayRecordHit) |
+                  (1ULL << kRuleOpOverlayResetJudgement) |
+                  (1ULL << kRuleOpPublishMarginSnapshot))) != 0)) {
+        const bool tracker_method =
+            args.target_kind == kTargetKindMarginTrackerAddHit ||
+            args.target_kind == kTargetKindMarginTrackerReset ||
+            args.target_kind == kTargetKindMarginTrackerCalculatePercentAcc;
+        if (publish_hit_margin_snapshot(tracker_method ? args.instance : nullptr)) {
+            g_last_hit_margin_authoritative_publish_ms.store(
+                steady_time_ms(),
+                std::memory_order_release);
+        }
+    }
+
+    if ((mask & (1ULL << kRuleOpPublishMarginSnapshot)) != 0 &&
+        args.instance != nullptr) {
+        shared_changed |= publish_margin_snapshot(args.instance);
+    }
+
+    if ((mask & (1ULL << kRuleOpOverlayRecordFloorMove)) != 0) {
+        const uint32_t before = active_overlay_state().progress_bits.load(
+            std::memory_order_acquire);
+        publish_controller_progress_snapshot();
+        shared_changed |= before != active_overlay_state().progress_bits.load(
+            std::memory_order_acquire);
+    }
+
+    if ((mask & (1ULL << kRuleOpOverlayPollTelemetry)) != 0 &&
+        poll_overlay_telemetry(args.instance, false)) {
+        active_overlay_state().last_op.store(kRuleOpOverlayPollTelemetry, std::memory_order_release);
+        shared_changed = true;
+    }
+
+    if ((mask & (1ULL << kRuleOpResourceApplyEditorRabbit)) != 0)
+        apply_resource_editor_rabbit(args.instance);
+    if ((mask & (1ULL << kRuleOpResourceApplyFloorColor)) != 0)
+        apply_resource_floor_color(args.instance);
+    if ((mask & (1ULL << kRuleOpResourceApplyPlanetColor)) != 0)
+        apply_resource_planet_color(args.instance);
+    if ((mask & (1ULL << kRuleOpResourceApplyLogoText)) != 0)
+        apply_resource_logo_text(args.instance);
+
+    if ((mask & (1ULL << kRuleOpGameplayAcceptedObserve)) != 0 &&
+        args.has_bool_result &&
+        args.bool_result &&
+        args.has_gameplay_input_args) {
+        starray::realtime::observe_gameplay_accepted(
+            args.gameplay_input_is_auto,
+            args.gameplay_input_state,
+            starray::realtime::monotonic_now_ns(),
+            starray::async_input_bridge::test_macro_enabled());
+    }
+
+    if (shared_changed)
+        active_overlay_state().generation.fetch_add(1, std::memory_order_acq_rel);
+
+}
+
+void enqueue_managed_after_owner_ops(
+    int dispatcher_index,
+    uint64_t mask,
+    const FixedOpArgs &args) {
+    if ((mask & (1ULL << kRuleOpManagedEventCallback)) != 0)
+        enqueue_managed_event_rules(dispatcher_index, args);
+}
+
+void run_fixed_after_ops(int dispatcher_index, const FixedOpArgs &args) {
+    auto *runtime = dispatcher_runtime_slot(dispatcher_index);
+    if (runtime == nullptr)
+        return;
+
+    if (g_resource_pending_restore_mask.load(std::memory_order_acquire) != 0)
+        apply_pending_resource_changer_state();
+    uint64_t unused_before_mask = 0;
+    uint64_t mask = 0;
+    if (runtime->enabled.load(std::memory_order_acquire) == 0 ||
+        !load_active_session_rule_masks(runtime, &unused_before_mask, &mask))
+        return;
+
+    if (mask == 0)
+        return;
+
+    const uint32_t call_count =
+        runtime->call_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    run_shared_after_ops(dispatcher_index, mask, args);
+
+    const auto subscribers = std::atomic_load_explicit(
+        &runtime->owner_overlay_after_rules,
+        std::memory_order_acquire);
+    size_t owner_count = 0;
+    uint32_t visible_count = 0;
+    if (subscribers != nullptr && !subscribers->empty()) {
+        for (const auto &target : *subscribers) {
+            const auto &session = target.session;
+            if (!pc_mod_session_token_active(target.pc_mod_session) ||
+                session == nullptr ||
+                session->retired.load(std::memory_order_acquire) != 0) {
+                continue;
+            }
+            OwnerOverlayScope scope(session.get());
+            run_owner_overlay_after_ops(target.after_op_mask, args, target.bundle_ids);
+            ++owner_count;
+            visible_count += active_overlay_state().visible.load(std::memory_order_relaxed) != 0
+                ? 1u
+                : 0u;
+        }
+    }
+    else if ((mask & kOwnerOverlayOpMask) != 0) {
+        static const std::vector<uint32_t> no_bundles;
+        run_owner_overlay_after_ops(mask, args, no_bundles);
+        owner_count = 1;
+        visible_count = active_overlay_state().visible.load(std::memory_order_relaxed) != 0
+            ? 1u
+            : 0u;
+    }
+
+    // Managed callbacks run once after every owner reducer has committed.
+    enqueue_managed_after_owner_ops(dispatcher_index, mask, args);
+
     if (call_count <= 3 || (call_count % 1024u) == 0) {
-        LOGI("dispatcher slot=%u index=%d calls=%u beforeMask=0x%llx afterMask=0x%llx overlayVisible=%u",
+        LOGI("dispatcher slot=%u index=%d calls=%u beforeMask=0x%llx afterMask=0x%llx overlayOwners=%zu visibleOwners=%u",
              runtime->slot_id.load(std::memory_order_relaxed),
              dispatcher_index,
              call_count,
              static_cast<unsigned long long>(runtime->before_op_mask.load(std::memory_order_relaxed)),
              static_cast<unsigned long long>(mask),
-             g_overlay_state.visible.load(std::memory_order_relaxed));
+             owner_count,
+             visible_count);
     }
 }
 
@@ -6162,7 +7579,7 @@ void dispatcher_instance_void0(int dispatcher_index, void *self, void *method_in
         report_missing_original(dispatcher_index);
         return;
     }
-    if (!modmanager_runtime_enabled()) {
+    if (!pccompat_runtime_enabled(0)) {
         original(self, method_info);
         return;
     }
@@ -6173,6 +7590,7 @@ void dispatcher_instance_void0(int dispatcher_index, void *self, void *method_in
         FixedBeforeArgs{.target_kind = dispatcher_target_kind(dispatcher_index), .instance = self});
     const bool managed_skip = run_managed_prefix_rules(dispatcher_index, args);
     refresh_fixed_args_after_managed_prefix(args);
+    self = args.instance;
     const bool skip = managed_skip || fixed_skip;
     if (!skip)
         original(self, method_info);
@@ -6185,7 +7603,7 @@ void dispatcher_instance_void1(int dispatcher_index, void *self, void *arg0, voi
         report_missing_original(dispatcher_index);
         return;
     }
-    if (!modmanager_runtime_enabled()) {
+    if (!pccompat_runtime_enabled(0)) {
         original(self, arg0, method_info);
         return;
     }
@@ -6202,6 +7620,7 @@ void dispatcher_instance_void1(int dispatcher_index, void *self, void *arg0, voi
         FixedBeforeArgs{.target_kind = dispatcher_target_kind(dispatcher_index), .instance = self});
     const bool managed_skip = run_managed_prefix_rules(dispatcher_index, args);
     refresh_fixed_args_after_managed_prefix(args);
+    self = args.instance;
     arg0 = reinterpret_cast<void *>(static_cast<uintptr_t>(args.raw_args[0]));
     const bool skip = managed_skip || fixed_skip;
     if (!skip)
@@ -6215,7 +7634,7 @@ void dispatcher_instance_void_int1(int dispatcher_index, void *self, int arg0, v
         report_missing_original(dispatcher_index);
         return;
     }
-    if (!modmanager_runtime_enabled()) {
+    if (!pccompat_runtime_enabled(0)) {
         original(self, arg0, method_info);
         return;
     }
@@ -6235,6 +7654,7 @@ void dispatcher_instance_void_int1(int dispatcher_index, void *self, int arg0, v
         FixedBeforeArgs{.target_kind = dispatcher_target_kind(dispatcher_index), .instance = self});
     const bool managed_skip = run_managed_prefix_rules(dispatcher_index, args);
     refresh_fixed_args_after_managed_prefix(args);
+    self = args.instance;
     arg0 = raw_i32_argument(args, 0);
     const bool skip = managed_skip || fixed_skip;
     if (!skip)
@@ -6248,7 +7668,7 @@ void dispatcher_instance_void_ptr_float_int(int dispatcher_index, void *self, vo
         report_missing_original(dispatcher_index);
         return;
     }
-    if (!modmanager_runtime_enabled()) {
+    if (!pccompat_runtime_enabled(0)) {
         original(self, arg0, arg1, arg2, method_info);
         return;
     }
@@ -6268,6 +7688,7 @@ void dispatcher_instance_void_ptr_float_int(int dispatcher_index, void *self, vo
         FixedBeforeArgs{.target_kind = dispatcher_target_kind(dispatcher_index), .instance = self});
     const bool managed_skip = run_managed_prefix_rules(dispatcher_index, args);
     refresh_fixed_args_after_managed_prefix(args);
+    self = args.instance;
     arg0 = reinterpret_cast<void *>(static_cast<uintptr_t>(args.raw_args[0]));
     arg1 = raw_float_argument(args, 1);
     arg2 = raw_i32_argument(args, 2);
@@ -6283,7 +7704,7 @@ void dispatcher_instance_void3(int dispatcher_index, void *self, void *arg0, voi
         report_missing_original(dispatcher_index);
         return;
     }
-    if (!modmanager_runtime_enabled()) {
+    if (!pccompat_runtime_enabled(0)) {
         original(self, arg0, arg1, arg2, method_info);
         return;
     }
@@ -6301,6 +7722,7 @@ void dispatcher_instance_void3(int dispatcher_index, void *self, void *arg0, voi
         FixedBeforeArgs{.target_kind = dispatcher_target_kind(dispatcher_index), .instance = self});
     const bool managed_skip = run_managed_prefix_rules(dispatcher_index, args);
     refresh_fixed_args_after_managed_prefix(args);
+    self = args.instance;
     arg0 = reinterpret_cast<void *>(static_cast<uintptr_t>(args.raw_args[0]));
     arg1 = reinterpret_cast<void *>(static_cast<uintptr_t>(args.raw_args[1]));
     arg2 = reinterpret_cast<void *>(static_cast<uintptr_t>(args.raw_args[2]));
@@ -6316,7 +7738,7 @@ void dispatcher_instance_void_bool_bool_ptr_bool(int dispatcher_index, void *sel
         report_missing_original(dispatcher_index);
         return;
     }
-    if (!modmanager_runtime_enabled()) {
+    if (!pccompat_runtime_enabled(0)) {
         original(self, arg0, arg1, arg2, arg3, method_info);
         return;
     }
@@ -6337,6 +7759,7 @@ void dispatcher_instance_void_bool_bool_ptr_bool(int dispatcher_index, void *sel
         FixedBeforeArgs{.target_kind = dispatcher_target_kind(dispatcher_index), .instance = self});
     const bool managed_skip = run_managed_prefix_rules(dispatcher_index, args);
     refresh_fixed_args_after_managed_prefix(args);
+    self = args.instance;
     arg0 = raw_bool_argument(args, 0);
     arg1 = raw_bool_argument(args, 1);
     arg2 = reinterpret_cast<void *>(static_cast<uintptr_t>(args.raw_args[2]));
@@ -6353,7 +7776,7 @@ bool dispatcher_instance_bool1(int dispatcher_index, void *self, bool arg0, void
         report_missing_original(dispatcher_index);
         return false;
     }
-    if (!modmanager_runtime_enabled()) {
+    if (!pccompat_runtime_enabled(0)) {
         return original(self, arg0, method_info);
     }
 
@@ -6369,6 +7792,7 @@ bool dispatcher_instance_bool1(int dispatcher_index, void *self, bool arg0, void
     args.managed_result_kind = 1;
     const bool managed_skip = run_managed_prefix_rules(dispatcher_index, args);
     refresh_fixed_args_after_managed_prefix(args);
+    self = args.instance;
     arg0 = raw_bool_argument(args, 0);
     const bool skip = managed_skip || fixed_skip;
     const bool result = skip
@@ -6388,7 +7812,7 @@ bool dispatcher_instance_bool2(int dispatcher_index, void *self, int arg0, bool 
         report_missing_original(dispatcher_index);
         return false;
     }
-    if (!modmanager_runtime_enabled()) {
+    if (!pccompat_runtime_enabled(0)) {
         return original(self, arg0, arg1, method_info);
     }
 
@@ -6406,6 +7830,7 @@ bool dispatcher_instance_bool2(int dispatcher_index, void *self, int arg0, bool 
     args.managed_result_kind = 1;
     const bool managed_skip = run_managed_prefix_rules(dispatcher_index, args);
     refresh_fixed_args_after_managed_prefix(args);
+    self = args.instance;
     arg0 = raw_i32_argument(args, 0);
     arg1 = raw_bool_argument(args, 1);
     const bool skip = managed_skip || fixed_skip;
@@ -6431,7 +7856,7 @@ bool dispatcher_instance_bool_bool_int(int dispatcher_index,
         report_missing_original(dispatcher_index);
         return false;
     }
-    if (!modmanager_runtime_enabled()) {
+    if (!pccompat_runtime_enabled(0)) {
         return original(self, arg0, arg1, method_info);
     }
 
@@ -6452,6 +7877,7 @@ bool dispatcher_instance_bool_bool_int(int dispatcher_index,
     args.managed_result_kind = 1;
     const bool managed_skip = run_managed_prefix_rules(dispatcher_index, args);
     refresh_fixed_args_after_managed_prefix(args);
+    self = args.instance;
     arg0 = raw_bool_argument(args, 0);
     arg1 = raw_i32_argument(args, 1);
     const bool skip = managed_skip || fixed_skip;
@@ -6472,7 +7898,7 @@ void dispatcher_static_void1(int dispatcher_index, int arg0, void *method_info) 
         report_missing_original(dispatcher_index);
         return;
     }
-    if (!modmanager_runtime_enabled()) {
+    if (!pccompat_runtime_enabled(0)) {
         original(arg0, method_info);
         return;
     }
@@ -6509,7 +7935,7 @@ int dispatcher_static_int_float_float_bool_float_float_double(
         report_missing_original(dispatcher_index);
         return 0;
     }
-    if (!modmanager_runtime_enabled()) {
+    if (!pccompat_runtime_enabled(0)) {
         return original(hitangle, refangle, is_cw, bpm_times_speed,
                         conductor_pitch, margin_scale, method_info);
     }
@@ -6561,7 +7987,7 @@ void dispatcher_instance_void_color1(int dispatcher_index, void *self, ColorValu
         report_missing_original(dispatcher_index);
         return;
     }
-    if (!modmanager_runtime_enabled()) {
+    if (!pccompat_runtime_enabled(0)) {
         original(self, arg0, method_info);
         return;
     }
@@ -6578,6 +8004,7 @@ void dispatcher_instance_void_color1(int dispatcher_index, void *self, ColorValu
     capture_raw_float(color_args, 2, arg0.b);
     capture_raw_float(color_args, 3, arg0.a);
     const bool skip = run_managed_prefix_rules(dispatcher_index, color_args) || fixed_skip;
+    self = color_args.instance;
     if (!skip)
         original(self, arg0, method_info);
     run_fixed_after_ops(dispatcher_index, color_args);
@@ -6589,7 +8016,7 @@ void dispatcher_instance_void_int_bool(int dispatcher_index, void *self, int arg
         report_missing_original(dispatcher_index);
         return;
     }
-    if (!modmanager_runtime_enabled()) {
+    if (!pccompat_runtime_enabled(0)) {
         original(self, arg0, arg1, method_info);
         return;
     }
@@ -6602,6 +8029,7 @@ void dispatcher_instance_void_int_bool(int dispatcher_index, void *self, int arg
         FixedBeforeArgs{.target_kind = dispatcher_target_kind(dispatcher_index), .instance = self});
     const bool managed_skip = run_managed_prefix_rules(dispatcher_index, args);
     refresh_fixed_args_after_managed_prefix(args);
+    self = args.instance;
     arg0 = raw_i32_argument(args, 0);
     arg1 = raw_bool_argument(args, 1);
     const bool skip = managed_skip || fixed_skip;
@@ -6616,7 +8044,7 @@ void dispatcher_instance_void_ptr_bool(int dispatcher_index, void *self, void *a
         report_missing_original(dispatcher_index);
         return;
     }
-    if (!modmanager_runtime_enabled()) {
+    if (!pccompat_runtime_enabled(0)) {
         original(self, arg0, arg1, method_info);
         return;
     }
@@ -6631,6 +8059,7 @@ void dispatcher_instance_void_ptr_bool(int dispatcher_index, void *self, void *a
             .instance = self});
     const bool managed_skip = run_managed_prefix_rules(dispatcher_index, args);
     refresh_fixed_args_after_managed_prefix(args);
+    self = args.instance;
     arg0 = reinterpret_cast<void *>(static_cast<uintptr_t>(args.raw_args[0]));
     arg1 = raw_bool_argument(args, 1);
     const bool skip = managed_skip || fixed_skip;
@@ -7433,8 +8862,29 @@ bool resolve_method(const MethodIdentity &identity,
         return false;
     }
 
+    uint32_t descriptor_slot = g_next_api_descriptor_slot.fetch_add(
+        1, std::memory_order_relaxed);
+    if (descriptor_slot == 0) {
+        descriptor_slot = g_next_api_descriptor_slot.fetch_add(
+            1, std::memory_order_relaxed);
+    }
+    uintptr_t protected_function = 0;
+    if (!PC_COMPAT_RESOLVE_ADDRESS(
+            0,
+            0,
+            descriptor_slot,
+            0 |
+                0,
+            reinterpret_cast<uintptr_t>(candidates[0].function),
+            &protected_function) ||
+        protected_function != reinterpret_cast<uintptr_t>(candidates[0].function)) {
+        error = "protected method descriptor failed: " + identity.type_name + "." +
+            identity.method_name;
+        return false;
+    }
+
     method.method_info = const_cast<void *>(candidates[0].method_info);
-    method.function = candidates[0].function;
+    method.function = reinterpret_cast<void *>(protected_function);
     return true;
 }
 
@@ -7636,7 +9086,25 @@ bool resolve_field_offset(const ResolvedClass &klass,
         error = "field offset is invalid: " + field_name;
         return false;
     }
-    offset = static_cast<int32_t>(raw_offset);
+    uint32_t descriptor_slot = g_next_scalar_descriptor_slot.fetch_add(
+        1, std::memory_order_relaxed);
+    if (descriptor_slot == 0) {
+        descriptor_slot = g_next_scalar_descriptor_slot.fetch_add(
+            1, std::memory_order_relaxed);
+    }
+    uint64_t protected_offset = 0;
+    if (!PC_COMPAT_RESOLVE_SCALAR(
+            0,
+            0,
+            descriptor_slot,
+            static_cast<uint64_t>(raw_offset),
+            &protected_offset) ||
+        protected_offset != static_cast<uint64_t>(raw_offset) ||
+        protected_offset > static_cast<uint64_t>(INT32_MAX)) {
+        error = "protected field offset descriptor failed: " + field_name;
+        return false;
+    }
+    offset = static_cast<int32_t>(protected_offset);
     return true;
 }
 
@@ -7644,11 +9112,17 @@ bool resolve_field_offset(const ResolvedClass &klass,
 
 extern "C" {
 
-void modmanager_pccompat_start_hook_coordinator() {
-    if (!modmanager_runtime_enabled()) {
-        LOGI("hook coordinator disabled by pc_mod_compat capability");
-        return;
+int modmanager_pccompat_prime_il2cpp_metadata() {
+    std::string error;
+    if (!ensure_il2cpp_metadata(error)) {
+        LOGE("IL2CPP metadata prime failed: %s", error.c_str());
+        return 0;
     }
+    LOGI("IL2CPP metadata primed before managed compatibility startup");
+    return 1;
+}
+
+void modmanager_pccompat_start_hook_coordinator() {
     starray::hud_logic::ensure_started();
     starray::async_input_bridge::ensure_registered();
     start_hook_coordinator_thread_once();
@@ -7682,6 +9156,18 @@ int modmanager_pccompat_load_hook_rules_json(const char *path) {
         g_state.last_error = error;
         LOGE("load failed path=%s error=%s", path, error.c_str());
         return -2;
+    }
+
+    if (!pccompat_session_get_token(
+            bundle.mod_id.c_str(), nullptr,
+            &bundle.pc_mod_session.session_handle,
+            &bundle.pc_mod_session.host_generation,
+            &bundle.pc_mod_session.resource_generation)) {
+        std::lock_guard<std::mutex> guard(g_lock);
+        g_state.last_error = "PC MOD session is unavailable for JSON rule bundle";
+        LOGE("load rejected path=%s mod=%s error=%s", path,
+             bundle.mod_id.c_str(), g_state.last_error.c_str());
+        return -3;
     }
 
     const auto loaded_target_count = static_cast<int>(bundle.targets.size());
@@ -7735,6 +9221,18 @@ int modmanager_pccompat_load_hook_rules_bin(const char *path) {
 
     RuntimeBundle bundle;
     bundle.path = path;
+    if (!pccompat_session_get_token(
+            parsed.mod_id.c_str(), parsed.source_assembly_sha256.data(),
+            &bundle.pc_mod_session.session_handle,
+            &bundle.pc_mod_session.host_generation,
+            &bundle.pc_mod_session.resource_generation)) {
+        std::lock_guard<std::mutex> guard(g_lock);
+        g_state.last_error =
+            "PC MOD session is unavailable or source assembly digest changed";
+        LOGE("binary recipe load rejected path=%s mod=%s error=%s", path,
+             parsed.mod_id.c_str(), g_state.last_error.c_str());
+        return -3;
+    }
     bundle.mod_id = std::move(parsed.mod_id);
     bundle.recipe_id = std::move(parsed.recipe_id);
     bundle.compatibility = std::move(parsed.compatibility);
@@ -8058,18 +9556,40 @@ int modmanager_pccompat_install_planned_slots() {
              static_cast<unsigned long long>(request.after_op_mask));
 
         const std::string broker_owner = "PcCompat:" + request.key;
-        const int ret = modmanager_hook_broker_install(
+        const uint32_t original_descriptor_slot =
+            0x60000000u | (request.slot_id & 0x1fffffffu);
+        const int ret = modmanager_hook_broker_install_protected(
             broker_owner.c_str(),
+            0,
+            0,
+            original_descriptor_slot,
             request.function,
             request.detour,
             &origin);
+        uintptr_t protected_origin = 0;
+        const bool original_descriptor_ok = ret == 0 && origin != nullptr &&
+            PC_COMPAT_RESOLVE_CONTINUATION(
+                0,
+                0,
+                original_descriptor_slot,
+                reinterpret_cast<uintptr_t>(origin),
+                &protected_origin) == 1 &&
+            protected_origin == reinterpret_cast<uintptr_t>(origin);
+        if (ret == 0 && !original_descriptor_ok) {
+            const int retired = modmanager_hook_broker_retire_owner_target(
+                broker_owner.c_str(), request.function);
+            LOGW("retired hook after original descriptor failure slot=%u target=%p result=%d",
+                 request.slot_id,
+                 request.function,
+                 retired);
+        }
 
         std::lock_guard<std::mutex> guard(g_lock);
         auto *slot = find_slot_by_key_locked(request.key);
-        const bool published = ret == 0 && origin != nullptr &&
+        const bool published = original_descriptor_ok &&
             publish_original_to_dispatcher(
                 request.dispatcher_index,
-                origin,
+                reinterpret_cast<void *>(protected_origin),
                 request.key,
                 request.abi_kind,
                 request.function);
@@ -8105,7 +9625,9 @@ int modmanager_pccompat_install_planned_slots() {
                 ? "hook broker install failed ret=" + std::to_string(ret)
                 : (origin == nullptr
                     ? "hook broker returned a null continuation"
-                    : "dispatcher binding publication failed after broker install");
+                    : (!original_descriptor_ok
+                        ? "protected original continuation descriptor failed"
+                        : "dispatcher binding publication failed after broker install"));
         }
         if (g_state.last_error.empty())
             g_state.last_error = slot != nullptr ? slot->status : "hook broker install failed";
@@ -8184,6 +9706,7 @@ void modmanager_pccompat_clear_hook_rules() {
         const int capacity = g_dispatcher_capacity.load(std::memory_order_acquire);
         for (int index = 0; index < capacity; ++index)
             disable_dispatcher_runtime_slot(index);
+        clear_owner_overlay_sessions();
         reset_overlay_runtime_state();
         reset_managed_event_state_locked();
         g_managed_prefix_order_plans.clear();
@@ -8216,6 +9739,7 @@ int modmanager_pccompat_unload_hook_rules_for_mod(const char *mod_id) {
             if (bundle.mod_id == mod_id)
                 bundle_ids.push_back(bundle.bundle_id);
         }
+        retire_owner_overlay_session(mod_id);
 
         // Retire callback queues before publishing dispatcher snapshots without
         // this MOD. An in-flight immutable snapshot then observes retired=1 and
@@ -8283,12 +9807,40 @@ int modmanager_pccompat_set_recipe_presentation_enabled(
 }
 
 void modmanager_pccompat_set_overlay_changed_callback(void *callback) {
+    uintptr_t protected_callback = 0;
+    if (callback != nullptr &&
+        (PC_COMPAT_RESOLVE_CONTINUATION(
+             0,
+             0,
+             kOverlayChangedCallbackDescriptorSlot,
+             reinterpret_cast<uintptr_t>(callback),
+             &protected_callback) != 1 ||
+         protected_callback != reinterpret_cast<uintptr_t>(callback))) {
+        LOGE("overlay callback descriptor rejected");
+        callback = nullptr;
+    } else if (callback != nullptr) {
+        callback = reinterpret_cast<void *>(protected_callback);
+    }
     g_overlay_changed_callback.store(
         reinterpret_cast<OverlayChangedCallback>(callback),
         std::memory_order_release);
 }
 
 void modmanager_pccompat_set_managed_prefix_callback(void *callback) {
+    uintptr_t protected_callback = 0;
+    if (callback != nullptr &&
+        (PC_COMPAT_RESOLVE_CONTINUATION(
+             0,
+             0,
+             kManagedPrefixCallbackDescriptorSlot,
+             reinterpret_cast<uintptr_t>(callback),
+             &protected_callback) != 1 ||
+         protected_callback != reinterpret_cast<uintptr_t>(callback))) {
+        LOGE("managed prefix callback descriptor rejected");
+        callback = nullptr;
+    } else if (callback != nullptr) {
+        callback = reinterpret_cast<void *>(protected_callback);
+    }
     g_managed_prefix_callback.store(
         reinterpret_cast<ManagedPrefixCallback>(callback),
         std::memory_order_release);
@@ -8499,6 +10051,71 @@ int modmanager_pccompat_set_managed_events_enabled(const char *mod_id, int enabl
     }
     LOGI("managed events mod=%s enabled=%d rings=%d", mod_id, enabled != 0 ? 1 : 0, updated);
     return updated;
+}
+
+// Registers a MOD-owned host component instance so the render-callback hook dispatches for it. The
+// pointer is an IL2CPP object address, valid only while the managed bridge holds a lease on it; the
+// bridge unregisters before destroying it, so a stale pointer never reaches the comparison.
+//
+// Returns the resulting registration count for the MOD, or negative on argument failure. Registering
+// the same pointer twice is not an error - the flat set is deduplicated - because a MOD's pool may
+// re-register a recycled object.
+int modmanager_pccompat_register_managed_render_host(const char *mod_id, uint64_t instance_ptr) {
+    if (mod_id == nullptr || mod_id[0] == '\0')
+        return -1;
+    if (instance_ptr == 0)
+        return -2;
+
+    std::lock_guard<std::mutex> guard(g_managed_render_hosts_lock);
+    auto &hosts = g_managed_render_hosts_by_mod[mod_id];
+    if (std::find(hosts.begin(), hosts.end(), instance_ptr) == hosts.end())
+        hosts.push_back(instance_ptr);
+    republish_managed_render_hosts_locked();
+    return static_cast<int>(hosts.size());
+}
+
+int modmanager_pccompat_unregister_managed_render_host(const char *mod_id, uint64_t instance_ptr) {
+    if (mod_id == nullptr || mod_id[0] == '\0')
+        return -1;
+    if (instance_ptr == 0)
+        return -2;
+
+    std::lock_guard<std::mutex> guard(g_managed_render_hosts_lock);
+    const auto found = g_managed_render_hosts_by_mod.find(mod_id);
+    if (found == g_managed_render_hosts_by_mod.end())
+        return 0;
+    auto &hosts = found->second;
+    const auto removed = std::remove(hosts.begin(), hosts.end(), instance_ptr);
+    const int count = static_cast<int>(std::distance(removed, hosts.end()));
+    hosts.erase(removed, hosts.end());
+    if (hosts.empty())
+        g_managed_render_hosts_by_mod.erase(found);
+    republish_managed_render_hosts_locked();
+    return count;
+}
+
+// Session teardown. Dropping every entry for one MOD must not disturb another's, which is why the
+// per-MOD lists are kept alongside the flat set rather than derived from it.
+int modmanager_pccompat_clear_managed_render_hosts(const char *mod_id) {
+    if (mod_id == nullptr || mod_id[0] == '\0')
+        return -1;
+
+    std::lock_guard<std::mutex> guard(g_managed_render_hosts_lock);
+    const auto found = g_managed_render_hosts_by_mod.find(mod_id);
+    if (found == g_managed_render_hosts_by_mod.end())
+        return 0;
+    const int count = static_cast<int>(found->second.size());
+    g_managed_render_hosts_by_mod.erase(found);
+    republish_managed_render_hosts_locked();
+    LOGI("managed render hosts cleared mod=%s count=%d", mod_id, count);
+    return count;
+}
+
+int modmanager_pccompat_managed_render_host_count() {
+    const auto hosts = std::atomic_load_explicit(
+        &g_managed_render_hosts,
+        std::memory_order_acquire);
+    return hosts ? static_cast<int>(hosts->size()) : 0;
 }
 
 int modmanager_pccompat_drain_managed_events(const char *mod_id,
@@ -8850,48 +10467,108 @@ void modmanager_pccompat_set_resource_changer_settings(const char *mod_id,
                                                        float tile_b,
                                                        float tile_a,
                                                        const char *resource_pack_name) {
-    const uint32_t next_rabbit = change_rabbit != 0 ? 1u : 0u;
-    const uint32_t next_ball = change_ball_color != 0 ? 1u : 0u;
-    const uint32_t next_tile = change_tile_color != 0 ? 1u : 0u;
-    const uint32_t old_rabbit = g_resource_change_rabbit.exchange(next_rabbit, std::memory_order_acq_rel);
-    const uint32_t old_ball = g_resource_change_ball_color.exchange(next_ball, std::memory_order_acq_rel);
-    const uint32_t old_tile = g_resource_change_tile_color.exchange(next_tile, std::memory_order_acq_rel);
-    uint32_t restore_mask = 0;
-    if (old_rabbit != 0 && next_rabbit == 0)
-        restore_mask |= kResourceRestoreRabbit;
-    if (old_ball != 0 && next_ball == 0)
-        restore_mask |= kResourceRestorePlanet;
-    if (old_tile != 0 && next_tile == 0)
-        restore_mask |= kResourceRestoreTile;
-    if (restore_mask != 0)
-        g_resource_pending_restore_mask.fetch_or(restore_mask, std::memory_order_release);
+    if (mod_id == nullptr || *mod_id == '\0') {
+        LOGE("ResourceChanger state rejected: empty mod id");
+        return;
+    }
+    if (!pc_mod_resource_session_active(mod_id, session_generation)) {
+        LOGW("ResourceChanger state rejected: inactive PC MOD session mod=%s generation=%lld",
+             mod_id, static_cast<long long>(session_generation));
+        return;
+    }
+
     const auto finite_or = [](float value, float fallback) {
         return std::isfinite(value) ? value : fallback;
     };
-    g_resource_planet_r.store(finite_or(planet_r, 0.8125f), std::memory_order_release);
-    g_resource_planet_g.store(finite_or(planet_g, 0.70703125f), std::memory_order_release);
-    g_resource_planet_b.store(finite_or(planet_b, 0.96875f), std::memory_order_release);
-    g_resource_planet_a.store(finite_or(planet_a, 1.0f), std::memory_order_release);
-    g_resource_title_r.store(finite_or(title_r, 0.56640625f), std::memory_order_release);
-    g_resource_title_g.store(finite_or(title_g, 0.46875f), std::memory_order_release);
-    g_resource_title_b.store(finite_or(title_b, 0.6328125f), std::memory_order_release);
-    g_resource_title_a.store(finite_or(title_a, 1.0f), std::memory_order_release);
-    g_resource_tile_r.store(finite_or(tile_r, 0.94921875f), std::memory_order_release);
-    g_resource_tile_g.store(finite_or(tile_g, 0.87109375f), std::memory_order_release);
-    g_resource_tile_b.store(finite_or(tile_b, 1.0f), std::memory_order_release);
-    g_resource_tile_a.store(finite_or(tile_a, 1.0f), std::memory_order_release);
+
+    uint32_t feature_mask = 0;
+    if (change_rabbit != 0)
+        feature_mask |= kResourceContributionRabbit;
+    if (change_ball_color != 0)
+        feature_mask |= kResourceContributionPlanet;
+    if (change_tile_color != 0)
+        feature_mask |= kResourceContributionTile;
+
+    const ResourceOwnerKey owner{mod_id, session_generation};
+    bool stale = false;
+    uint32_t transition_mask = 0;
+    std::string active_mod_id;
+    int64_t active_generation = 0;
     {
         std::lock_guard<std::mutex> guard(g_resource_state_lock);
-        g_resource_state_mod_id = mod_id != nullptr ? mod_id : "";
-        g_resource_state_generation = session_generation;
-        g_resource_pack_name = resource_pack_name != nullptr ? resource_pack_name : "";
+        auto latest = g_resource_latest_generation_by_mod.find(owner.mod_id);
+        if (latest != g_resource_latest_generation_by_mod.end() &&
+            session_generation < latest->second) {
+            stale = true;
+        } else {
+            if (latest == g_resource_latest_generation_by_mod.end() ||
+                session_generation > latest->second) {
+                for (auto it = g_resource_contributions.begin();
+                     it != g_resource_contributions.end();) {
+                    if (it->first.mod_id == owner.mod_id) {
+                        it = g_resource_contributions.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+                g_resource_latest_generation_by_mod[owner.mod_id] =
+                    session_generation;
+            }
+
+            if (feature_mask == 0) {
+                g_resource_contributions.erase(owner);
+            } else {
+                auto [entry, inserted] = g_resource_contributions.try_emplace(owner);
+                ResourceContribution &contribution = entry->second;
+                if (inserted) {
+                    contribution.registration_sequence =
+                        ++g_resource_contribution_sequence;
+                }
+                contribution.feature_mask = feature_mask;
+                contribution.planet_color = ColorValue{
+                    finite_or(planet_r, kResourceDefaultPlanetColor.r),
+                    finite_or(planet_g, kResourceDefaultPlanetColor.g),
+                    finite_or(planet_b, kResourceDefaultPlanetColor.b),
+                    finite_or(planet_a, kResourceDefaultPlanetColor.a),
+                };
+                contribution.title_color = ColorValue{
+                    finite_or(title_r, kResourceDefaultTitleColor.r),
+                    finite_or(title_g, kResourceDefaultTitleColor.g),
+                    finite_or(title_b, kResourceDefaultTitleColor.b),
+                    finite_or(title_a, kResourceDefaultTitleColor.a),
+                };
+                contribution.tile_color = ColorValue{
+                    finite_or(tile_r, kResourceDefaultTileColor.r),
+                    finite_or(tile_g, kResourceDefaultTileColor.g),
+                    finite_or(tile_b, kResourceDefaultTileColor.b),
+                    finite_or(tile_a, kResourceDefaultTileColor.a),
+                };
+                contribution.resource_pack_name =
+                    resource_pack_name != nullptr ? resource_pack_name : "";
+            }
+            transition_mask = publish_resource_effective_state_locked();
+            active_mod_id = g_resource_state_mod_id;
+            active_generation = g_resource_state_generation;
+        }
     }
-    LOGI("ResourceChanger state mod=%s generation=%lld rabbit=%d ball=%d tile=%d",
-         mod_id != nullptr && *mod_id != '\0' ? mod_id : "<none>",
+
+    if (stale) {
+        LOGI("ResourceChanger stale state ignored mod=%s generation=%lld",
+             mod_id,
+             static_cast<long long>(session_generation));
+        return;
+    }
+
+    refresh_resource_rabbit_sprite_projection();
+    LOGI("ResourceChanger contribution mod=%s generation=%lld rabbit=%d ball=%d tile=%d active=%s/%lld transition=0x%x",
+         mod_id,
          static_cast<long long>(session_generation),
          change_rabbit != 0 ? 1 : 0,
          change_ball_color != 0 ? 1 : 0,
-         change_tile_color != 0 ? 1 : 0);
+         change_tile_color != 0 ? 1 : 0,
+         active_mod_id.empty() ? "<none>" : active_mod_id.c_str(),
+         static_cast<long long>(active_generation),
+         transition_mask);
 }
 
 int modmanager_pccompat_publish_resource_changer_sprite(
@@ -8900,6 +10577,8 @@ int modmanager_pccompat_publish_resource_changer_sprite(
         void *sprite) {
     if (mod_id == nullptr || *mod_id == '\0' || session_generation <= 0 || sprite == nullptr)
         return -1;
+    if (!pc_mod_resource_session_active(mod_id, session_generation))
+        return -4;
     std::string error;
     if (!ensure_il2cpp_metadata(error) || g_il2cpp_metadata.gchandle_new == nullptr)
         return -2;
@@ -8908,22 +10587,48 @@ int modmanager_pccompat_publish_resource_changer_sprite(
     if (next_handle == nullptr)
         return -3;
 
-    void *stale_handle = nullptr;
+    const ResourceOwnerKey owner{mod_id, session_generation};
+    std::vector<void *> stale_handles;
+    bool stale_generation = false;
     {
         std::lock_guard<std::mutex> guard(g_resource_asset_lock);
-        if (g_resource_rabbit_sprite_generation > session_generation) {
-            stale_handle = next_handle;
+        auto latest = g_resource_sprite_latest_generation_by_mod.find(owner.mod_id);
+        if (latest != g_resource_sprite_latest_generation_by_mod.end() &&
+            session_generation < latest->second) {
+            stale_generation = true;
         } else {
-            stale_handle = g_resource_rabbit_sprite_handle;
-            g_resource_rabbit_sprite_handle = next_handle;
-            g_resource_rabbit_sprite_mod_id = mod_id;
-            g_resource_rabbit_sprite_generation = session_generation;
+            if (latest == g_resource_sprite_latest_generation_by_mod.end() ||
+                session_generation > latest->second) {
+                for (auto it = g_resource_sprite_contributions.begin();
+                     it != g_resource_sprite_contributions.end();) {
+                    if (it->first.mod_id == owner.mod_id) {
+                        stale_handles.push_back(it->second.handle);
+                        it = g_resource_sprite_contributions.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+                g_resource_sprite_latest_generation_by_mod[owner.mod_id] =
+                    session_generation;
+            }
+
+            auto [entry, inserted] =
+                g_resource_sprite_contributions.try_emplace(owner);
+            if (inserted) {
+                entry->second.registration_sequence = ++g_resource_sprite_sequence;
+            } else if (entry->second.handle != nullptr) {
+                stale_handles.push_back(entry->second.handle);
+            }
+            entry->second.handle = next_handle;
+            refresh_resource_rabbit_sprite_projection_locked();
         }
     }
-    if (stale_handle != nullptr && g_il2cpp_metadata.gchandle_free != nullptr)
-        g_il2cpp_metadata.gchandle_free(stale_handle);
-    if (stale_handle == next_handle)
+    if (stale_generation) {
+        free_resource_handle(next_handle);
         return 0;
+    }
+    for (void *handle : stale_handles)
+        free_resource_handle(handle);
     LOGI("ResourceChanger VirtualBundle sprite published mod=%s generation=%lld",
          mod_id,
          static_cast<long long>(session_generation));
@@ -8938,16 +10643,15 @@ int modmanager_pccompat_retire_resource_changer_sprite(
     void *stale_handle = nullptr;
     {
         std::lock_guard<std::mutex> guard(g_resource_asset_lock);
-        if (g_resource_rabbit_sprite_mod_id != mod_id ||
-            g_resource_rabbit_sprite_generation != session_generation)
+        const ResourceOwnerKey owner{mod_id, session_generation};
+        const auto contribution = g_resource_sprite_contributions.find(owner);
+        if (contribution == g_resource_sprite_contributions.end())
             return 0;
-        stale_handle = g_resource_rabbit_sprite_handle;
-        g_resource_rabbit_sprite_handle = nullptr;
-        g_resource_rabbit_sprite_mod_id.clear();
-        g_resource_rabbit_sprite_generation = 0;
+        stale_handle = contribution->second.handle;
+        g_resource_sprite_contributions.erase(contribution);
+        refresh_resource_rabbit_sprite_projection_locked();
     }
-    if (stale_handle != nullptr && g_il2cpp_metadata.gchandle_free != nullptr)
-        g_il2cpp_metadata.gchandle_free(stale_handle);
+    free_resource_handle(stale_handle);
     return 1;
 }
 
@@ -8980,6 +10684,26 @@ int modmanager_pccompat_get_loaded_ui_bytecode_instruction_count() {
     return count_ui_bytecode_instructions(g_state);
 }
 
+void modmanager_pccompat_set_application_focus_state(int resumed,
+                                                     int window_focused) {
+    uint32_t state = kApplicationFocusKnown;
+    if (resumed != 0)
+        state |= kApplicationResumed;
+    if (window_focused != 0)
+        state |= kApplicationWindowFocused;
+    g_application_focus_state.store(state, std::memory_order_release);
+}
+
+int modmanager_pccompat_application_is_focused() {
+    const uint32_t state = g_application_focus_state.load(std::memory_order_acquire);
+    if ((state & kApplicationFocusKnown) == 0)
+        return 1;
+    return (state & (kApplicationResumed | kApplicationWindowFocused)) ==
+                   (kApplicationResumed | kApplicationWindowFocused)
+               ? 1
+               : 0;
+}
+
 void modmanager_pccompat_observe_touch_input(int action,
                                              int pointer_id,
                                              int pointer_count,
@@ -8991,7 +10715,7 @@ void modmanager_pccompat_observe_touch_input(int action,
                                              int source,
                                              int device_id,
                                              int android_flags) {
-    if (!modmanager_runtime_enabled())
+    if (!pccompat_runtime_enabled(0))
         return;
     starray::hud_logic::ensure_started();
     starray::realtime::observe_touch_raw(
@@ -9018,7 +10742,7 @@ void modmanager_pccompat_observe_key_input(int action,
                                            int64_t event_time_ms,
                                            int source,
                                            int android_flags) {
-    if (!modmanager_runtime_enabled())
+    if (!pccompat_runtime_enabled(0))
         return;
     starray::hud_logic::ensure_started();
     starray::realtime::observe_key_raw(
@@ -9035,7 +10759,7 @@ void modmanager_pccompat_observe_key_input(int action,
 }
 
 void modmanager_pccompat_set_external_input_devices(uint32_t flags) {
-    if (!modmanager_runtime_enabled())
+    if (!pccompat_runtime_enabled(0))
         return;
     starray::realtime::set_external_input_devices(flags);
 }
@@ -9352,7 +11076,7 @@ const char *modmanager_pccompat_get_level_identity() {
     return identity.c_str();
 }
 
-int modmanager_pccompat_read_overlay_snapshot(void *output, uint32_t output_size) {
+static int read_overlay_snapshot_current(void *output, uint32_t output_size) {
     if (output == nullptr || output_size < kOverlaySnapshotV2Size)
         return -1;
 
@@ -9360,10 +11084,22 @@ int modmanager_pccompat_read_overlay_snapshot(void *output, uint32_t output_size
     const uint32_t requested_size = request_words[0];
     const uint32_t requested_abi = request_words[1];
     const uint32_t requested_generation = request_words[2];
-    const bool wants_v4 =
+    const bool wants_v7 =
         requested_size == sizeof(PcCompatOverlaySnapshotV1) &&
         requested_abi == kOverlaySnapshotAbiVersion &&
         output_size >= sizeof(PcCompatOverlaySnapshotV1);
+    const bool wants_v6 =
+        requested_size == kOverlaySnapshotV6Size &&
+        requested_abi == kOverlaySnapshotAbiVersionV6 &&
+        output_size >= kOverlaySnapshotV6Size;
+    const bool wants_v5 =
+        requested_size == kOverlaySnapshotV5Size &&
+        requested_abi == kOverlaySnapshotAbiVersionV5 &&
+        output_size >= kOverlaySnapshotV5Size;
+    const bool wants_v4 =
+        requested_size == kOverlaySnapshotV4Size &&
+        requested_abi == kOverlaySnapshotAbiVersionV4 &&
+        output_size >= kOverlaySnapshotV4Size;
     const bool wants_v3 =
         requested_size == kOverlaySnapshotV3Size &&
         requested_abi == kOverlaySnapshotAbiVersionV3 &&
@@ -9371,134 +11107,180 @@ int modmanager_pccompat_read_overlay_snapshot(void *output, uint32_t output_size
     const bool wants_v2 =
         requested_size == kOverlaySnapshotV2Size &&
         requested_abi == kOverlaySnapshotAbiVersionV2;
-    if (!wants_v4 && !wants_v3 && !wants_v2)
+    if (!wants_v7 && !wants_v6 && !wants_v5 && !wants_v4 && !wants_v3 && !wants_v2)
         return -1;
 
     const uint32_t current_generation =
-        g_overlay_state.generation.load(std::memory_order_acquire);
+        active_overlay_state().generation.load(std::memory_order_acquire);
     if (requested_generation == current_generation) {
         return 0;
     }
 
     PcCompatOverlaySnapshotV1 snapshot{};
-    snapshot.struct_size = wants_v4
+    snapshot.struct_size = wants_v7
         ? static_cast<uint32_t>(sizeof(snapshot))
-        : wants_v3 ? kOverlaySnapshotV3Size : kOverlaySnapshotV2Size;
-    snapshot.abi_version = wants_v4
+        : wants_v6
+            ? kOverlaySnapshotV6Size
+        : wants_v5
+            ? kOverlaySnapshotV5Size
+        : wants_v4
+            ? kOverlaySnapshotV4Size
+            : wants_v3 ? kOverlaySnapshotV3Size : kOverlaySnapshotV2Size;
+    snapshot.abi_version = wants_v7
         ? kOverlaySnapshotAbiVersion
-        : wants_v3 ? kOverlaySnapshotAbiVersionV3 : kOverlaySnapshotAbiVersionV2;
+        : wants_v6
+            ? kOverlaySnapshotAbiVersionV6
+        : wants_v5
+            ? kOverlaySnapshotAbiVersionV5
+        : wants_v4
+            ? kOverlaySnapshotAbiVersionV4
+            : wants_v3 ? kOverlaySnapshotAbiVersionV3 : kOverlaySnapshotAbiVersionV2;
 
     for (int attempt = 0; attempt < 3; ++attempt) {
         const uint32_t generation_before =
-            g_overlay_state.generation.load(std::memory_order_acquire);
-        snapshot.visible = g_overlay_state.visible.load(std::memory_order_acquire);
-        snapshot.practice = g_overlay_state.practice.load(std::memory_order_acquire);
-        snapshot.show_count = g_overlay_state.show_count.load(std::memory_order_acquire);
-        snapshot.hide_count = g_overlay_state.hide_count.load(std::memory_order_acquire);
+            active_overlay_state().generation.load(std::memory_order_acquire);
+        snapshot.visible = active_overlay_state().visible.load(std::memory_order_acquire);
+        snapshot.practice = active_overlay_state().practice.load(std::memory_order_acquire);
+        snapshot.show_count = active_overlay_state().show_count.load(std::memory_order_acquire);
+        snapshot.hide_count = active_overlay_state().hide_count.load(std::memory_order_acquire);
         snapshot.player_update_count =
-            g_overlay_state.player_update_count.load(std::memory_order_acquire);
+            active_overlay_state().player_update_count.load(std::memory_order_acquire);
         snapshot.state_change_count =
-            g_overlay_state.state_change_count.load(std::memory_order_acquire);
+            active_overlay_state().state_change_count.load(std::memory_order_acquire);
         snapshot.last_op =
-            static_cast<int32_t>(g_overlay_state.last_op.load(std::memory_order_acquire));
+            static_cast<int32_t>(active_overlay_state().last_op.load(std::memory_order_acquire));
         snapshot.last_target_kind =
-            static_cast<int32_t>(g_overlay_state.last_target_kind.load(std::memory_order_acquire));
-        snapshot.player_count = g_overlay_state.player_count.load(std::memory_order_acquire);
-        snapshot.last_seq_id = g_overlay_state.last_seq_id.load(std::memory_order_acquire);
+            static_cast<int32_t>(active_overlay_state().last_target_kind.load(std::memory_order_acquire));
+        snapshot.player_count = active_overlay_state().player_count.load(std::memory_order_acquire);
+        snapshot.last_seq_id = active_overlay_state().last_seq_id.load(std::memory_order_acquire);
         snapshot.last_is_restart =
-            g_overlay_state.last_is_restart.load(std::memory_order_acquire);
+            active_overlay_state().last_is_restart.load(std::memory_order_acquire);
         snapshot.last_wipe_direction =
-            g_overlay_state.last_wipe_direction.load(std::memory_order_acquire);
+            active_overlay_state().last_wipe_direction.load(std::memory_order_acquire);
         snapshot.last_reset_to_editor =
-            g_overlay_state.last_reset_to_editor.load(std::memory_order_acquire);
+            active_overlay_state().last_reset_to_editor.load(std::memory_order_acquire);
         snapshot.judgement_hit_count =
-            g_overlay_state.judgement_hit_count.load(std::memory_order_acquire);
+            active_overlay_state().judgement_hit_count.load(std::memory_order_acquire);
         snapshot.judgement_reset_count =
-            g_overlay_state.judgement_reset_count.load(std::memory_order_acquire);
+            active_overlay_state().judgement_reset_count.load(std::memory_order_acquire);
         snapshot.last_hit_margin =
-            g_overlay_state.last_hit_margin.load(std::memory_order_acquire);
+            active_overlay_state().last_hit_margin.load(std::memory_order_acquire);
         snapshot.floor_move_count =
-            g_overlay_state.floor_move_count.load(std::memory_order_acquire);
+            active_overlay_state().floor_move_count.load(std::memory_order_acquire);
         snapshot.last_floor_exit_angle = bits_to_float(
-            g_overlay_state.last_floor_exit_angle_bits.load(std::memory_order_acquire));
+            active_overlay_state().last_floor_exit_angle_bits.load(std::memory_order_acquire));
         snapshot.last_floor_move_hit_margin =
-            g_overlay_state.last_floor_move_hit_margin.load(std::memory_order_acquire);
+            active_overlay_state().last_floor_move_hit_margin.load(std::memory_order_acquire);
         snapshot.player_hit_count =
-            g_overlay_state.player_hit_count.load(std::memory_order_acquire);
+            active_overlay_state().player_hit_count.load(std::memory_order_acquire);
         snapshot.last_player_hit_is_auto =
-            g_overlay_state.last_player_hit_is_auto.load(std::memory_order_acquire);
-        snapshot.death_count = g_overlay_state.death_count.load(std::memory_order_acquire);
+            active_overlay_state().last_player_hit_is_auto.load(std::memory_order_acquire);
+        snapshot.death_count = active_overlay_state().death_count.load(std::memory_order_acquire);
         snapshot.last_death_overload =
-            g_overlay_state.last_death_overload.load(std::memory_order_acquire);
+            active_overlay_state().last_death_overload.load(std::memory_order_acquire);
         snapshot.last_death_multipress =
-            g_overlay_state.last_death_multipress.load(std::memory_order_acquire);
+            active_overlay_state().last_death_multipress.load(std::memory_order_acquire);
         snapshot.last_death_hitbox =
-            g_overlay_state.last_death_hitbox.load(std::memory_order_acquire);
+            active_overlay_state().last_death_hitbox.load(std::memory_order_acquire);
         snapshot.hit_timing_count =
-            g_overlay_state.hit_timing_count.load(std::memory_order_acquire);
+            active_overlay_state().hit_timing_count.load(std::memory_order_acquire);
         snapshot.last_hit_timing_ms = bits_to_float(
-            g_overlay_state.last_hit_timing_ms_bits.load(std::memory_order_acquire));
+            active_overlay_state().last_hit_timing_ms_bits.load(std::memory_order_acquire));
         snapshot.last_hit_timing_margin =
-            g_overlay_state.last_hit_timing_margin.load(std::memory_order_acquire);
+            active_overlay_state().last_hit_timing_margin.load(std::memory_order_acquire);
         snapshot.accuracy_snapshot_count =
-            g_overlay_state.accuracy_snapshot_count.load(std::memory_order_acquire);
+            active_overlay_state().accuracy_snapshot_count.load(std::memory_order_acquire);
         snapshot.percent_acc = bits_to_float(
-            g_overlay_state.percent_acc_bits.load(std::memory_order_acquire));
+            active_overlay_state().percent_acc_bits.load(std::memory_order_acquire));
         snapshot.percent_x_acc = bits_to_float(
-            g_overlay_state.percent_x_acc_bits.load(std::memory_order_acquire));
+            active_overlay_state().percent_x_acc_bits.load(std::memory_order_acquire));
         snapshot.progress = bits_to_float(
-            g_overlay_state.progress_bits.load(std::memory_order_acquire));
-        snapshot.combo_count = g_overlay_state.combo_count.load(std::memory_order_acquire);
-        snapshot.attempt_count = g_overlay_state.attempt_count.load(std::memory_order_acquire);
+            active_overlay_state().progress_bits.load(std::memory_order_acquire));
+        snapshot.combo_count = active_overlay_state().combo_count.load(std::memory_order_acquire);
+        snapshot.attempt_count = active_overlay_state().attempt_count.load(std::memory_order_acquire);
         snapshot.bpm_snapshot_count =
-            g_overlay_state.bpm_snapshot_count.load(std::memory_order_acquire);
+            active_overlay_state().bpm_snapshot_count.load(std::memory_order_acquire);
         snapshot.tile_bpm = bits_to_float(
-            g_overlay_state.tile_bpm_bits.load(std::memory_order_acquire));
+            active_overlay_state().tile_bpm_bits.load(std::memory_order_acquire));
         snapshot.kps = bits_to_float(
-            g_overlay_state.kps_bits.load(std::memory_order_acquire));
+            active_overlay_state().kps_bits.load(std::memory_order_acquire));
         snapshot.timeline_snapshot_count =
-            g_overlay_state.timeline_snapshot_count.load(std::memory_order_acquire);
+            active_overlay_state().timeline_snapshot_count.load(std::memory_order_acquire);
         snapshot.music_time = bits_to_float(
-            g_overlay_state.music_time_bits.load(std::memory_order_acquire));
+            active_overlay_state().music_time_bits.load(std::memory_order_acquire));
         snapshot.music_total_time = bits_to_float(
-            g_overlay_state.music_total_time_bits.load(std::memory_order_acquire));
+            active_overlay_state().music_total_time_bits.load(std::memory_order_acquire));
         snapshot.map_time = bits_to_float(
-            g_overlay_state.map_time_bits.load(std::memory_order_acquire));
+            active_overlay_state().map_time_bits.load(std::memory_order_acquire));
         snapshot.map_total_time = bits_to_float(
-            g_overlay_state.map_total_time_bits.load(std::memory_order_acquire));
+            active_overlay_state().map_total_time_bits.load(std::memory_order_acquire));
         snapshot.checkpoints_used =
-            g_overlay_state.checkpoints_used.load(std::memory_order_acquire);
+            active_overlay_state().checkpoints_used.load(std::memory_order_acquire);
         snapshot.current_checkpoint =
-            g_overlay_state.current_checkpoint.load(std::memory_order_acquire);
+            active_overlay_state().current_checkpoint.load(std::memory_order_acquire);
         snapshot.total_checkpoints =
-            g_overlay_state.total_checkpoints.load(std::memory_order_acquire);
+            active_overlay_state().total_checkpoints.load(std::memory_order_acquire);
         snapshot.current_seq_id =
-            g_overlay_state.current_seq_id.load(std::memory_order_acquire);
+            active_overlay_state().current_seq_id.load(std::memory_order_acquire);
         snapshot.floor_count =
-            g_overlay_state.floor_count.load(std::memory_order_acquire);
+            active_overlay_state().floor_count.load(std::memory_order_acquire);
         snapshot.start_progress = bits_to_float(
-            g_overlay_state.start_progress_bits.load(std::memory_order_acquire));
+            active_overlay_state().start_progress_bits.load(std::memory_order_acquire));
         snapshot.speed_multiplier = bits_to_float(
-            g_overlay_state.speed_multiplier_bits.load(std::memory_order_acquire));
+            active_overlay_state().speed_multiplier_bits.load(std::memory_order_acquire));
         snapshot.session_auto =
-            g_overlay_state.session_auto.load(std::memory_order_acquire);
+            active_overlay_state().session_auto.load(std::memory_order_acquire);
         snapshot.input_state_generation =
-            g_overlay_state.input_state_generation.load(std::memory_order_acquire);
+            active_overlay_state().input_state_generation.load(std::memory_order_acquire);
         snapshot.input_held_mask =
-            g_overlay_state.input_held_mask.load(std::memory_order_acquire);
+            active_overlay_state().input_held_mask.load(std::memory_order_acquire);
         snapshot.input_last_down_mask =
-            g_overlay_state.input_last_down_mask.load(std::memory_order_acquire);
+            active_overlay_state().input_last_down_mask.load(std::memory_order_acquire);
         snapshot.input_last_up_mask =
-            g_overlay_state.input_last_up_mask.load(std::memory_order_acquire);
+            active_overlay_state().input_last_up_mask.load(std::memory_order_acquire);
         snapshot.input_total_count =
-            g_overlay_state.input_total_count.load(std::memory_order_acquire);
+            active_overlay_state().input_total_count.load(std::memory_order_acquire);
         snapshot.input_kps = bits_to_float(
-            g_overlay_state.input_kps_bits.load(std::memory_order_acquire));
+            active_overlay_state().input_kps_bits.load(std::memory_order_acquire));
         snapshot.planet_speed = bits_to_float(
-            g_overlay_state.planet_speed_bits.load(std::memory_order_acquire));
+            active_overlay_state().planet_speed_bits.load(std::memory_order_acquire));
+        snapshot.rdc_auto = active_overlay_state().rdc_auto.load(std::memory_order_acquire);
+        snapshot.no_fail = active_overlay_state().no_fail.load(std::memory_order_acquire);
+        snapshot.paused = active_overlay_state().paused.load(std::memory_order_acquire);
+        snapshot.is_game_world =
+            active_overlay_state().is_game_world.load(std::memory_order_acquire);
+        snapshot.song_pitch = bits_to_float(
+            active_overlay_state().song_pitch_bits.load(std::memory_order_acquire));
+        snapshot.conductor_add_offset = bits_to_double(
+            active_overlay_state().conductor_add_offset_bits.load(std::memory_order_acquire));
+        snapshot.conductor_songposition_minusi = bits_to_double(
+            active_overlay_state().conductor_songposition_minusi_bits.load(
+                std::memory_order_acquire));
+        snapshot.is_scn_game =
+            active_overlay_state().is_scn_game.load(std::memory_order_acquire);
+        snapshot.game_ready =
+            active_overlay_state().game_ready.load(std::memory_order_acquire);
+        snapshot.session_epoch =
+            active_overlay_state().session_epoch.load(std::memory_order_acquire);
+        snapshot.valid_game_snapshot_fields =
+            active_overlay_state().valid_game_snapshot_fields.load(std::memory_order_acquire);
+        snapshot.controller_pointer = static_cast<uint64_t>(
+            active_overlay_state().controller_pointer.load(std::memory_order_acquire));
+        snapshot.conductor_pointer = static_cast<uint64_t>(
+            active_overlay_state().conductor_pointer.load(std::memory_order_acquire));
+        snapshot.level_maker_pointer = static_cast<uint64_t>(
+            active_overlay_state().level_maker_pointer.load(std::memory_order_acquire));
+        snapshot.current_floor_pointer = static_cast<uint64_t>(
+            active_overlay_state().current_floor_pointer.load(std::memory_order_acquire));
+        snapshot.first_floor_pointer = static_cast<uint64_t>(
+            active_overlay_state().first_floor_pointer.load(std::memory_order_acquire));
+        snapshot.song_pointer = static_cast<uint64_t>(
+            active_overlay_state().song_pointer.load(std::memory_order_acquire));
+        snapshot.planetary_system_pointer = static_cast<uint64_t>(
+            active_overlay_state().planetary_system_pointer.load(std::memory_order_acquire));
 
         const uint32_t generation_after =
-            g_overlay_state.generation.load(std::memory_order_acquire);
+            active_overlay_state().generation.load(std::memory_order_acquire);
         snapshot.generation = generation_after;
         if (generation_before == generation_after)
             break;
@@ -9507,14 +11289,60 @@ int modmanager_pccompat_read_overlay_snapshot(void *output, uint32_t output_size
     std::memcpy(
         output,
         &snapshot,
-        wants_v4
+        wants_v7
             ? sizeof(snapshot)
-            : static_cast<size_t>(wants_v3 ? kOverlaySnapshotV3Size : kOverlaySnapshotV2Size));
+            : wants_v6
+                ? kOverlaySnapshotV6Size
+            : wants_v5
+                ? kOverlaySnapshotV5Size
+            : static_cast<size_t>(
+                wants_v4
+                    ? kOverlaySnapshotV4Size
+                    : wants_v3 ? kOverlaySnapshotV3Size : kOverlaySnapshotV2Size));
     return 1;
 }
 
+int modmanager_pccompat_read_overlay_snapshot(void *output, uint32_t output_size) {
+    const auto session = default_owner_overlay_session();
+    OwnerOverlayScope scope(
+        session != nullptr ? session.get() : &g_legacy_overlay_session);
+    return read_overlay_snapshot_current(output, output_size);
+}
+
+int modmanager_pccompat_read_shared_game_snapshot(void *output, uint32_t output_size) {
+    OwnerOverlayScope scope(&g_legacy_overlay_session);
+    return read_overlay_snapshot_current(output, output_size);
+}
+
+int modmanager_pccompat_poll_shared_game_snapshot() {
+    OwnerOverlayScope scope(&g_legacy_overlay_session);
+    if (!poll_overlay_telemetry(nullptr, false))
+        return 0;
+    active_overlay_state().last_op.store(
+        kRuleOpOverlayPollTelemetry,
+        std::memory_order_release);
+    active_overlay_state().generation.fetch_add(1, std::memory_order_acq_rel);
+    return 1;
+}
+
+int modmanager_pccompat_read_overlay_snapshot_for_mod(
+    const char *mod_id,
+    void *output,
+    uint32_t output_size) {
+    const auto session = owner_overlay_session_for_mod(mod_id);
+    if (session == nullptr ||
+        session->retired.load(std::memory_order_acquire) != 0) {
+        return -2;
+    }
+    OwnerOverlayScope scope(session.get());
+    return read_overlay_snapshot_current(output, output_size);
+}
+
 int modmanager_pccompat_get_overlay_visible() {
-    return static_cast<int>(g_overlay_state.visible.load(std::memory_order_acquire));
+    return any_owner_overlay_visible() ||
+           active_overlay_state().visible.load(std::memory_order_acquire) != 0
+        ? 1
+        : 0;
 }
 
 int modmanager_pccompat_read_hit_margin_snapshot(void *output, uint32_t output_size) {
@@ -9531,8 +11359,8 @@ int modmanager_pccompat_read_hit_margin_snapshot(void *output, uint32_t output_s
         g_last_hit_margin_fallback_poll_ms.load(std::memory_order_acquire);
     const bool snapshot_valid =
         g_hit_margin_snapshot.valid.load(std::memory_order_acquire) != 0;
-    const bool overlay_visible =
-        g_overlay_state.visible.load(std::memory_order_acquire) != 0;
+    const bool overlay_visible = any_owner_overlay_visible() ||
+        active_overlay_state().visible.load(std::memory_order_acquire) != 0;
     if (overlay_visible &&
         (!snapshot_valid ||
          last_authoritative_ms == 0 ||
@@ -9584,123 +11412,123 @@ uintptr_t modmanager_pccompat_get_margin_tracker_instance() {
 }
 
 int modmanager_pccompat_get_overlay_practice() {
-    return static_cast<int>(g_overlay_state.practice.load(std::memory_order_acquire));
+    return static_cast<int>(default_overlay_state_for_legacy_api().practice.load(std::memory_order_acquire));
 }
 
 uint32_t modmanager_pccompat_get_overlay_show_count() {
-    return g_overlay_state.show_count.load(std::memory_order_acquire);
+    return default_overlay_state_for_legacy_api().show_count.load(std::memory_order_acquire);
 }
 
 uint32_t modmanager_pccompat_get_overlay_hide_count() {
-    return g_overlay_state.hide_count.load(std::memory_order_acquire);
+    return default_overlay_state_for_legacy_api().hide_count.load(std::memory_order_acquire);
 }
 
 uint32_t modmanager_pccompat_get_overlay_player_update_count() {
-    return g_overlay_state.player_update_count.load(std::memory_order_acquire);
+    return default_overlay_state_for_legacy_api().player_update_count.load(std::memory_order_acquire);
 }
 
 uint32_t modmanager_pccompat_get_overlay_state_change_count() {
-    return g_overlay_state.state_change_count.load(std::memory_order_acquire);
+    return default_overlay_state_for_legacy_api().state_change_count.load(std::memory_order_acquire);
 }
 
 int modmanager_pccompat_get_overlay_last_op() {
-    return static_cast<int>(g_overlay_state.last_op.load(std::memory_order_acquire));
+    return static_cast<int>(default_overlay_state_for_legacy_api().last_op.load(std::memory_order_acquire));
 }
 
 int modmanager_pccompat_get_overlay_last_target_kind() {
-    return static_cast<int>(g_overlay_state.last_target_kind.load(std::memory_order_acquire));
+    return static_cast<int>(default_overlay_state_for_legacy_api().last_target_kind.load(std::memory_order_acquire));
 }
 
 int modmanager_pccompat_get_overlay_player_count() {
-    return static_cast<int>(g_overlay_state.player_count.load(std::memory_order_acquire));
+    return static_cast<int>(default_overlay_state_for_legacy_api().player_count.load(std::memory_order_acquire));
 }
 
 int modmanager_pccompat_get_overlay_last_seq_id() {
-    return static_cast<int>(g_overlay_state.last_seq_id.load(std::memory_order_acquire));
+    return static_cast<int>(default_overlay_state_for_legacy_api().last_seq_id.load(std::memory_order_acquire));
 }
 
 int modmanager_pccompat_get_overlay_last_is_restart() {
-    return static_cast<int>(g_overlay_state.last_is_restart.load(std::memory_order_acquire));
+    return static_cast<int>(default_overlay_state_for_legacy_api().last_is_restart.load(std::memory_order_acquire));
 }
 
 int modmanager_pccompat_get_overlay_last_wipe_direction() {
-    return static_cast<int>(g_overlay_state.last_wipe_direction.load(std::memory_order_acquire));
+    return static_cast<int>(default_overlay_state_for_legacy_api().last_wipe_direction.load(std::memory_order_acquire));
 }
 
 int modmanager_pccompat_get_overlay_last_reset_to_editor() {
-    return static_cast<int>(g_overlay_state.last_reset_to_editor.load(std::memory_order_acquire));
+    return static_cast<int>(default_overlay_state_for_legacy_api().last_reset_to_editor.load(std::memory_order_acquire));
 }
 
 uint32_t modmanager_pccompat_get_overlay_judgement_hit_count() {
-    return g_overlay_state.judgement_hit_count.load(std::memory_order_acquire);
+    return default_overlay_state_for_legacy_api().judgement_hit_count.load(std::memory_order_acquire);
 }
 
 uint32_t modmanager_pccompat_get_overlay_judgement_reset_count() {
-    return g_overlay_state.judgement_reset_count.load(std::memory_order_acquire);
+    return default_overlay_state_for_legacy_api().judgement_reset_count.load(std::memory_order_acquire);
 }
 
 int modmanager_pccompat_get_overlay_last_hit_margin() {
-    return static_cast<int>(g_overlay_state.last_hit_margin.load(std::memory_order_acquire));
+    return static_cast<int>(default_overlay_state_for_legacy_api().last_hit_margin.load(std::memory_order_acquire));
 }
 
 uint32_t modmanager_pccompat_get_overlay_floor_move_count() {
-    return g_overlay_state.floor_move_count.load(std::memory_order_acquire);
+    return default_overlay_state_for_legacy_api().floor_move_count.load(std::memory_order_acquire);
 }
 
 float modmanager_pccompat_get_overlay_last_floor_exit_angle() {
-    return bits_to_float(g_overlay_state.last_floor_exit_angle_bits.load(std::memory_order_acquire));
+    return bits_to_float(default_overlay_state_for_legacy_api().last_floor_exit_angle_bits.load(std::memory_order_acquire));
 }
 
 int modmanager_pccompat_get_overlay_last_floor_move_hit_margin() {
-    return static_cast<int>(g_overlay_state.last_floor_move_hit_margin.load(std::memory_order_acquire));
+    return static_cast<int>(default_overlay_state_for_legacy_api().last_floor_move_hit_margin.load(std::memory_order_acquire));
 }
 
 uint32_t modmanager_pccompat_get_overlay_player_hit_count() {
-    return g_overlay_state.player_hit_count.load(std::memory_order_acquire);
+    return default_overlay_state_for_legacy_api().player_hit_count.load(std::memory_order_acquire);
 }
 
 int modmanager_pccompat_get_overlay_last_player_hit_is_auto() {
-    return static_cast<int>(g_overlay_state.last_player_hit_is_auto.load(std::memory_order_acquire));
+    return static_cast<int>(default_overlay_state_for_legacy_api().last_player_hit_is_auto.load(std::memory_order_acquire));
 }
 
 uint32_t modmanager_pccompat_get_overlay_death_count() {
-    return g_overlay_state.death_count.load(std::memory_order_acquire);
+    return default_overlay_state_for_legacy_api().death_count.load(std::memory_order_acquire);
 }
 
 int modmanager_pccompat_get_overlay_last_death_overload() {
-    return static_cast<int>(g_overlay_state.last_death_overload.load(std::memory_order_acquire));
+    return static_cast<int>(default_overlay_state_for_legacy_api().last_death_overload.load(std::memory_order_acquire));
 }
 
 int modmanager_pccompat_get_overlay_last_death_multipress() {
-    return static_cast<int>(g_overlay_state.last_death_multipress.load(std::memory_order_acquire));
+    return static_cast<int>(default_overlay_state_for_legacy_api().last_death_multipress.load(std::memory_order_acquire));
 }
 
 int modmanager_pccompat_get_overlay_last_death_hitbox() {
-    return static_cast<int>(g_overlay_state.last_death_hitbox.load(std::memory_order_acquire));
+    return static_cast<int>(default_overlay_state_for_legacy_api().last_death_hitbox.load(std::memory_order_acquire));
 }
 
 uint32_t modmanager_pccompat_get_overlay_hit_timing_count() {
-    return g_overlay_state.hit_timing_count.load(std::memory_order_acquire);
+    return default_overlay_state_for_legacy_api().hit_timing_count.load(std::memory_order_acquire);
 }
 
 float modmanager_pccompat_get_overlay_last_hit_timing_ms() {
-    return bits_to_float(g_overlay_state.last_hit_timing_ms_bits.load(std::memory_order_acquire));
+    return bits_to_float(default_overlay_state_for_legacy_api().last_hit_timing_ms_bits.load(std::memory_order_acquire));
 }
 
 int modmanager_pccompat_get_overlay_last_hit_timing_margin() {
-    return static_cast<int>(g_overlay_state.last_hit_timing_margin.load(std::memory_order_acquire));
+    return static_cast<int>(default_overlay_state_for_legacy_api().last_hit_timing_margin.load(std::memory_order_acquire));
 }
 
 uint32_t modmanager_pccompat_get_overlay_accuracy_snapshot_count() {
-    return g_overlay_state.accuracy_snapshot_count.load(std::memory_order_acquire);
+    return default_overlay_state_for_legacy_api().accuracy_snapshot_count.load(std::memory_order_acquire);
 }
 
 float modmanager_pccompat_get_overlay_percent_acc() {
-    return bits_to_float(g_overlay_state.percent_acc_bits.load(std::memory_order_acquire));
+    return bits_to_float(default_overlay_state_for_legacy_api().percent_acc_bits.load(std::memory_order_acquire));
 }
 
 float modmanager_pccompat_get_overlay_percent_x_acc() {
-    return bits_to_float(g_overlay_state.percent_x_acc_bits.load(std::memory_order_acquire));
+    return bits_to_float(default_overlay_state_for_legacy_api().percent_x_acc_bits.load(std::memory_order_acquire));
 }
 
 } // extern "C"

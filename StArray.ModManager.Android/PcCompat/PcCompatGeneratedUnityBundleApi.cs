@@ -20,7 +20,10 @@ internal sealed class PcCompatGeneratedUnityBundleApi
     private readonly Func<object, object?> _getAsset;
     private readonly Func<object, string?> _getTextAssetText;
     private readonly Func<object, bool> _isUnityObjectAlive;
-    private readonly Action<object, bool> _unload;
+    // Unload is bridge-owned and is intentionally excluded from the generated
+    // AssetBundle proxy. Older proxy sets may still expose it, but its absence
+    // is a supported Android ABI shape and must not block startup.
+    private readonly Action<object, bool>? _unload;
     private readonly ConstructorInfo _assetBundleConstructor;
     private readonly Dictionary<string, object> _assetTypeObjects =
         new(StringComparer.OrdinalIgnoreCase);
@@ -64,7 +67,7 @@ internal sealed class PcCompatGeneratedUnityBundleApi
             "op_Implicit",
             isStatic: true,
             unityObject);
-        var unload = RequiredMethod(
+        var unload = TryGetMethod(
             assetBundle,
             "Unload",
             isStatic: false,
@@ -77,7 +80,7 @@ internal sealed class PcCompatGeneratedUnityBundleApi
         _getAsset = CompileInstanceResult<object?>(getAsset);
         _getTextAssetText = CompileInstanceResult<string?>(getTextAssetText);
         _isUnityObjectAlive = CompileStaticObjectResult<bool>(isUnityObjectAlive);
-        _unload = CompileInstanceBoolCall(unload);
+        _unload = unload is null ? null : CompileInstanceBoolCall(unload);
         _assetBundleConstructor = assetBundle.GetConstructor([typeof(IntPtr)])
             ?? throw new MissingMethodException(assetBundle.FullName, ".ctor(IntPtr)");
     }
@@ -117,10 +120,27 @@ internal sealed class PcCompatGeneratedUnityBundleApi
         => _isUnityObjectAlive(proxy);
 
     public void Unload(object bundle, bool unloadAllLoadedObjects)
-        => _unload(bundle, unloadAllLoadedObjects);
+    {
+        // VirtualBundle teardown releases owner leases and materialized Unity
+        // objects. If the host proxy has no native AssetBundle.Unload member,
+        // retaining the process-wide capability bundle is the correct fallback.
+        _unload?.Invoke(bundle, unloadAllLoadedObjects);
+    }
 
     public object WrapAssetBundle(nint bundle)
         => _assetBundleConstructor.Invoke([bundle]);
+
+    /// <summary>
+    /// Creates an owner-scoped IL2CPP root for a long-lived Unity object. The
+    /// AsyncOperation proxy can be released after its result is consumed, while
+    /// the returned bundle or asset must remain rooted until its owner unloads it.
+    /// </summary>
+    public object CreateNativeRoot(nint pointer)
+    {
+        if (pointer == nint.Zero)
+            throw new ArgumentException("Cannot root a null IL2CPP object.", nameof(pointer));
+        return new Il2CppSystem.Object(pointer);
+    }
 
     public static nint GetPointer(object? proxy)
         => proxy switch
@@ -209,6 +229,17 @@ internal sealed class PcCompatGeneratedUnityBundleApi
                ?? throw new MissingMethodException(
                    type.FullName,
                    $"{name}({string.Join(", ", parameterTypes.Select(item => item.FullName))})");
+    }
+
+    private static MethodInfo? TryGetMethod(
+        Type type,
+        string name,
+        bool isStatic,
+        params Type[] parameterTypes)
+    {
+        var flags = BindingFlags.Public |
+                    (isStatic ? BindingFlags.Static : BindingFlags.Instance);
+        return type.GetMethod(name, flags, binder: null, parameterTypes, modifiers: null);
     }
 
     private static Func<string, object?> CompileStaticStringCall(MethodInfo method)

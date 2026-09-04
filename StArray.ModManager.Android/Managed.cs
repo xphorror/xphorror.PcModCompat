@@ -26,6 +26,7 @@ public static class Managed
     private static readonly object s_nativeLibraryLock = new();
     private static bool s_nativeResolverInstalled;
     private static IntPtr s_il2CppHandle;
+    private static IntPtr s_monoHandle;
     private static ModManagerUI? s_ui;
     private static ModLoader? s_loader;
     private static AndroidModManagerPlatformServices? s_platformServices;
@@ -89,7 +90,11 @@ public static class Managed
         InstallNativeLibraryResolvers();
         LogBenchmark(benchmarkEnabled, "Native library resolvers", null);
 
+        // Compatibility is governed by runtime/API discovery and the normal loader
+        // lifecycle checks below.
         bool pcCompatEnabled = true;
+        NativeModAndroidShadowRewrite.Install();
+        LogBenchmark(benchmarkEnabled, "Native MOD callback-only rewrite", null);
 
         // Android linker namespaces can make RTLD_NOLOAD return null even when
         // libil2cpp.so is already mapped. Use the verified native handle as
@@ -109,7 +114,14 @@ public static class Managed
         HookHelper.Instance ??= new DobbyHook();
         if (pcCompatEnabled)
         {
-            if (!PcCompatIl2CppInteropBootstrap.TryStart())
+            if (!PcCompatNativeHookRules.TryPrimeIl2CppMetadata())
+            {
+                pcCompatEnabled = false;
+                Logger.Error(
+                    nameof(Managed),
+                    "PC MOD compatibility disabled because protected IL2CPP metadata initialization failed");
+            }
+            else if (!PcCompatIl2CppInteropBootstrap.TryStart())
             {
                 pcCompatEnabled = false;
                 Logger.Error(
@@ -118,7 +130,10 @@ public static class Managed
             }
             else
             {
+                PcCompatAbiBridge.Install();
                 PcCompatManagedComponentOwnerHost.Install();
+                PcCompatManagedSnapshotScalarBridge.RegisterResolver(
+                    PcCompatDynamicGetterSnapshotHost.TryResolve);
                 PcCompatAndroidManagedAssemblyRewrite.Install();
                 PcCompatAndroidResourceAssemblyCompile.Install();
                 PcCompatAndroidTargetSignature.Install();
@@ -195,7 +210,14 @@ public static class Managed
 
         // 初始化
         sw = benchmarkEnabled ? Stopwatch.StartNew() : null;
-        var loader = new ModLoader(modsPath);
+        var nativeModHostPathPolicy = CreateNativeModHostPathPolicy(
+            AndroidUtils.GetExternalStorageRoot(),
+            AndroidUtils.GetInternalFilesDir(),
+            AndroidUtils.GetSystemRoot(),
+            modsPath,
+            configDir,
+            baseDir);
+        var loader = new ModLoader(modsPath, nativeModHostPathPolicy);
         s_loader = loader;
         if (pcCompatEnabled)
             loader.SetPendingLoadCompletionScheduler(
@@ -382,6 +404,43 @@ public static class Managed
         }
     }
 
+    internal static ModHostPathPolicy CreateNativeModHostPathPolicy(
+        string? externalStorageRoot,
+        string? internalFilesRoot,
+        string? systemRoot,
+        string modsPath,
+        string configDirectory,
+        string runtimeDirectory)
+    {
+        var sharedWritable = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var sharedReadOnly = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var hostProtected = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        AddNormalized(sharedWritable, externalStorageRoot);
+        AddNormalized(sharedWritable, internalFilesRoot);
+        AddNormalized(sharedReadOnly, systemRoot);
+
+        // Protect actual Host locations, not a named directory convention. The current MOD's
+        // explicit install/private roots take precedence in NativeModPathBridge.
+        AddNormalized(hostProtected, Path.GetDirectoryName(Path.GetFullPath(modsPath)));
+        AddNormalized(hostProtected, configDirectory);
+        AddNormalized(hostProtected, runtimeDirectory);
+
+        return new ModHostPathPolicy
+        {
+            SharedWritableRoots = sharedWritable.Order(StringComparer.Ordinal).ToArray(),
+            SharedReadOnlyRoots = sharedReadOnly.Order(StringComparer.Ordinal).ToArray(),
+            HostProtectedRoots = hostProtected.Order(StringComparer.Ordinal).ToArray()
+        };
+
+        static void AddNormalized(HashSet<string> target, string? path)
+        {
+            if (string.IsNullOrWhiteSpace(path))
+                return;
+            target.Add(Path.GetFullPath(path));
+        }
+    }
+
     private static bool EnvEnabled(string name, bool defaultValue)
     {
         string? value = Environment.GetEnvironmentVariable(name);
@@ -436,6 +495,12 @@ public static class Managed
             libraryName.Equals("GameAssembly", StringComparison.OrdinalIgnoreCase))
             return ResolveIl2CppLibrary();
 
+        if (libraryName.Equals("mono-2.0-bdwgc.dll", StringComparison.OrdinalIgnoreCase) ||
+            libraryName.Equals("libmonobdwgc-2.0.so", StringComparison.OrdinalIgnoreCase) ||
+            libraryName.Equals("libmono-2.0.so.1", StringComparison.OrdinalIgnoreCase) ||
+            libraryName.Equals("libmono.so", StringComparison.OrdinalIgnoreCase))
+            return ResolveMonoLibrary(assembly, searchPath);
+
         if (!libraryName.Equals("cimgui", StringComparison.OrdinalIgnoreCase))
             return IntPtr.Zero;
 
@@ -459,6 +524,29 @@ public static class Managed
             if (s_il2CppHandle == IntPtr.Zero)
                 Logger.Error(nameof(Managed), "Failed to resolve libil2cpp.so through native namespace bridge");
             return s_il2CppHandle;
+        }
+    }
+
+    private static IntPtr ResolveMonoLibrary(Assembly assembly, DllImportSearchPath? searchPath)
+    {
+        lock (s_nativeLibraryLock)
+        {
+            if (s_monoHandle != IntPtr.Zero)
+                return s_monoHandle;
+
+            foreach (var candidate in new[]
+                     {
+                         "libmonobdwgc-2.0.so",
+                         "libmono-2.0.so.1",
+                         "libmono.so"
+                     })
+            {
+                if (NativeLibrary.TryLoad(candidate, assembly, searchPath, out s_monoHandle))
+                    return s_monoHandle;
+            }
+
+            Logger.Error(nameof(Managed), "Failed to resolve the loaded Mono runtime library");
+            return IntPtr.Zero;
         }
     }
 }

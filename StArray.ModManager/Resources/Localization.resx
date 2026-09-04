@@ -326,6 +326,4 @@
   <data name="PcCompat_SettingsLinkedHint" xml:space="preserve"><value>这里与 MOD 原菜单绑定同一组实时值；修改会调用原 setter 并通过原保存入口持久化。</value></data>
   <data name="Inspector_HotkeyPress" xml:space="preserve"><value>请按键... (Esc 取消, Backspace 解绑)</value></data>
   <data name="Inspector_ListAdd" xml:space="preserve"><value>添加</value></data>
-  <data name="License_ModManagerRequired" xml:space="preserve"><value>当前授权不包含 ModManager</value></data>
-  <data name="License_PcCompatRequired" xml:space="preserve"><value>需要 PC MOD 兼容授权</value></data>
 </root>

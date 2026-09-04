@@ -36,8 +36,16 @@ public interface IPcCompatManagedSettingsCanvasProbe
     void ReleaseCanvasSurface();
 }
 
+internal interface IPcCompatManagedSettingsImGuiTransaction
+{
+    bool ShouldDispatchCurrentEvent();
+    bool IsStable { get; }
+    void MarkRecoverableLayoutFailure();
+}
+
 public sealed class PcCompatManagedSettingsController
 {
+    private const int RecoverableLayoutFailureLimit = 3;
     private static readonly long ImGuiOpenTimeoutTicks =
         checked(Stopwatch.Frequency * 3L);
 
@@ -55,7 +63,9 @@ public sealed class PcCompatManagedSettingsController
     private bool _openRequested;
     private bool _saveRequested;
     private bool _closeRequested;
+    private bool _closeCallbackActive;
     private string? _fault;
+    private int _recoverableLayoutFailureCount;
     private long _openStartedTimestamp;
 
     private PcCompatManagedSettingsController(
@@ -238,6 +248,7 @@ public sealed class PcCompatManagedSettingsController
 
             _openRequested = true;
             _closeRequested = false;
+            _recoverableLayoutFailureCount = 0;
             _openStartedTimestamp = Stopwatch.GetTimestamp();
             _state = PcCompatManagedSettingsState.Opening;
             error = null;
@@ -275,6 +286,39 @@ public sealed class PcCompatManagedSettingsController
         }
     }
 
+    public void ReleaseForSessionTeardown()
+    {
+        lock (_gate)
+        {
+            try
+            {
+                if (_state == PcCompatManagedSettingsState.Open ||
+                    _state == PcCompatManagedSettingsState.Opening && !_openRequested)
+                {
+                    InvokeClose();
+                }
+            }
+            catch
+            {
+                // Session teardown must still revoke the settings surface and
+                // its input transaction. The outer lifecycle records actual
+                // MOD shutdown faults through its existing failure path.
+            }
+            finally
+            {
+                _openRequested = false;
+                _saveRequested = false;
+                _closeRequested = false;
+                _fault = null;
+                _recoverableLayoutFailureCount = 0;
+                _unityBackend?.ReleaseCanvasSurface();
+                _surfaceKind = PcCompatManagedSettingsSurfaceKind.None;
+                _openStartedTimestamp = 0;
+                _state = PcCompatManagedSettingsState.Closed;
+            }
+        }
+    }
+
     public bool DispatchFrame()
         => DispatchCore(allowImGuiDraw: false);
 
@@ -296,12 +340,17 @@ public sealed class PcCompatManagedSettingsController
 
             try
             {
+                var skippedImGui = false;
+                var canDispatchImGui = allowImGuiDraw &&
+                                       CanDispatchImGuiCurrentEvent(out skippedImGui);
                 if (_openRequested)
                 {
                     _openRequested = false;
                     _unityBackend?.BeginCanvasProbe(
                         _ownerGameObjects?.Invoke() ?? Array.Empty<object>());
                     _open();
+                    if (WasReleasedDuringCallback())
+                        return true;
                     if (_unityBackend?.TryClaimCanvasSurface() == true)
                     {
                         _surfaceKind = PcCompatManagedSettingsSurfaceKind.UnityCanvas;
@@ -320,13 +369,17 @@ public sealed class PcCompatManagedSettingsController
                 if (_state == PcCompatManagedSettingsState.Opening &&
                     _surfaceKind == PcCompatManagedSettingsSurfaceKind.UnityImGui)
                 {
-                    if (allowImGuiDraw)
+                    if (canDispatchImGui)
                     {
                         _draw();
                         drewImGui = true;
+                        if (WasReleasedDuringCallback())
+                            return true;
                         if (!_isVisible())
                         {
-                            _close();
+                            InvokeClose();
+                            if (WasReleasedDuringCallback())
+                                return true;
                             _schema?.Refresh();
                             _surfaceKind = PcCompatManagedSettingsSurfaceKind.None;
                             _openStartedTimestamp = 0;
@@ -336,7 +389,8 @@ public sealed class PcCompatManagedSettingsController
                         _openStartedTimestamp = 0;
                         _state = PcCompatManagedSettingsState.Open;
                     }
-                    else if (_openStartedTimestamp != 0 &&
+                    else if (!skippedImGui &&
+                             _openStartedTimestamp != 0 &&
                              Stopwatch.GetTimestamp() - _openStartedTimestamp >=
                              ImGuiOpenTimeoutTicks)
                     {
@@ -349,13 +403,17 @@ public sealed class PcCompatManagedSettingsController
                 {
                     _saveRequested = false;
                     _save();
+                    if (WasReleasedDuringCallback())
+                        return true;
                     _schema?.Refresh();
                 }
 
                 if (_closeRequested)
                 {
                     _closeRequested = false;
-                    _close();
+                    InvokeClose();
+                    if (WasReleasedDuringCallback())
+                        return true;
                     _schema?.Refresh();
                     _unityBackend?.ReleaseCanvasSurface();
                     _surfaceKind = PcCompatManagedSettingsSurfaceKind.None;
@@ -366,16 +424,24 @@ public sealed class PcCompatManagedSettingsController
 
                 if (_state == PcCompatManagedSettingsState.Open)
                 {
-                    if (allowImGuiDraw &&
+                    if (canDispatchImGui &&
                         _surfaceKind == PcCompatManagedSettingsSurfaceKind.UnityImGui &&
                         !drewImGui)
+                    {
                         _draw();
+                        if (WasReleasedDuringCallback())
+                            return true;
+                    }
                     var visible = _surfaceKind == PcCompatManagedSettingsSurfaceKind.UnityCanvas
                         ? _unityBackend?.IsClaimedCanvasSurfaceVisible() == true
                         : _isVisible();
+                    if (WasReleasedDuringCallback())
+                        return true;
                     if (!visible)
                     {
-                        _close();
+                        InvokeClose();
+                        if (WasReleasedDuringCallback())
+                            return true;
                         _schema?.Refresh();
                         _unityBackend?.ReleaseCanvasSurface();
                         _surfaceKind = PcCompatManagedSettingsSurfaceKind.None;
@@ -383,14 +449,40 @@ public sealed class PcCompatManagedSettingsController
                         _state = PcCompatManagedSettingsState.Closed;
                     }
                 }
+                if (_recoverableLayoutFailureCount != 0 &&
+                    (_unityBackend is not IPcCompatManagedSettingsImGuiTransaction transaction ||
+                     transaction.IsStable))
+                {
+                    _recoverableLayoutFailureCount = 0;
+                }
                 return true;
             }
             catch (Exception exception)
             {
+                // Explicit session teardown wins over an exception thrown by a
+                // callback that was already being unwound. A retired surface
+                // must not become Faulted and be mistaken for a live MOD fault.
+                if (WasReleasedDuringCallback())
+                    return true;
                 var failure = exception.GetBaseException().ToString();
+                if (IsRecoverableGUILayoutRepaintMismatch(exception))
+                {
+                    if (_unityBackend is IPcCompatManagedSettingsImGuiTransaction transaction)
+                        transaction.MarkRecoverableLayoutFailure();
+                    if (++_recoverableLayoutFailureCount < RecoverableLayoutFailureLimit)
+                    {
+                        _openRequested = false;
+                        _saveRequested = false;
+                        _closeRequested = false;
+                        _fault = null;
+                        return true;
+                    }
+                }
                 try
                 {
-                    _close();
+                    InvokeClose();
+                    if (WasReleasedDuringCallback())
+                        return true;
                     _schema?.Refresh();
                 }
                 catch (Exception closeException)
@@ -411,6 +503,46 @@ public sealed class PcCompatManagedSettingsController
                 return false;
             }
         }
+    }
+
+    private bool WasReleasedDuringCallback()
+        => _state is PcCompatManagedSettingsState.Closed or
+           PcCompatManagedSettingsState.Unavailable;
+
+    private void InvokeClose()
+    {
+        if (_closeCallbackActive)
+            return;
+
+        _closeCallbackActive = true;
+        try
+        {
+            _close();
+        }
+        finally
+        {
+            _closeCallbackActive = false;
+        }
+    }
+
+    private static bool IsRecoverableGUILayoutRepaintMismatch(Exception exception)
+    {
+        var text = exception.ToString();
+        return text.Contains("GUILayout: Mismatched LayoutGroup.Ignore", StringComparison.Ordinal) ||
+               text.Contains("Getting control ", StringComparison.Ordinal) &&
+               text.Contains("position in a group with only ", StringComparison.Ordinal) &&
+               text.Contains("when doing repaint", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private bool CanDispatchImGuiCurrentEvent(out bool skipped)
+    {
+        skipped = false;
+        if (_unityBackend is not IPcCompatManagedSettingsImGuiTransaction transaction)
+            return true;
+
+        var allowed = transaction.ShouldDispatchCurrentEvent();
+        skipped = !allowed;
+        return allowed;
     }
 
     public PcCompatManagedSettingsSnapshot Snapshot()

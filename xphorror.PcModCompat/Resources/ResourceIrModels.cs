@@ -10,6 +10,7 @@ public enum ResourceIrMaterializationKind
     TmpFontFromAtlas = 5,
     PrefabGraph = 6,
     TextureAlpha8 = 7,
+    FontFromFile = 8,
     Unsupported = 255
 }
 

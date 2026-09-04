@@ -8,7 +8,7 @@ public static class ResourceIrCompiler
 {
     public const string AliasFileName = "pccompat_resource_aliases.json";
     public const string CacheMarkerFileName = "resource_ir_compiler.txt";
-    public const string CompilerRevision = "resource-ir-compiler-v4-alpha8-atlas";
+    public const string CompilerRevision = "resource-ir-compiler-v5-font-file";
     private static readonly JsonSerializerOptions AliasJsonOptions = new()
     {
         PropertyNameCaseInsensitive = true
@@ -140,9 +140,30 @@ public static class ResourceIrCompiler
             Assets = assets,
             Warnings = warnings
         };
-        return string.IsNullOrWhiteSpace(payloadOutputDirectory)
+        var result = string.IsNullOrWhiteSpace(payloadOutputDirectory)
             ? document
             : ResourceIrUnityExtractor.Enrich(report, document, payloadOutputDirectory);
+        var missingMaterializers = result.Assets
+            .Where(asset => asset.RequiredByMod)
+            .Where(asset => asset.MaterializationKind is
+                ResourceIrMaterializationKind.MetadataOnly or ResourceIrMaterializationKind.Unsupported)
+            .Select(asset => $"{asset.Name} ({asset.ExpectedType}, source={asset.SourceType})")
+            .OrderBy(value => value, StringComparer.Ordinal)
+            .ToArray();
+        if (missingMaterializers.Length != 0)
+        {
+            var extractionFailures = result.Warnings
+                .Where(warning => warning.Contains("Resource asset extraction failed", StringComparison.Ordinal))
+                .Take(16)
+                .ToArray();
+            throw new InvalidDataException(
+                "Required resource requests have no materializer: " +
+                string.Join(", ", missingMaterializers) +
+                (extractionFailures.Length == 0
+                    ? string.Empty
+                    : "; extraction failures: " + string.Join(" | ", extractionFailures)));
+        }
+        return result;
     }
 
     private static IReadOnlyList<ResourceIrAliasEntry> ReadAliases(string modFolder)

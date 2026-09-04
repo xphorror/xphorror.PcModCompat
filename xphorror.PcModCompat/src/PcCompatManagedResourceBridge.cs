@@ -55,9 +55,9 @@ public static class PcCompatManagedResourceBridge
     public static void ClearCapabilityAssetProvider()
         => Volatile.Write(ref s_capabilityProvider, null);
 
-    // Return object intentionally: the assembly rewriter inserts a cast to the
-    // generated UnityEngine.AssetBundle proxy without making this core assembly
-    // depend on a build-specific proxy DLL.
+    // Return object intentionally: the assembly rewriter erases the desktop
+    // AssetBundle type at this boundary and carries an owner-scoped virtual
+    // handle instead of exposing a build-specific Unity proxy.
     public static object LoadAssetBundleFromFile(string path)
     {
         var execution = RequireExecutionContext();
@@ -69,24 +69,32 @@ public static class PcCompatManagedResourceBridge
                 $"AssetBundle acquisition is not allowed during {execution.Phase}.");
         }
 
-        try
+        // A registered VirtualBundle session is authoritative. Falling back to
+        // the legacy native AssetBundle provider after a recipe/path/materializer
+        // error leaks a second ownership model and can return a stale IL2CPP
+        // wrapper. Legacy providers are only valid when no VirtualBundle session
+        // exists for this MOD generation.
+        if (PcCompatVirtualBundleRegistry.HasSession(
+                execution.ModId,
+                execution.ResourceSessionGeneration))
         {
             return PcCompatVirtualBundleRegistry.Acquire(
                 execution.ModId,
                 execution.ResourceSessionGeneration,
                 path ?? string.Empty);
         }
-        catch when (Volatile.Read(ref s_provider) is not null)
-        {
-            var provider = Volatile.Read(ref s_provider)!;
-            return provider.Acquire(new PcCompatManagedAssetBundleRequest(
-                       execution.ModId,
-                       execution.ResourceSessionGeneration,
-                       path ?? string.Empty))
-                   ?? throw new InvalidOperationException(
-                       $"No legacy AssetBundle belongs to mod={execution.ModId} " +
-                       $"generation={execution.ResourceSessionGeneration} path={path}.");
-        }
+
+        var provider = Volatile.Read(ref s_provider)
+                       ?? throw new InvalidOperationException(
+                           $"No VirtualBundle session or legacy AssetBundle provider exists for " +
+                           $"mod={execution.ModId} generation={execution.ResourceSessionGeneration}.");
+        return provider.Acquire(new PcCompatManagedAssetBundleRequest(
+                   execution.ModId,
+                   execution.ResourceSessionGeneration,
+                   path ?? string.Empty))
+               ?? throw new InvalidOperationException(
+                   $"No legacy AssetBundle belongs to mod={execution.ModId} " +
+                   $"generation={execution.ResourceSessionGeneration} path={path}.");
     }
 
     public static object LoadAssetFromBundle(object bundle, string assetName)
@@ -135,7 +143,7 @@ public static class PcCompatManagedResourceBridge
             if (!virtualBundle.ModId.Equals(execution.ModId, StringComparison.OrdinalIgnoreCase) ||
                 virtualBundle.SessionGeneration != execution.ResourceSessionGeneration)
                 throw new InvalidOperationException("VirtualBundle release owner mismatch.");
-            PcCompatVirtualBundleRegistry.Release(virtualBundle);
+            PcCompatVirtualBundleRegistry.Release(virtualBundle, unloadAllLoadedObjects);
             return;
         }
         var provider = Volatile.Read(ref s_provider)

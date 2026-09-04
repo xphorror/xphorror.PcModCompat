@@ -70,6 +70,7 @@ internal static class ProxyFieldRewriter
                 options.InputPath);
             if (options.ManagedBridgeRewrites.Count != 0 ||
                 options.ManagedCallBridgeRewrites.Count != 0 ||
+                options.ManagedWritableCollections.Count != 0 ||
                 options.ManagedProxyCastBridge is not null ||
                 options.ManagedReadProgressGuard is not null ||
                 options.ManagedPollingWaitRewrite is not null ||
@@ -103,7 +104,14 @@ internal static class ProxyFieldRewriter
                 managedBridgeModule,
                 proxyModules,
                 managedOwnedModules,
+                options,
                 options.ManagedCallBridgeRewrites,
+                managedBridgeRewrites,
+                managedBridgeIssues);
+            var renderComponentPlans = PlanManagedRenderComponentRewrites(
+                module,
+                managedOwnedModules,
+                options.ManagedRenderComponents,
                 managedBridgeRewrites,
                 managedBridgeIssues);
             var managedReadProgressGuardPlans = PlanManagedReadProgressGuards(
@@ -132,6 +140,8 @@ internal static class ProxyFieldRewriter
                 .ToHashSet();
             var opaqueTypeErasurePlans = PlanOpaqueTypeErasures(
                 module,
+                importer,
+                managedBridgeModule,
                 options.ManagedCallBridgeRewrites,
                 managedCallBridgeInstructions,
                 managedBridgeRewrites,
@@ -149,6 +159,9 @@ internal static class ProxyFieldRewriter
                 options.ManagedProxyCastBridge,
                 managedBridgeRewrites,
                 managedBridgeIssues);
+            // Reuses ProxyCastRewritePlan: both are "replace this callvirt with a static bridge call
+            // of identical stack shape", which is all the emitter needs to know.
+            var writableCollectionPlans = new List<ProxyCastRewritePlan>();
             var scanned = 0;
 
             foreach (var type in module.GetTypes())
@@ -261,20 +274,40 @@ internal static class ProxyFieldRewriter
                 }
 
                 var imported = importer.Import(candidates[0]);
-                var arrayConverter = ArrayGetterMatchesField(candidates[0], field, isWrite)
+                var returnConverter = ArrayGetterMatchesField(candidates[0], field, isWrite)
                     ? CreateArrayToManagedConverter(module, importer, field)
                     : ListGetterMatchesField(candidates[0], field, isWrite)
-                        ? CreateListToManagedConverter(module, importer, field)
-                        : null;
+                        ? CreateListToManagedConverter(module, importer, managedBridgeModule, field)
+                        : CreateMethodReturnConverter(
+                            module,
+                            importer,
+                            managedBridgeModule,
+                            candidates[0].MethodSig?.RetType,
+                            field.FieldSig!.Type,
+                            followingUnboxType: null);
+                var argumentConverter = isWrite
+                    ? CreateFieldArgumentConverter(
+                        module,
+                        importer,
+                        managedBridgeModule,
+                        candidates[0].MethodSig,
+                        field.FieldSig!.Type)
+                    : null;
                 var record = new RewriteRecord(
                     method.FullName,
                     instruction.Offset,
                     instruction.OpCode.Name,
                     field.FullName,
-                    arrayConverter is null
-                        ? imported.FullName
-                        : imported.FullName + " -> " + arrayConverter.FullName);
-                pending.Add(new RewritePlan(method, instruction, imported, arrayConverter, record));
+                    imported.FullName +
+                    (argumentConverter is null ? string.Empty : " <- " + argumentConverter.FullName) +
+                    (returnConverter is null ? string.Empty : " -> " + returnConverter.FullName));
+                pending.Add(new RewritePlan(
+                    method,
+                    instruction,
+                    imported,
+                    argumentConverter,
+                    returnConverter,
+                    record));
             }
 
 
@@ -286,6 +319,18 @@ internal static class ProxyFieldRewriter
                     continue;
                 if (managedCallBridgeInstructions.Contains(instruction))
                     continue;
+
+                // Before the proxy-assembly filter: List<T> lives in corlib, so a mutator callsite
+                // would be skipped as "not a proxy assembly" and never reach the registry.
+                CollectWritableCollectionMutations(
+                    module,
+                    importer,
+                    managedBridgeModule,
+                    options,
+                    method,
+                    instruction,
+                    writableCollectionPlans,
+                    methodCalls);
 
                 var declaringType = target.DeclaringType;
                 var assemblyName = declaringType.DefinitionAssembly?.Name?.String;
@@ -339,6 +384,11 @@ internal static class ProxyFieldRewriter
                 var namedCandidates = proxyType.Methods
                     .Where(candidate => candidate.Name == target.Name)
                     .ToArray();
+                var writableCollection = MatchWritableCollectionGetter(
+                    options.ManagedWritableCollections,
+                    assemblyName,
+                    declaringType,
+                    target);
                 var candidates = namedCandidates
                     .Where(candidate => candidate.IsStatic == !targetSig.HasThis)
                     .Where(candidate => (uint)candidate.GenericParameters.Count == targetGenericArity)
@@ -359,11 +409,13 @@ internal static class ProxyFieldRewriter
                             Converter = CreateMethodReturnConverter(
                                 module,
                                 importer,
+                                managedBridgeModule,
                                 candidate.MethodSig is null
                                     ? null
                                     : ResolveMethodReturnType(candidate.MethodSig.RetType, target as MethodSpec),
                                 ResolveMethodReturnType(targetSig.RetType, target as MethodSpec),
-                                GetFollowingUnboxType(method, instruction, proxyModules))
+                                GetFollowingUnboxType(method, instruction, proxyModules),
+                                writableCollection)
                         })
                         .Where(candidate => candidate.Converter is not null)
                         .ToArray();
@@ -380,7 +432,12 @@ internal static class ProxyFieldRewriter
                         .Where(candidate => (uint)candidate.GenericParameters.Count == targetGenericArity)
                         .Select(candidate =>
                         {
-                            var bridge = CreateMethodArgumentConverter(module, importer, candidate.MethodSig, targetSig);
+                            var bridge = CreateMethodArgumentConverter(
+                                module,
+                                importer,
+                                managedBridgeModule,
+                                candidate.MethodSig,
+                                targetSig);
                             return new { Method = candidate, Bridge = bridge };
                         })
                         .Where(candidate => candidate.Bridge is not null)
@@ -426,6 +483,18 @@ internal static class ProxyFieldRewriter
 
                 if (returnConverter is not null || argumentConverter is not null)
                 {
+                    if (writableCollection is not null &&
+                        (!targetSig.HasThis || targetSig.Params.Count != 0))
+                    {
+                        methodIssues.Add(new MethodIssueRecord(
+                            method.FullName,
+                            instruction.Offset,
+                            instruction.OpCode.Name,
+                            identity,
+                            surfaceEntry,
+                            "writable collection getter must be a zero-argument instance method"));
+                        continue;
+                    }
                     var proxyMethod = ImportProxyMethod(importer, candidates[0], target as MethodSpec);
                     methodRewrites.Add(new MethodRewritePlan(
                         method,
@@ -433,7 +502,9 @@ internal static class ProxyFieldRewriter
                         proxyMethod,
                         argumentIndex,
                         argumentConverter,
-                        returnConverter));
+                        returnConverter,
+                        DuplicateInstanceForReturnConverter: writableCollection is not null,
+                        ReturnConverterStringArgument: writableCollection?.SourceProperty));
                 }
 
                 methodCalls.Add(new MethodCallRecord(
@@ -454,14 +525,16 @@ internal static class ProxyFieldRewriter
             {
                 foreach (var item in pending)
                 {
+                    if (item.ArgumentConverter is not null)
+                        InsertFieldArgumentConverter(item);
                     item.Instruction.OpCode = OpCodes.Call;
                     item.Instruction.Operand = item.Accessor;
-                    if (item.ArrayConverter is not null)
+                    if (item.ReturnConverter is not null)
                     {
                         var instructionIndex = item.Method.Body.Instructions.IndexOf(item.Instruction);
                         item.Method.Body.Instructions.Insert(
                             instructionIndex + 1,
-                            Instruction.Create(OpCodes.Call, item.ArrayConverter));
+                            Instruction.Create(OpCodes.Call, item.ReturnConverter));
                     }
                 }
 
@@ -475,10 +548,23 @@ internal static class ProxyFieldRewriter
                 {
                     if (item.ArgumentConverter is not null)
                         InsertArgumentConverter(importer, item);
+                    if (item.DuplicateInstanceForReturnConverter)
+                    {
+                        InsertBeforeWithRetargeting(
+                            item.Method.Body,
+                            item.Instruction,
+                            Instruction.Create(OpCodes.Dup));
+                    }
                     item.Instruction.Operand = item.ProxyMethod;
                     if (item.ReturnConverter is not null)
                     {
                         var instructionIndex = item.Method.Body.Instructions.IndexOf(item.Instruction);
+                        if (item.ReturnConverterStringArgument is { } stringArgument)
+                        {
+                            item.Method.Body.Instructions.Insert(
+                                ++instructionIndex,
+                                Instruction.Create(OpCodes.Ldstr, stringArgument));
+                        }
                         item.Method.Body.Instructions.Insert(
                             instructionIndex + 1,
                             Instruction.Create(OpCodes.Call, item.ReturnConverter));
@@ -503,8 +589,27 @@ internal static class ProxyFieldRewriter
                     item.Instruction.OpCode = OpCodes.Call;
                     item.Instruction.Operand = item.BridgeMethod;
                 }
+                foreach (var item in writableCollectionPlans)
+                {
+                    item.Instruction.OpCode = OpCodes.Call;
+                    item.Instruction.Operand = item.BridgeMethod;
+                }
+                foreach (var item in renderComponentPlans)
+                {
+                    // pop, not nop: the preceding ldarg.0 stays, and pop consumes exactly the one
+                    // value the removed call would have.
+                    item.Instruction.OpCode = OpCodes.Pop;
+                    item.Instruction.Operand = null;
+                }
                 foreach (var item in opaqueTypeErasurePlans)
+                {
+                    foreach (var operatorRewrite in item.OperatorRewrites)
+                    {
+                        operatorRewrite.Instruction.OpCode = OpCodes.Call;
+                        operatorRewrite.Instruction.Operand = operatorRewrite.BridgeMethod;
+                    }
                     ApplyOpaqueTypeErasure(module, item);
+                }
                 NormalizeBranchEncodings(module);
 
                 if (!options.AuditOnly)
@@ -1513,6 +1618,7 @@ internal static class ProxyFieldRewriter
         ModuleDef? bridgeModule,
         IReadOnlyDictionary<string, ModuleDefMD> proxyModules,
         IReadOnlyDictionary<string, ModuleDefMD> managedOwnedModules,
+        Options options,
         IReadOnlyList<ManagedCallBridgeRewriteSpec> specs,
         List<ManagedBridgeRewriteRecord> rewrites,
         List<ManagedBridgeIssueRecord> issues)
@@ -1606,7 +1712,9 @@ internal static class ProxyFieldRewriter
             }
 
             var bridgeGenericArity = spec.BridgeGenericArgumentsFromSourceParameters?.Count ??
-                                     checked((int)spec.SourceGenericArity);
+                                     (spec.EraseBridgeGenericArity
+                                         ? 0
+                                         : checked((int)spec.SourceGenericArity));
             var bridgeCandidates = bridgeTypes[0].Methods
                 .Where(method => method.Name == spec.BridgeMethod)
                 .Where(method => method.IsStatic &&
@@ -1626,13 +1734,26 @@ internal static class ProxyFieldRewriter
             var callsites = module.GetTypes()
                 .SelectMany(type => type.Methods.Where(method => method.HasBody))
                 .SelectMany(method => method.Body.Instructions
-                    .Where(instruction => instruction.OpCode.Code is Code.Call or Code.Callvirt)
+                    .Where(instruction => spec.SourceIsConstructor
+                        ? instruction.OpCode.Code == Code.Newobj
+                        : instruction.OpCode.Code is Code.Call or Code.Callvirt)
                     .Where(instruction => instruction.Operand is IMethod target &&
                                           ManagedCallSourceMatches(spec, target))
                     .Select(instruction => (Method: method, Instruction: instruction, Target: (IMethod)instruction.Operand)))
                 .ToArray();
             foreach (var callsite in callsites)
             {
+                if (spec.SourceIsConstructor &&
+                    callsite.Instruction.OpCode.Code != Code.Newobj)
+                {
+                    issues.Add(new ManagedBridgeIssueRecord(
+                        spec.SourceType,
+                        spec.SourceMethod,
+                        $"constructor source uses unsupported opcode " +
+                        $"{callsite.Instruction.OpCode.Name} at " +
+                        $"{callsite.Method.FullName}@IL_{callsite.Instruction.Offset:X4}"));
+                    continue;
+                }
                 if (spec.SourceIsStatic && callsite.Instruction.OpCode.Code != Code.Call)
                 {
                     issues.Add(new ManagedBridgeIssueRecord(
@@ -1659,6 +1780,7 @@ internal static class ProxyFieldRewriter
                     module,
                     proxyModules,
                     managedOwnedModules,
+                    options,
                     spec,
                     sourceMethodSpec,
                     out var filterReason);
@@ -1689,6 +1811,7 @@ internal static class ProxyFieldRewriter
                     sourceSignature,
                     sourceMethodSpec);
                 if (sourceSignature.HasThis &&
+                    !spec.SourceIsConstructor &&
                     spec.InstanceForwarding != ManagedCallInstanceForwarding.AsObject)
                 {
                     issues.Add(new ManagedBridgeIssueRecord(
@@ -1697,7 +1820,7 @@ internal static class ProxyFieldRewriter
                         "instance source requires explicit AsObject forwarding"));
                     continue;
                 }
-                if (!sourceSignature.HasThis &&
+                if ((!sourceSignature.HasThis || spec.SourceIsConstructor) &&
                     spec.InstanceForwarding != ManagedCallInstanceForwarding.None)
                 {
                     issues.Add(new ManagedBridgeIssueRecord(
@@ -1720,16 +1843,31 @@ internal static class ProxyFieldRewriter
                 }
 
                 ITypeDefOrRef? returnCast = null;
+                ITypeDefOrRef? returnUnbox = null;
                 var bridgeReturn = ResolveMethodReturnType(
                     bridgeCandidates[0].MethodSig!.RetType,
                     sourceMethodSpec);
-                var resolvedSourceReturn = ResolveMethodReturnType(
-                    sourceSignature.RetType,
-                    sourceMethodSpec);
+                var resolvedSourceReturn = spec.SourceIsConstructor
+                    ? callsite.Target.DeclaringType.ToTypeSig()
+                    : ResolveMethodReturnType(sourceSignature.RetType, sourceMethodSpec);
                 if (TypeIdentity(bridgeReturn) != TypeIdentity(resolvedSourceReturn))
                 {
                     var sourceReturn = resolvedSourceReturn.ToTypeDefOrRef();
-                    if (ManagedCallErasesReturnType(spec, TypeIdentity(resolvedSourceReturn)) &&
+                    if (spec.AllowValueTypeReturnUnbox &&
+                        TypeIdentity(bridgeReturn) == "System.Object" &&
+                        TypeIdentity(resolvedSourceReturn) != "System.Void")
+                    {
+                        if (!resolvedSourceReturn.IsValueType || sourceReturn is null)
+                        {
+                            issues.Add(new ManagedBridgeIssueRecord(
+                                spec.SourceType,
+                                spec.SourceMethod,
+                                "value-type return unbox requires a resolvable struct return type"));
+                            continue;
+                        }
+                        returnUnbox = importer.Import(sourceReturn);
+                    }
+                    else if (ManagedCallErasesReturnType(spec, TypeIdentity(resolvedSourceReturn)) &&
                         TypeIdentity(bridgeReturn) == "System.Object" &&
                         TypeIdentity(resolvedSourceReturn) != "System.Void")
                     {
@@ -1749,6 +1887,32 @@ internal static class ProxyFieldRewriter
                     {
                         returnCast = importer.Import(sourceReturn);
                     }
+                }
+
+                ITypeDefOrRef? boxArgument = null;
+                if (spec.BoxLastValueTypeArgument)
+                {
+                    if (sourceSignature.Params.Count == 0)
+                    {
+                        issues.Add(new ManagedBridgeIssueRecord(
+                            spec.SourceType,
+                            spec.SourceMethod,
+                            "boxed argument forwarding requires at least one parameter"));
+                        continue;
+                    }
+                    var boxed = ResolveMethodReturnType(
+                        sourceSignature.Params[^1],
+                        sourceMethodSpec);
+                    var boxedTypeRef = boxed.ToTypeDefOrRef();
+                    if (!boxed.IsValueType || boxedTypeRef is null)
+                    {
+                        issues.Add(new ManagedBridgeIssueRecord(
+                            spec.SourceType,
+                            spec.SourceMethod,
+                            "boxed argument forwarding requires a resolvable struct parameter"));
+                        continue;
+                    }
+                    boxArgument = importer.Import(boxedTypeRef);
                 }
 
                 int? callsiteToken = null;
@@ -1782,7 +1946,9 @@ internal static class ProxyFieldRewriter
                     0,
                     returnCast,
                     callsiteToken,
-                    spec.AppendOwnerId));
+                    spec.AppendOwnerId,
+                    boxArgument,
+                    returnUnbox));
                 rewrites.Add(new ManagedBridgeRewriteRecord(
                     callsite.Method.FullName,
                     callsite.Instruction.Offset,
@@ -1791,6 +1957,8 @@ internal static class ProxyFieldRewriter
                     importedBridge.FullName +
                     (callsiteToken is null ? string.Empty : $" token=0x{callsiteToken.Value:X8}") +
                     (spec.AppendOwnerId == null ? string.Empty : " owner=embedded") +
+                    (boxArgument is null ? string.Empty : " box " + boxArgument.FullName) +
+                    (returnUnbox is null ? string.Empty : " -> unbox " + returnUnbox.FullName) +
                     (returnCast is null ? string.Empty : " -> cast " + returnCast.FullName),
                     0));
             }
@@ -1821,6 +1989,7 @@ internal static class ProxyFieldRewriter
         ModuleDef module,
         IReadOnlyDictionary<string, ModuleDefMD> proxyModules,
         IReadOnlyDictionary<string, ModuleDefMD> managedOwnedModules,
+        Options options,
         ManagedCallBridgeRewriteSpec spec,
         MethodSpec? sourceMethodSpec,
         out string? reason)
@@ -1830,7 +1999,8 @@ internal static class ProxyFieldRewriter
             return ManagedCallFilterResult.Rewrite;
         if (spec.GenericArgumentFilter is not (
                 ManagedCallGenericArgumentFilter.ModuleLocalMonoBehaviour or
-                ManagedCallGenericArgumentFilter.ModOwnedMonoBehaviour))
+                ManagedCallGenericArgumentFilter.ModOwnedMonoBehaviour or
+                ManagedCallGenericArgumentFilter.ModOwnedOrProxyComponent))
         {
             reason = $"unsupported generic argument filter {spec.GenericArgumentFilter}";
             return ManagedCallFilterResult.Reject;
@@ -1890,13 +2060,32 @@ internal static class ProxyFieldRewriter
             if (IsManagedOwnedMonoBehaviour(typeDefinition, module, managedOwnedModules))
                 return ManagedCallFilterResult.Rewrite;
 
-            reason =
-                $"MOD-owned component type does not derive UnityEngine.MonoBehaviour: {typeDefinition.FullName}";
+            if (MatchRenderComponent(
+                    options.ManagedRenderComponents,
+                    typeDefinition,
+                    module,
+                    managedOwnedModules,
+                    out var renderMismatch) is not null)
+            {
+                return ManagedCallFilterResult.Rewrite;
+            }
+
+            // The old message named MonoBehaviour, which was never the failing condition:
+            // IsManagedOwnedMonoBehaviour already walks the base chain. What it rejects is a chain
+            // that leaves the MOD's own modules, and that is what the message has to say.
+            reason = renderMismatch ??
+                     "MOD-owned component type has a base chain that leaves the MOD's own modules " +
+                     $"and is not a registered render component: {typeDefinition.FullName}";
             return ManagedCallFilterResult.Reject;
         }
 
         if (!string.IsNullOrWhiteSpace(assemblyName) && proxyModules.ContainsKey(assemblyName))
-            return ManagedCallFilterResult.Skip;
+        {
+            return spec.GenericArgumentFilter ==
+                   ManagedCallGenericArgumentFilter.ModOwnedOrProxyComponent
+                ? ManagedCallFilterResult.Rewrite
+                : ManagedCallFilterResult.Skip;
+        }
 
         reason =
             $"cannot prove generic component type is a generated proxy or MOD-owned MonoBehaviour: " +
@@ -1957,6 +2146,200 @@ internal static class ProxyFieldRewriter
         return false;
     }
 
+    /// <summary>
+    /// Resolves the registration that permits <paramref name="type"/> to derive a proxy class, or
+    /// null with a reason.
+    /// </summary>
+    /// <remarks>
+    /// The registration names the expected base type and this verifies it, walking down through the
+    /// MOD's own modules first. A MOD update that reparents the type - JipperKeyViewer's own
+    /// development branch already replaced <c>RainGraphic</c> with three self-drawing layers - then
+    /// fails closed here instead of binding a managed shell to the wrong host component.
+    /// </remarks>
+    private static ManagedRenderComponentSpec? MatchRenderComponent(
+        IReadOnlyList<ManagedRenderComponentSpec> specs,
+        TypeDef type,
+        ModuleDef module,
+        IReadOnlyDictionary<string, ModuleDefMD> managedOwnedModules,
+        out string? reason)
+    {
+        reason = null;
+        if (specs.Count == 0)
+            return null;
+
+        var componentAssembly = type.Module?.Assembly?.Name?.String;
+        var candidates = specs
+            .Where(spec => string.Equals(spec.ComponentType, type.FullName, StringComparison.Ordinal))
+            .Where(spec => string.Equals(
+                spec.ComponentAssembly,
+                componentAssembly,
+                StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        if (candidates.Length == 0)
+            return null;
+        if (candidates.Length > 1)
+        {
+            reason = $"render component type is registered {candidates.Length} times: {type.FullName}";
+            return null;
+        }
+        var candidate = candidates[0];
+
+        // Walk to the first base type outside the MOD's own modules. That is the link the
+        // registration is lifting, so it is the one that has to match.
+        var visited = new HashSet<TypeDef>();
+        for (var current = type; visited.Add(current);)
+        {
+            var baseType = current.BaseType;
+            if (baseType is null)
+            {
+                reason = $"registered render component has no base type: {type.FullName}";
+                return null;
+            }
+
+            var baseAssembly = baseType.DefinitionAssembly?.Name?.String;
+            TypeDef? baseDefinition = baseType as TypeDef;
+            if (baseDefinition is null &&
+                string.Equals(baseAssembly, module.Assembly?.Name?.String, StringComparison.OrdinalIgnoreCase))
+            {
+                baseDefinition = module.Find(baseType.FullName, isReflectionName: false);
+            }
+            if (baseDefinition is null &&
+                !string.IsNullOrWhiteSpace(baseAssembly) &&
+                managedOwnedModules.TryGetValue(baseAssembly, out var ownedModule))
+            {
+                baseDefinition = ownedModule.Find(baseType.FullName, isReflectionName: false);
+            }
+
+            var baseIsModOwned = baseDefinition is not null &&
+                                 (ReferenceEquals(baseDefinition.Module, module) ||
+                                  managedOwnedModules.Values.Any(owned =>
+                                      ReferenceEquals(baseDefinition.Module, owned)));
+            if (!baseIsModOwned)
+            {
+                if (!string.Equals(baseType.FullName, candidate.BaseType, StringComparison.Ordinal) ||
+                    !string.Equals(baseAssembly, candidate.BaseAssembly, StringComparison.OrdinalIgnoreCase))
+                {
+                    reason =
+                        $"registered render component {type.FullName} derives " +
+                        $"{baseAssembly ?? "<unknown>"}!{baseType.FullName}, " +
+                        $"but the registration declares {candidate.BaseAssembly}!{candidate.BaseType}";
+                    return null;
+                }
+                return candidate;
+            }
+            current = baseDefinition!;
+        }
+
+        reason = $"registered render component has a cyclic base chain: {type.FullName}";
+        return null;
+    }
+
+    /// <summary>
+    /// Blanks the base constructor call in each registered render component's own constructor.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <c>RainGraphic..ctor()</c> compiles to "initialize fields, then
+    /// <c>call MaskableGraphic::.ctor()</c>". The proxy constructor's body ends in an
+    /// <c>il2cpp_runtime_invoke</c> of the native base constructor on <c>this</c> - and by the time
+    /// the bridge runs the constructor, <c>this</c> is already bound to a live host component whose
+    /// native construction <c>AddComponent</c> performed. Letting the call through would run native
+    /// construction a second time on that object.
+    /// </para>
+    /// <para>
+    /// A <c>pop</c> replaces the <c>call</c> rather than deleting instructions: both consume the one
+    /// pushed <c>this</c> and leave nothing, so the stack stays balanced and no branch target moves.
+    /// Field initialization is untouched, and the type keeps deriving the proxy - which is what lets
+    /// its own <c>get_rectTransform</c>, <c>get_color</c> and <c>SetVerticesDirty</c> calls go
+    /// through the inherited proxy members with no rewriting at all.
+    /// </para>
+    /// </remarks>
+    private static IReadOnlyList<ProxyCastRewritePlan> PlanManagedRenderComponentRewrites(
+        ModuleDef module,
+        IReadOnlyDictionary<string, ModuleDefMD> managedOwnedModules,
+        IReadOnlyList<ManagedRenderComponentSpec> specs,
+        List<ManagedBridgeRewriteRecord> rewrites,
+        List<ManagedBridgeIssueRecord> issues)
+    {
+        var plans = new List<ProxyCastRewritePlan>();
+        if (specs.Count == 0)
+            return plans;
+
+        var moduleAssembly = module.Assembly?.Name?.String;
+        foreach (var spec in specs
+                     .Where(candidate => string.Equals(
+                         candidate.ComponentAssembly,
+                         moduleAssembly,
+                         StringComparison.OrdinalIgnoreCase))
+                     .Where(candidate => candidate.ConstructorNoOpBaseCall)
+                     .OrderBy(candidate => candidate.ComponentType, StringComparer.Ordinal))
+        {
+            var type = module.Find(spec.ComponentType, isReflectionName: false);
+            if (type is null)
+            {
+                // Not an issue: the registry spans every target MOD, and only the entries whose
+                // component type is present in this assembly apply to it.
+                continue;
+            }
+            if (MatchRenderComponent(specs, type, module, managedOwnedModules, out var mismatch) is null)
+            {
+                issues.Add(new ManagedBridgeIssueRecord(
+                    spec.ComponentType,
+                    ".ctor",
+                    mismatch ?? $"render component registration did not match {spec.ComponentType}"));
+                continue;
+            }
+
+            var baseCalls = type.Methods
+                .Where(method => method.Name == ".ctor" && method.HasBody)
+                .SelectMany(method => method.Body.Instructions
+                    .Where(instruction =>
+                        instruction.OpCode.Code == Code.Call &&
+                        instruction.Operand is IMethod target &&
+                        target.Name == ".ctor" &&
+                        target.MethodSig?.Params.Count == 0 &&
+                        string.Equals(
+                            target.DeclaringType?.FullName,
+                            spec.BaseType,
+                            StringComparison.Ordinal) &&
+                        string.Equals(
+                            target.DeclaringType?.DefinitionAssembly?.Name?.String,
+                            spec.BaseAssembly,
+                            StringComparison.OrdinalIgnoreCase))
+                    .Select(instruction => (Method: method, Instruction: instruction)))
+                .ToArray();
+            if (baseCalls.Length == 0)
+            {
+                issues.Add(new ManagedBridgeIssueRecord(
+                    spec.ComponentType,
+                    ".ctor",
+                    $"no parameterless {spec.BaseAssembly}!{spec.BaseType}::.ctor() call to blank; " +
+                    "the bridge would run native base construction twice on a bound instance"));
+                continue;
+            }
+
+            foreach (var baseCall in baseCalls)
+            {
+                // ProxyCastRewritePlan is reused for its emitter shape only - "replace this
+                // instruction" - so the bridge method is the instruction's own operand and the
+                // emitter is told separately to pop. See the render-component loop in Rewrite.
+                plans.Add(new ProxyCastRewritePlan(
+                    baseCall.Method,
+                    baseCall.Instruction,
+                    (IMethod)baseCall.Instruction.Operand));
+                rewrites.Add(new ManagedBridgeRewriteRecord(
+                    baseCall.Method.FullName,
+                    baseCall.Instruction.Offset,
+                    baseCall.Instruction.OpCode.Name,
+                    $"{spec.BaseAssembly}!{spec.BaseType}::.ctor()",
+                    "render-component base constructor blanked to pop",
+                    0));
+            }
+        }
+
+        return plans;
+    }
+
     private static bool ManagedCallSourceMatches(
         ManagedCallBridgeRewriteSpec spec,
         IMethod target)
@@ -1969,7 +2352,11 @@ internal static class ProxyFieldRewriter
             target.Name != spec.SourceMethod ||
             signature.HasThis == spec.SourceIsStatic ||
             signature.GenParamCount != spec.SourceGenericArity ||
-            TypeIdentity(signature.RetType) != NormalizeExternalTypeIdentity(spec.SourceReturnType) ||
+            (!spec.SourceIsConstructor &&
+             TypeIdentity(signature.RetType) !=
+                 NormalizeExternalTypeIdentity(spec.SourceReturnType)) ||
+            (spec.SourceIsConstructor &&
+             TypeIdentity(signature.RetType) != "System.Void") ||
             signature.Params.Count != spec.SourceParameterTypes.Count)
         {
             return false;
@@ -1989,7 +2376,9 @@ internal static class ProxyFieldRewriter
         MethodSig? bridge)
     {
         var bridgeGenericArity = spec.BridgeGenericArgumentsFromSourceParameters?.Count ??
-                                 checked((int)spec.SourceGenericArity);
+                                 (spec.EraseBridgeGenericArity
+                                     ? 0
+                                     : checked((int)spec.SourceGenericArity));
         if (bridge is null || bridge.HasThis || bridge.GenParamCount != bridgeGenericArity)
             return false;
 
@@ -2013,9 +2402,18 @@ internal static class ProxyFieldRewriter
                 bridge.Params[bridgeIndex + index],
                 spec);
             var sourceParameter = NormalizeExternalTypeIdentity(spec.SourceParameterTypes[index]);
-            if (bridgeParameter != sourceParameter &&
-                !(spec.AllowObjectParameterForwarding && bridgeParameter == "System.Object"))
-                return false;
+            if (bridgeParameter == sourceParameter)
+                continue;
+            if (spec.AllowObjectParameterForwarding && bridgeParameter == "System.Object")
+                continue;
+            // Boxed struct forwarding, last parameter only - see BoxLastValueTypeArgument.
+            if (spec.BoxLastValueTypeArgument &&
+                bridgeParameter == "System.Object" &&
+                index == spec.SourceParameterTypes.Count - 1)
+            {
+                continue;
+            }
+            return false;
         }
         if (spec.AppendCallsiteToken &&
             TypeIdentity(bridge.Params[bridgeIndex + spec.SourceParameterTypes.Count]) !=
@@ -2026,10 +2424,16 @@ internal static class ProxyFieldRewriter
 
         var sourceReturn = NormalizeExternalTypeIdentity(spec.SourceReturnType);
         var bridgeReturn = ManagedCallBridgeTypeIdentity(bridge.RetType, spec);
+        if (spec.AllowValueTypeReturnUnbox &&
+            bridgeReturn == "System.Object" &&
+            sourceReturn != "System.Void")
+        {
+            return true;
+        }
         return bridgeReturn == sourceReturn ||
                ((spec.AllowObjectReturnCast ||
                  ManagedCallErasesReturnType(spec, sourceReturn)) &&
-                sourceReturn != "System.Void" &&
+                (sourceReturn != "System.Void" || spec.SourceIsConstructor) &&
                 bridgeReturn == "System.Object");
     }
 
@@ -2044,6 +2448,8 @@ internal static class ProxyFieldRewriter
             $"callsite-token={(spec.AppendCallsiteToken ? 1 : 0)}:" +
            $"owner={(spec.AppendOwnerId == null ? 0 : 1)}:" +
            $"filter={spec.GenericArgumentFilter}:" +
+           $"box-last={(spec.BoxLastValueTypeArgument ? 1 : 0)}:" +
+           $"unbox-return={(spec.AllowValueTypeReturnUnbox ? 1 : 0)}:" +
            $"bridge-ga={string.Join(',', spec.BridgeGenericArgumentsFromSourceParameters ?? [])}";
 
     private static string ManagedCallBridgeTypeIdentity(
@@ -2084,6 +2490,8 @@ internal static class ProxyFieldRewriter
 
     private static IReadOnlyList<OpaqueTypeErasurePlan> PlanOpaqueTypeErasures(
         ModuleDef module,
+        Importer importer,
+        ModuleDef? managedBridgeModule,
         IReadOnlyList<ManagedCallBridgeRewriteSpec> specs,
         IReadOnlySet<Instruction> claimedCallsites,
         List<ManagedBridgeRewriteRecord> rewrites,
@@ -2099,6 +2507,7 @@ internal static class ProxyFieldRewriter
             var parameters = new List<(MethodDef Method, int Index)>();
             var locals = new List<(MethodDef Method, Local Local)>();
             var typeInstructions = new List<(MethodDef Method, Instruction Instruction)>();
+            var operatorRewrites = new List<OpaqueOperatorRewritePlan>();
             var invalid = false;
 
             foreach (var type in module.GetTypes())
@@ -2215,6 +2624,18 @@ internal static class ProxyFieldRewriter
 
             if (invalid)
                 continue;
+
+            PlanOpaqueOperatorRewrites(
+                module,
+                importer,
+                managedBridgeModule,
+                source,
+                fields,
+                parameters,
+                locals,
+                operatorRewrites,
+                rewrites,
+                issues);
             plans.Add(new OpaqueTypeErasurePlan(
                 source.SourceAssembly,
                 source.SourceType,
@@ -2222,7 +2643,8 @@ internal static class ProxyFieldRewriter
                 returns,
                 parameters,
                 locals,
-                typeInstructions));
+                typeInstructions,
+                operatorRewrites));
             foreach (var field in fields)
             {
                 rewrites.Add(new ManagedBridgeRewriteRecord(
@@ -2244,8 +2666,209 @@ internal static class ProxyFieldRewriter
                     0));
             }
         }
-        return plans;
+            return plans;
     }
+
+    private static void PlanOpaqueOperatorRewrites(
+        ModuleDef module,
+        Importer importer,
+        ModuleDef? managedBridgeModule,
+        (string SourceAssembly, string SourceType) source,
+        IReadOnlyList<FieldDef> erasedFields,
+        IReadOnlyList<(MethodDef Method, int Index)> erasedParameters,
+        IReadOnlyList<(MethodDef Method, Local Local)> erasedLocals,
+        List<OpaqueOperatorRewritePlan> operatorRewrites,
+        List<ManagedBridgeRewriteRecord> rewrites,
+        List<ManagedBridgeIssueRecord> issues)
+    {
+        var importedBridges = new Dictionary<string, IMethod?>(StringComparer.Ordinal);
+
+        foreach (var method in module.GetTypes().SelectMany(type => type.Methods)
+                     .Where(candidate => candidate.HasBody))
+        {
+            var hasErasedValue = method.MethodSig is { } signature &&
+                                 (IsSourceType(signature.RetType, source.SourceAssembly, source.SourceType) ||
+                                  signature.Params.Any(parameter =>
+                                      IsSourceType(parameter, source.SourceAssembly, source.SourceType))) ||
+                                 erasedParameters.Any(item => ReferenceEquals(item.Method, method)) ||
+                                 erasedLocals.Any(item => ReferenceEquals(item.Method, method)) ||
+                                 method.Body.Instructions.Any(instruction =>
+                                     instruction.Operand is IField field &&
+                                     IsErasedField(field, erasedFields));
+            if (!hasErasedValue)
+                continue;
+
+            for (var index = 0; index < method.Body.Instructions.Count; index++)
+            {
+                var instruction = method.Body.Instructions[index];
+                if (instruction.Operand is not IMethod target ||
+                    target.DeclaringType.FullName != "UnityEngine.Object")
+                    continue;
+
+                string? bridgeName = target.Name.String switch
+                {
+                    "op_Equality" when HasOpaqueEqualityOperand(
+                        method,
+                        index,
+                        source,
+                        erasedFields,
+                        erasedParameters,
+                        erasedLocals) => "IsOpaqueHandleEqual",
+                    "op_Inequality" when HasOpaqueEqualityOperand(
+                        method,
+                        index,
+                        source,
+                        erasedFields,
+                        erasedParameters,
+                        erasedLocals) => "IsOpaqueHandleNotEqual",
+                    "op_Implicit" when index > 0 && IsOpaqueValueLoad(
+                        method,
+                        index - 1,
+                        source,
+                        erasedFields,
+                        erasedParameters,
+                        erasedLocals) => "IsOpaqueHandleTruthy",
+                    _ => null
+                };
+                if (bridgeName == null)
+                    continue;
+
+                if (!importedBridges.TryGetValue(bridgeName, out var bridge))
+                {
+                    bridge = ImportOpaqueBridge(
+                        importer,
+                        managedBridgeModule,
+                        bridgeName,
+                        issues,
+                        source.SourceType);
+                    importedBridges.Add(bridgeName, bridge);
+                }
+                if (bridge == null)
+                    continue;
+
+                operatorRewrites.Add(new OpaqueOperatorRewritePlan(method, instruction, bridge));
+                rewrites.Add(new ManagedBridgeRewriteRecord(
+                    method.FullName,
+                    instruction.Offset,
+                    instruction.OpCode.Name,
+                    target.FullName,
+                    bridge.FullName,
+                    0));
+            }
+        }
+    }
+
+    private static IMethod? ImportOpaqueBridge(
+        Importer importer,
+        ModuleDef? managedBridgeModule,
+        string bridgeName,
+        List<ManagedBridgeIssueRecord> issues,
+        string sourceType)
+    {
+        const string bridgeTypeName =
+            "StArray.ModManager.Android.PcCompat.PcCompatOpaqueHandleBridge";
+        var bridgeType = managedBridgeModule?.GetTypes().SingleOrDefault(type =>
+            type.FullName == bridgeTypeName);
+        var bridgeMethod = bridgeType?.Methods.SingleOrDefault(method =>
+            method.IsStatic &&
+            method.Name == bridgeName);
+        if (bridgeMethod != null)
+            return importer.Import(bridgeMethod);
+
+        issues.Add(new ManagedBridgeIssueRecord(
+            sourceType,
+            bridgeName,
+            $"opaque Unity operator bridge is unavailable: {bridgeTypeName}::{bridgeName}"));
+        return null;
+    }
+
+    private static bool HasOpaqueEqualityOperand(
+        MethodDef method,
+        int operatorIndex,
+        (string SourceAssembly, string SourceType) source,
+        IReadOnlyList<FieldDef> erasedFields,
+        IReadOnlyList<(MethodDef Method, int Index)> erasedParameters,
+        IReadOnlyList<(MethodDef Method, Local Local)> erasedLocals)
+    {
+        if (operatorIndex < 2)
+            return false;
+        var left = method.Body.Instructions[operatorIndex - 2];
+        var right = method.Body.Instructions[operatorIndex - 1];
+        return (IsNullInstruction(left) && IsOpaqueValueLoad(
+                    method,
+                    operatorIndex - 1,
+                    source,
+                    erasedFields,
+                    erasedParameters,
+                    erasedLocals)) ||
+               (IsOpaqueValueLoad(
+                    method,
+                    operatorIndex - 2,
+                    source,
+                    erasedFields,
+                    erasedParameters,
+                    erasedLocals) && IsNullInstruction(right));
+    }
+
+    private static bool IsOpaqueValueLoad(
+        MethodDef method,
+        int index,
+        (string SourceAssembly, string SourceType) source,
+        IReadOnlyList<FieldDef> erasedFields,
+        IReadOnlyList<(MethodDef Method, int Index)> erasedParameters,
+        IReadOnlyList<(MethodDef Method, Local Local)> erasedLocals)
+    {
+        if (index < 0 || index >= method.Body.Instructions.Count)
+            return false;
+        var instruction = method.Body.Instructions[index];
+        if (instruction.Operand is IField field && IsErasedField(field, erasedFields))
+            return true;
+        if (instruction.Operand is Local local && erasedLocals.Any(item =>
+                ReferenceEquals(item.Method, method) && ReferenceEquals(item.Local, local)))
+            return true;
+        if (instruction.Operand is Parameter parameter && erasedParameters.Any(item =>
+                ReferenceEquals(item.Method, method) && item.Index == parameter.Index))
+            return true;
+
+        var localIndex = instruction.OpCode.Code switch
+        {
+            Code.Ldloc_0 => 0,
+            Code.Ldloc_1 => 1,
+            Code.Ldloc_2 => 2,
+            Code.Ldloc_3 => 3,
+            _ => -1
+        };
+        if (localIndex >= 0 && localIndex < method.Body.Variables.Count &&
+            erasedLocals.Any(item => ReferenceEquals(item.Method, method) &&
+                                      ReferenceEquals(item.Local, method.Body.Variables[localIndex])))
+            return true;
+
+        var parameterIndex = instruction.OpCode.Code switch
+        {
+            Code.Ldarg_0 => 0,
+            Code.Ldarg_1 => 1,
+            Code.Ldarg_2 => 2,
+            Code.Ldarg_3 => 3,
+            _ => -1
+        };
+        if (parameterIndex >= 0 && parameterIndex < method.Parameters.Count &&
+            erasedParameters.Any(item => ReferenceEquals(item.Method, method) &&
+                                         item.Index == parameterIndex))
+            return true;
+
+        if ((instruction.OpCode.Code is Code.Castclass or Code.Isinst) &&
+            instruction.Operand is ITypeDefOrRef type &&
+            IsSourceType(type.ToTypeSig(), source.SourceAssembly, source.SourceType))
+            return true;
+
+        return false;
+    }
+
+    private static bool IsErasedField(IField field, IReadOnlyList<FieldDef> erasedFields)
+        => erasedFields.Any(candidate => candidate.FullName == field.FullName);
+
+    private static bool IsNullInstruction(Instruction instruction)
+        => instruction.OpCode.Code == Code.Ldnull;
 
     private static IEnumerable<(string SourceAssembly, string SourceType)>
         GetManagedCallErasedTypes(ManagedCallBridgeRewriteSpec spec)
@@ -2397,6 +3020,15 @@ internal static class ProxyFieldRewriter
     {
         if (plan.DroppedArguments == 0)
         {
+            // Order matters: the struct argument is on the stack top before the appended
+            // constants are pushed, so it has to be boxed first.
+            if (plan.BoxArgumentType is not null)
+            {
+                InsertBeforeWithRetargeting(
+                    plan.Method.Body,
+                    plan.Instruction,
+                    Instruction.Create(OpCodes.Box, plan.BoxArgumentType));
+            }
             if (plan.AppendedInt32 is { } appended)
             {
                 InsertBeforeWithRetargeting(
@@ -2419,6 +3051,13 @@ internal static class ProxyFieldRewriter
                 plan.Method.Body.Instructions.Insert(
                     callIndex + 1,
                     Instruction.Create(OpCodes.Castclass, plan.ReturnCastType));
+            }
+            else if (plan.ReturnUnboxType is not null)
+            {
+                var callIndex = plan.Method.Body.Instructions.IndexOf(plan.Instruction);
+                plan.Method.Body.Instructions.Insert(
+                    callIndex + 1,
+                    Instruction.Create(OpCodes.Unbox_Any, plan.ReturnUnboxType));
             }
             return;
         }
@@ -2598,12 +3237,29 @@ internal static class ProxyFieldRewriter
         {
             return accessor.MethodSig is { Params.Count: 1 } signature &&
                    signature.RetType.ElementType == ElementType.Void &&
-                   TypeIdentity(signature.Params[0]) == TypeIdentity(fieldType);
+                   CompatibleProxyTypeIdentity(signature.Params[0], fieldType);
         }
 
         return accessor.MethodSig is { Params.Count: 0 } getterSignature &&
-               TypeIdentity(getterSignature.RetType) == TypeIdentity(fieldType);
+               CompatibleProxyTypeIdentity(getterSignature.RetType, fieldType);
     }
+
+    /// <summary>
+    /// Il2CppInterop deliberately prefixes generated corlib proxy types with <c>Il2Cpp</c>.
+    /// The PC MOD instruction still carries the ordinary <c>System.*</c> identity, so a
+    /// field-backed proxy surface must compare the two identities semantically rather than by
+    /// their generated spelling. This is intentionally limited to the generated corlib prefix;
+    /// unrelated proxy types remain exact-match/fail-closed.
+    /// </summary>
+    private static bool CompatibleProxyTypeIdentity(TypeSig candidate, TypeSig source)
+        => CompatibleProxyTypeIdentity(TypeIdentity(candidate), TypeIdentity(source));
+
+    private static bool CompatibleProxyTypeIdentity(string candidate, string source)
+        => string.Equals(candidate, source, StringComparison.Ordinal) ||
+           string.Equals(
+               candidate.Replace("Il2CppSystem.", "System.", StringComparison.Ordinal),
+               source,
+               StringComparison.Ordinal);
 
     private static bool ArrayGetterMatchesField(MethodDef accessor, IField field, bool isWrite)
     {
@@ -2650,6 +3306,55 @@ internal static class ProxyFieldRewriter
         return new MemberRefUser(module, "op_Implicit", signature, declaringType);
     }
 
+    private static TypeRefUser CreateManagedListType(
+        ModuleDef module,
+        ModuleDef? managedBridgeModule)
+    {
+        var assemblyRef = module.CorLibTypes.AssemblyRef;
+        if (managedBridgeModule is not null)
+        {
+            var bridgeType = managedBridgeModule.Find(
+                "StArray.ModManager.Android.PcCompat.PcCompatCollectionBridge",
+                isReflectionName: false);
+            var bridgeMethod = bridgeType?.Methods.SingleOrDefault(
+                method => method.Name == "AddToBoundList" &&
+                          method.IsStatic &&
+                          method.GenericParameters.Count == 1);
+            var bridgeList = bridgeMethod?.MethodSig?.Params.FirstOrDefault() as GenericInstSig;
+            var managedListType = bridgeList?.GenericType.TypeDefOrRef;
+            var assemblyName = (managedListType?.Scope as AssemblyRef)?.Name?.String ??
+                               managedListType?.DefinitionAssembly?.Name?.String ??
+                               managedBridgeModule.GetAssemblyRefs()
+                                   .FirstOrDefault(candidate => string.Equals(
+                                       candidate.Name?.String,
+                                       "System.Collections",
+                                       StringComparison.OrdinalIgnoreCase))
+                                   ?.Name?.String;
+            if (string.IsNullOrWhiteSpace(assemblyName))
+            {
+                throw new InvalidDataException(
+                    "PcCompatCollectionBridge.AddToBoundList has no resolvable managed List assembly.");
+            }
+
+            assemblyRef = module.GetAssemblyRefs().FirstOrDefault(
+                              candidate => string.Equals(
+                                  candidate.Name?.String,
+                                  assemblyName,
+                                  StringComparison.OrdinalIgnoreCase)) ??
+                          new AssemblyRefUser(new AssemblyNameInfo(assemblyName));
+        }
+
+        // MOD input often names this type through its Unity-era mscorlib facade. The bridge is
+        // compiled against the runtime's actual List owner (System.Collections on .NET 10), so
+        // using module.CorLibTypes here would emit a call that looks identical in logs but cannot
+        // be resolved by CLR method binding.
+        return new TypeRefUser(
+            module,
+            "System.Collections.Generic",
+            "List`1",
+            assemblyRef);
+    }
+
     private static bool ListGetterMatchesField(MethodDef accessor, IField field, bool isWrite)
     {
         if (isWrite || field.FieldSig?.Type is not GenericInstSig expectedList ||
@@ -2665,19 +3370,36 @@ internal static class ProxyFieldRewriter
                TypeIdentity(expectedList.GenericArguments[0]) == TypeIdentity(proxyList.GenericArguments[0]);
     }
 
-    private static IMethod CreateListToManagedConverter(ModuleDef module, Importer importer, IField field)
+    private static IMethod CreateListToManagedConverter(
+        ModuleDef module,
+        Importer importer,
+        ModuleDef? managedBridgeModule,
+        IField field)
     {
         var expectedList = (GenericInstSig)field.FieldSig!.Type;
-        return CreateListToManagedConverter(module, importer, expectedList.GenericArguments[0]);
+        return CreateListToManagedConverter(
+            module,
+            importer,
+            managedBridgeModule,
+            expectedList.GenericArguments[0]);
     }
 
-    private static IMethod CreateListToManagedConverter(ModuleDef module, Importer importer, TypeSig expectedElement)
+    /// <param name="boundCopyMethod">
+    /// Set when the source member is a registered writable collection, so mutations on the returned
+    /// copy have to write through to the Il2Cpp original. Null selects the plain copying converter.
+    /// </param>
+    private static IMethod CreateListToManagedConverter(
+        ModuleDef module,
+        Importer importer,
+        ModuleDef? managedBridgeModule,
+        TypeSig expectedElement,
+        string? boundCopyMethod = null,
+        string? boundPropertyName = null)
     {
         var elementType = importer.Import(expectedElement);
         var methodVariable = new GenericMVar(0);
 
-        var corlib = module.CorLibTypes.AssemblyRef;
-        var managedListType = new TypeRefUser(module, "System.Collections.Generic", "List`1", corlib);
+        var managedListType = CreateManagedListType(module, managedBridgeModule);
         var managedList = new GenericInstSig(new ClassSig(managedListType), methodVariable);
 
         var il2CppMscorlib = module.GetAssemblyRefs().FirstOrDefault(
@@ -2698,11 +3420,194 @@ internal static class ProxyFieldRewriter
             "StArray.ModManager.Android.PcCompat",
             "PcCompatCollectionBridge",
             androidAssembly);
-        var signature = MethodSig.CreateStatic(managedList, il2CppList);
+        MethodSig signature;
+        if (boundCopyMethod is null)
+        {
+            signature = MethodSig.CreateStatic(managedList, il2CppList);
+        }
+        else
+        {
+            if (string.IsNullOrWhiteSpace(boundPropertyName))
+                throw new InvalidDataException("A bound collection converter requires a property name.");
+            var bridgeObject = managedBridgeModule is null
+                ? module.CorLibTypes.Object
+                : importer.Import(managedBridgeModule.CorLibTypes.Object);
+            var bridgeString = managedBridgeModule is null
+                ? module.CorLibTypes.String
+                : importer.Import(managedBridgeModule.CorLibTypes.String);
+            signature = MethodSig.CreateStatic(
+                managedList,
+                bridgeObject,
+                il2CppList,
+                bridgeString);
+        }
         signature.Generic = true;
         signature.GenParamCount = 1;
-        var genericMethod = new MemberRefUser(module, "CopyList", signature, bridgeType);
+        var genericMethod = new MemberRefUser(
+            module,
+            boundCopyMethod ?? "CopyList",
+            signature,
+            bridgeType);
         return new MethodSpecUser(genericMethod, new GenericInstMethodSig(elementType));
+    }
+
+    /// <summary>
+    /// Retargets a <c>List&lt;T&gt;</c> mutator to the write-through bridge of the same shape.
+    /// </summary>
+    /// <remarks>
+    /// The bridge takes the list as an ordinary leading argument, which is exactly the stack layout
+    /// <c>callvirt List&lt;T&gt;::Add</c> already produces, so the callsite needs no stack surgery -
+    /// only the operand and the opcode change.
+    /// </remarks>
+    private static IMethod CreateBoundListMutatorBridge(
+        ModuleDef module,
+        Importer importer,
+        ModuleDef? managedBridgeModule,
+        TypeSig elementType,
+        string bridgeType,
+        string bridgeMethod,
+        MethodSig sourceSignature)
+    {
+        var imported = importer.Import(elementType);
+        var methodVariable = new GenericMVar(0);
+        var managedList = new GenericInstSig(
+            new ClassSig(CreateManagedListType(module, managedBridgeModule)),
+            methodVariable);
+        var separator = bridgeType.LastIndexOf('.');
+        var androidAssembly = module.GetAssemblyRefs().FirstOrDefault(
+            assembly => assembly.Name == "StArray.ModManager.Android") ??
+            new AssemblyRefUser(new AssemblyNameInfo("StArray.ModManager.Android"));
+        var declaringType = new TypeRefUser(
+            module,
+            bridgeType[..separator],
+            bridgeType[(separator + 1)..],
+            androidAssembly);
+
+        // List<T>'s instance members encode T as GenericVar(!0), while the static bridge declares
+        // T as GenericMVar(!!0). Preserve the source shape, but translate every occurrence of the
+        // declaring type's !0 recursively so the emitted MemberRef binds to the host method.
+        var parameters = new List<TypeSig> { managedList };
+        parameters.AddRange(sourceSignature.Params.Select(parameter =>
+            ImportBoundListBridgeType(importer, parameter, methodVariable)));
+        var signature = MethodSig.CreateStatic(
+            ImportBoundListBridgeType(importer, sourceSignature.RetType, methodVariable),
+            parameters.ToArray());
+        signature.Generic = true;
+        signature.GenParamCount = 1;
+        return new MethodSpecUser(
+            new MemberRefUser(module, bridgeMethod, signature, declaringType),
+            new GenericInstMethodSig(imported));
+    }
+
+    private static TypeSig ImportBoundListBridgeType(
+        Importer importer,
+        TypeSig type,
+        GenericMVar methodVariable)
+    {
+        type = type.RemovePinnedAndModifiers();
+        return type switch
+        {
+            GenericVar { Number: 0 } => methodVariable,
+            SZArraySig array => new SZArraySig(
+                ImportBoundListBridgeType(importer, array.Next, methodVariable)),
+            ByRefSig byRef => new ByRefSig(
+                ImportBoundListBridgeType(importer, byRef.Next, methodVariable)),
+            PtrSig pointer => new PtrSig(
+                ImportBoundListBridgeType(importer, pointer.Next, methodVariable)),
+            GenericInstSig generic => new GenericInstSig(
+                generic.GenericType,
+                generic.GenericArguments
+                    .Select(argument => ImportBoundListBridgeType(importer, argument, methodVariable))
+                    .ToArray()),
+            _ => importer.Import(type)
+        };
+    }
+
+    /// <summary>
+    /// Matches a callsite against the writable-collection registry, by the property's getter.
+    /// </summary>
+    private static ManagedWritableCollectionSpec? MatchWritableCollectionGetter(
+        IReadOnlyList<ManagedWritableCollectionSpec> specs,
+        string assemblyName,
+        ITypeDefOrRef declaringType,
+        IMethod target)
+    {
+        if (specs.Count == 0)
+            return null;
+        var declaringName = SurfaceDeclaringTypeName(declaringType);
+        return specs.FirstOrDefault(spec =>
+            spec.SourceAssembly == assemblyName &&
+            spec.SourceType == declaringName &&
+            target.Name == "get_" + spec.SourceProperty);
+    }
+
+    /// <summary>
+    /// Retargets every <c>List&lt;T&gt;</c> mutator whose element type belongs to a registered
+    /// writable collection, so mutations on a bound copy reach Unity.
+    /// </summary>
+    /// <remarks>
+    /// Matching is by element type alone, deliberately. The bridges behave identically to the members
+    /// they replace when the list is not bound - the MOD's own lists keep working untouched - so
+    /// proving per callsite that the receiver came from the registered getter would cost a stack-flow
+    /// analysis and change no outcome. The narrowing that does matter is the element type: a
+    /// <c>List&lt;string&gt;</c> in the same method is left alone.
+    /// </remarks>
+    private static void CollectWritableCollectionMutations(
+        ModuleDef module,
+        Importer importer,
+        ModuleDef? managedBridgeModule,
+        Options options,
+        MethodDef method,
+        Instruction instruction,
+        List<ProxyCastRewritePlan> plans,
+        List<MethodCallRecord> methodCalls)
+    {
+        if (options.ManagedWritableCollections.Count == 0 ||
+            instruction.OpCode.Code is not (Code.Call or Code.Callvirt) ||
+            instruction.Operand is not IMethod target ||
+            target.DeclaringType is not TypeSpec { TypeSig: GenericInstSig listInstance } ||
+            listInstance.GenericType.TypeDefOrRef.FullName != "System.Collections.Generic.List`1" ||
+            listInstance.GenericArguments.Count != 1 ||
+            target.MethodSig is not { HasThis: true } sourceSignature)
+        {
+            return;
+        }
+
+        var elementType = listInstance.GenericArguments[0];
+        var elementIdentity = TypeIdentity(elementType);
+        foreach (var spec in options.ManagedWritableCollections)
+        {
+            if (spec.ElementType != elementIdentity)
+                continue;
+            var bridgeMethod = target.Name.String switch
+            {
+                "Add" => spec.AddMethod,
+                "Remove" => spec.RemoveMethod,
+                "Clear" => spec.ClearMethod,
+                "Insert" => spec.InsertMethod,
+                _ => null
+            };
+            if (bridgeMethod is null)
+                continue;
+
+            var bridge = CreateBoundListMutatorBridge(
+                module,
+                importer,
+                managedBridgeModule,
+                elementType,
+                spec.BridgeType,
+                bridgeMethod,
+                sourceSignature);
+            plans.Add(new ProxyCastRewritePlan(method, instruction, bridge));
+            methodCalls.Add(new MethodCallRecord(
+                method.FullName,
+                instruction.Offset,
+                instruction.OpCode.Name,
+                MethodIdentity(target),
+                $"writable-collection|{spec.SourceAssembly}|{spec.SourceType}|{spec.SourceProperty}",
+                bridge.FullName));
+            return;
+        }
     }
 
     private static string TypeIdentity(TypeSig type)
@@ -2751,6 +3656,7 @@ internal static class ProxyFieldRewriter
     private static ArgumentBridge? CreateMethodArgumentConverter(
         ModuleDef module,
         Importer importer,
+        ModuleDef? managedBridgeModule,
         MethodSig? proxySignature,
         MethodSig targetSignature)
     {
@@ -2777,6 +3683,21 @@ internal static class ProxyFieldRewriter
                 CreateDelegateArgumentConverter(
                     module,
                     importer,
+                    proxySignature.Params[index],
+                    targetSignature.Params[index]) ??
+                CreateArrayToIl2CppArgumentConverter(
+                    module,
+                    importer,
+                    proxySignature.Params[index],
+                    targetSignature.Params[index]) ??
+                CreateStringBuilderArgumentConverter(
+                    module,
+                    proxySignature.Params[index],
+                    targetSignature.Params[index]) ??
+                CreateListToIl2CppArgumentConverter(
+                    module,
+                    importer,
+                    managedBridgeModule,
                     proxySignature.Params[index],
                     targetSignature.Params[index]);
             if (converter is null)
@@ -2831,6 +3752,56 @@ internal static class ProxyFieldRewriter
             new GenericInstMethodSig(importer.Import(targetNullable.GenericArguments[0])));
     }
 
+    private static IMethod? CreateNullableToManagedConverter(
+        ModuleDef module,
+        Importer importer,
+        GenericInstSig proxyNullable,
+        GenericInstSig targetNullable)
+    {
+        if (proxyNullable.GenericArguments.Count != 1 ||
+            targetNullable.GenericArguments.Count != 1 ||
+            proxyNullable.GenericType.TypeDefOrRef.FullName != "Il2CppSystem.Nullable`1" ||
+            targetNullable.GenericType.TypeDefOrRef.FullName != "System.Nullable`1" ||
+            TypeIdentity(proxyNullable.GenericArguments[0]) !=
+            TypeIdentity(targetNullable.GenericArguments[0]))
+        {
+            return null;
+        }
+
+        var methodVariable = new GenericMVar(0);
+        var corlib = module.CorLibTypes.AssemblyRef;
+        var managedNullableType = new TypeRefUser(module, "System", "Nullable`1", corlib);
+        var managedNullable = new GenericInstSig(
+            new ValueTypeSig(managedNullableType),
+            methodVariable);
+        var il2CppMscorlib = module.GetAssemblyRefs().FirstOrDefault(
+            assembly => assembly.Name == "Il2Cppmscorlib") ??
+            new AssemblyRefUser(new AssemblyNameInfo("Il2Cppmscorlib"));
+        var il2CppNullableType = new TypeRefUser(
+            module,
+            "Il2CppSystem",
+            "Nullable`1",
+            il2CppMscorlib);
+        var il2CppNullable = new GenericInstSig(
+            new ClassSig(il2CppNullableType),
+            methodVariable);
+        var androidAssembly = module.GetAssemblyRefs().FirstOrDefault(
+            assembly => assembly.Name == "StArray.ModManager.Android") ??
+            new AssemblyRefUser(new AssemblyNameInfo("StArray.ModManager.Android"));
+        var bridgeType = new TypeRefUser(
+            module,
+            "StArray.ModManager.Android.PcCompat",
+            "PcCompatAbiBridge",
+            androidAssembly);
+        var signature = MethodSig.CreateStatic(managedNullable, il2CppNullable);
+        signature.Generic = true;
+        signature.GenParamCount = 1;
+        var genericMethod = new MemberRefUser(module, "ToManagedNullable", signature, bridgeType);
+        return new MethodSpecUser(
+            genericMethod,
+            new GenericInstMethodSig(importer.Import(targetNullable.GenericArguments[0])));
+    }
+
     private static IMethod? CreateDelegateArgumentConverter(
         ModuleDef module,
         Importer importer,
@@ -2848,6 +3819,76 @@ internal static class ProxyFieldRewriter
         }
 
         return CreateToIl2CppDelegateConverter(module, importer, proxyType);
+    }
+
+    /// <summary>
+    /// Converts a managed array argument to the Il2Cpp array wrapper the proxy expects, using the
+    /// <c>op_Implicit</c> the interop runtime already defines on each wrapper type.
+    /// </summary>
+    /// <remarks>
+    /// This is the mirror image of <see cref="CreateArrayToManagedConverter(ModuleDef, Importer, TypeSig)"/>,
+    /// which handles returns. All three wrapper types declare the managed-to-Il2Cpp direction, but on
+    /// the concrete type rather than on <c>Il2CppArrayBase`1</c>, and <c>Il2CppStringArray</c> is not
+    /// generic at all - hence the per-kind construction instead of one shared shape.
+    ///
+    /// <c>Il2CppReferenceArray`1</c> is deliberately not handled: a managed <c>T[]</c> of proxy
+    /// references would have to be element-wise unwrapped, and no audited callsite needs it. The
+    /// only reference-array parameter in the target MODs is <c>GUILayoutOption[]</c>, and the proxy
+    /// carries an overload that keeps it a managed array.
+    /// </remarks>
+    private static IMethod? CreateArrayToIl2CppArgumentConverter(
+        ModuleDef module,
+        Importer importer,
+        TypeSig proxyType,
+        TypeSig targetType)
+    {
+        if (targetType is not SZArraySig targetArray)
+            return null;
+
+        var runtimeAssembly = module.GetAssemblyRefs().FirstOrDefault(
+            assembly => assembly.Name == "Il2CppInterop.Runtime") ??
+            new AssemblyRefUser(new AssemblyNameInfo("Il2CppInterop.Runtime"));
+
+        if (TypeIdentity(proxyType) == "Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppStringArray")
+        {
+            if (TypeIdentity(targetArray.Next) != "System.String")
+                return null;
+            var stringArrayType = new TypeRefUser(
+                module,
+                "Il2CppInterop.Runtime.InteropTypes.Arrays",
+                "Il2CppStringArray",
+                runtimeAssembly);
+            var stringArraySig = new ClassSig(stringArrayType);
+            return new MemberRefUser(
+                module,
+                "op_Implicit",
+                MethodSig.CreateStatic(stringArraySig, new SZArraySig(module.CorLibTypes.String)),
+                stringArrayType);
+        }
+
+        if (proxyType is not GenericInstSig proxyArray ||
+            proxyArray.GenericArguments.Count != 1 ||
+            proxyArray.GenericType.TypeDefOrRef.FullName !=
+                "Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppStructArray`1" ||
+            TypeIdentity(proxyArray.GenericArguments[0]) != TypeIdentity(targetArray.Next))
+        {
+            return null;
+        }
+
+        var elementType = importer.Import(targetArray.Next);
+        var typeVariable = new GenericVar(0);
+        var structArrayType = new TypeRefUser(
+            module,
+            "Il2CppInterop.Runtime.InteropTypes.Arrays",
+            "Il2CppStructArray`1",
+            runtimeAssembly);
+        var declaringType = new TypeSpecUser(new GenericInstSig(new ClassSig(structArrayType), elementType));
+        var openSig = new GenericInstSig(new ClassSig(structArrayType), typeVariable);
+        return new MemberRefUser(
+            module,
+            "op_Implicit",
+            MethodSig.CreateStatic(openSig, new SZArraySig(typeVariable)),
+            declaringType);
     }
 
     private static IMethod CreateToIl2CppDelegateConverter(
@@ -2876,6 +3917,97 @@ internal static class ProxyFieldRewriter
         return new MethodSpecUser(
             genericMethod,
             new GenericInstMethodSig(importer.Import(proxyType)));
+    }
+
+    /// <summary>
+    /// Converts a managed <c>System.Text.StringBuilder</c> argument to the Il2Cpp one, via a host
+    /// helper. Unlike the array wrappers this pair has no <c>op_Implicit</c>, so a bridge method is
+    /// the only way to reach it.
+    /// </summary>
+    private static IMethod? CreateStringBuilderArgumentConverter(
+        ModuleDef module,
+        TypeSig proxyType,
+        TypeSig targetType)
+    {
+        if (TypeIdentity(targetType) != "System.Text.StringBuilder" ||
+            TypeIdentity(proxyType) != "Il2CppSystem.Text.StringBuilder")
+        {
+            return null;
+        }
+
+        var il2CppMscorlib = module.GetAssemblyRefs().FirstOrDefault(
+            assembly => assembly.Name == "Il2Cppmscorlib") ??
+            new AssemblyRefUser(new AssemblyNameInfo("Il2Cppmscorlib"));
+        var il2CppBuilder = new ClassSig(
+            new TypeRefUser(module, "Il2CppSystem.Text", "StringBuilder", il2CppMscorlib));
+        var managedBuilder = new ClassSig(
+            new TypeRefUser(module, "System.Text", "StringBuilder", module.CorLibTypes.AssemblyRef));
+        var androidAssembly = module.GetAssemblyRefs().FirstOrDefault(
+            assembly => assembly.Name == "StArray.ModManager.Android") ??
+            new AssemblyRefUser(new AssemblyNameInfo("StArray.ModManager.Android"));
+        var bridgeType = new TypeRefUser(
+            module,
+            "StArray.ModManager.Android.PcCompat",
+            "PcCompatAbiBridge",
+            androidAssembly);
+        return new MemberRefUser(
+            module,
+            "ToIl2CppStringBuilder",
+            MethodSig.CreateStatic(il2CppBuilder, managedBuilder),
+            bridgeType);
+    }
+
+    /// <summary>
+    /// Converts a managed <c>List&lt;T&gt;</c> argument to the Il2Cpp one, via a host helper. This is
+    /// the argument-side mirror of the <c>CopyList</c> return converter, so a property whose getter
+    /// is bridged one way has its setter bridged the other.
+    /// </summary>
+    private static IMethod? CreateListToIl2CppArgumentConverter(
+        ModuleDef module,
+        Importer importer,
+        ModuleDef? managedBridgeModule,
+        TypeSig proxyType,
+        TypeSig targetType)
+    {
+        if (proxyType is not GenericInstSig proxyList || targetType is not GenericInstSig targetList ||
+            proxyList.GenericArguments.Count != 1 || targetList.GenericArguments.Count != 1 ||
+            proxyList.GenericType.TypeDefOrRef.FullName !=
+                "Il2CppSystem.Collections.Generic.List`1" ||
+            targetList.GenericType.TypeDefOrRef.FullName != "System.Collections.Generic.List`1" ||
+            TypeIdentity(proxyList.GenericArguments[0]) != TypeIdentity(targetList.GenericArguments[0]))
+        {
+            return null;
+        }
+
+        var elementType = importer.Import(targetList.GenericArguments[0]);
+        var methodVariable = new GenericMVar(0);
+        var managedList = new GenericInstSig(
+            new ClassSig(CreateManagedListType(module, managedBridgeModule)),
+            methodVariable);
+        var il2CppMscorlib = module.GetAssemblyRefs().FirstOrDefault(
+            assembly => assembly.Name == "Il2Cppmscorlib") ??
+            new AssemblyRefUser(new AssemblyNameInfo("Il2Cppmscorlib"));
+        var il2CppList = new GenericInstSig(
+            new ClassSig(new TypeRefUser(
+                module,
+                "Il2CppSystem.Collections.Generic",
+                "List`1",
+                il2CppMscorlib)),
+            methodVariable);
+        var androidAssembly = module.GetAssemblyRefs().FirstOrDefault(
+            assembly => assembly.Name == "StArray.ModManager.Android") ??
+            new AssemblyRefUser(new AssemblyNameInfo("StArray.ModManager.Android"));
+        var bridgeType = new TypeRefUser(
+            module,
+            "StArray.ModManager.Android.PcCompat",
+            "PcCompatCollectionBridge",
+            androidAssembly);
+        var signature = MethodSig.CreateStatic(il2CppList, managedList);
+        signature.Generic = true;
+        signature.GenParamCount = 1;
+        return new MethodSpecUser(
+            new MemberRefUser(module, "ToIl2CppList", signature, bridgeType),
+            new GenericInstMethodSig(elementType));
     }
 
     private static DelegateConstructorRewrite? CreateUnityActionConstructorRewrite(
@@ -2941,13 +4073,32 @@ internal static class ProxyFieldRewriter
             body.Instructions.Insert(insertionIndex++, instruction);
     }
 
+    private static void InsertFieldArgumentConverter(RewritePlan plan)
+    {
+        var instruction = Instruction.Create(OpCodes.Call, plan.ArgumentConverter!);
+        InsertBeforeWithRetargeting(plan.Method.Body, plan.Instruction, instruction);
+    }
+
     private static IMethod? CreateMethodReturnConverter(
         ModuleDef module,
         Importer importer,
+        ModuleDef? managedBridgeModule,
         TypeSig? proxyReturn,
         TypeSig expectedReturn,
-        TypeSig? followingUnboxType)
+        TypeSig? followingUnboxType,
+        ManagedWritableCollectionSpec? writableCollection = null)
     {
+        if (proxyReturn is GenericInstSig proxyNullable &&
+            expectedReturn is GenericInstSig expectedNullable &&
+            CreateNullableToManagedConverter(
+                module,
+                importer,
+                proxyNullable,
+                expectedNullable) is { } nullableConverter)
+        {
+            return nullableConverter;
+        }
+
         if (proxyReturn is GenericInstSig proxyArray && expectedReturn is SZArraySig expectedArray &&
             proxyArray.GenericArguments.Count == 1 &&
             proxyArray.GenericType.TypeDefOrRef.FullName is (
@@ -2965,7 +4116,13 @@ internal static class ProxyFieldRewriter
             expectedList.GenericType.TypeDefOrRef.FullName == "System.Collections.Generic.List`1" &&
             TypeIdentity(proxyList.GenericArguments[0]) == TypeIdentity(expectedList.GenericArguments[0]))
         {
-            return CreateListToManagedConverter(module, importer, expectedList.GenericArguments[0]);
+            return CreateListToManagedConverter(
+                module,
+                importer,
+                managedBridgeModule,
+                expectedList.GenericArguments[0],
+                writableCollection?.BoundCopyMethod,
+                writableCollection?.SourceProperty);
         }
 
         if (proxyReturn?.FullName == "Il2CppSystem.Object" &&
@@ -2976,6 +4133,34 @@ internal static class ProxyFieldRewriter
         }
 
         return null;
+    }
+
+    private static IMethod? CreateFieldArgumentConverter(
+        ModuleDef module,
+        Importer importer,
+        ModuleDef? managedBridgeModule,
+        MethodSig? proxySignature,
+        TypeSig sourceFieldType)
+    {
+        if (proxySignature is null ||
+            proxySignature.Params.Count != 1 ||
+            proxySignature.RetType.ElementType != ElementType.Void)
+        {
+            return null;
+        }
+
+        // A field store leaves [receiver, value] on the stack. Model the source field as a normal
+        // instance setter so the callsite converter inventory stays shared with method calls.
+        var sourceSignature = MethodSig.CreateInstance(
+            module.CorLibTypes.Void,
+            importer.Import(sourceFieldType));
+        return CreateMethodArgumentConverter(
+                   module,
+                   importer,
+                   managedBridgeModule,
+                   proxySignature,
+                   sourceSignature)
+               ?.Converter;
     }
 
     private static TypeSig? GetFollowingUnboxType(
@@ -3062,7 +4247,11 @@ internal static class ProxyFieldRewriter
     {
         var sources = spec.BridgeGenericArgumentsFromSourceParameters;
         if (sources is null)
+        {
+            if (spec.EraseBridgeGenericArity)
+                return importer.Import(candidate);
             return ImportProxyMethod(importer, candidate, sourceMethodSpec);
+        }
 
         var arguments = new TypeSig[sources.Count];
         for (var index = 0; index < sources.Count; index++)
@@ -3206,6 +4395,65 @@ public sealed record ManagedBridgeRewriteSpec(
     string? AppendOwnerId = null,
     bool AppendCallsiteToken = false);
 
+/// <summary>
+/// Declares a proxy property whose collection the MOD mutates in place, so the getter must hand back
+/// a copy bound to the Il2Cpp original instead of a detached one.
+/// </summary>
+/// <remarks>
+/// <para>
+/// The plain <c>CopyList</c> return converter is correct for read-only collections and wrong for this
+/// one: <c>font.fallbackFontAssetTable.Add(cjk)</c> appends to a copy nobody reads, so the fallback
+/// silently never applies. Registering the property switches its getter to <c>CopyBoundList</c> and
+/// retargets <c>List&lt;T&gt;</c> mutators of the matching element type to write-through bridges.
+/// </para>
+/// <para>
+/// Registration is per element type rather than per callsite because the bridges are faithful
+/// stand-ins for the members they replace - an unbound list is simply mutated in place. That removes
+/// the need to prove, per mutator callsite, that the receiver came from this getter, which would take
+/// a stack-flow analysis for no behavioural gain.
+/// </para>
+/// </remarks>
+public sealed record ManagedWritableCollectionSpec(
+    string SourceAssembly,
+    string SourceType,
+    string SourceProperty,
+    string ElementType,
+    string BridgeType,
+    string BoundCopyMethod,
+    string AddMethod,
+    string RemoveMethod,
+    string ClearMethod,
+    string InsertMethod);
+
+/// <summary>
+/// Declares a MOD component type whose inheritance chain is allowed to pass through a generated proxy
+/// module, because a registered native hook forwards a render callback to it.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Without a registration, <see cref="ManagedCallGenericArgumentFilter.ModOwnedMonoBehaviour"/>
+/// requires every link of the base chain to live in a MOD-owned module, so
+/// <c>AddComponent&lt;RainGraphic&gt;</c> is refused: <c>MaskableGraphic</c> is a proxy type. That
+/// constraint is deliberate - Unity would have to instantiate and call back a type absent from the
+/// IL2CPP class table - so it is lifted per type rather than in general.
+/// </para>
+/// <para>
+/// <paramref name="BaseType"/> is checked, not assumed. A MOD update that reparents the type to a
+/// different proxy class must fail closed rather than bind its instance to the wrong host component.
+/// </para>
+/// </remarks>
+/// <param name="ConstructorNoOpBaseCall">
+/// Blanks the <c>call BaseType::.ctor()</c> in the component's own constructor. The bridge binds the
+/// managed shell to an already-constructed host instance, so letting that call through would run the
+/// native base constructor a second time on a live object.
+/// </param>
+public sealed record ManagedRenderComponentSpec(
+    string ComponentAssembly,
+    string ComponentType,
+    string BaseAssembly,
+    string BaseType,
+    bool ConstructorNoOpBaseCall = true);
+
 public enum ManagedCallInstanceForwarding
 {
     None,
@@ -3216,7 +4464,8 @@ public enum ManagedCallGenericArgumentFilter
 {
     Any,
     ModuleLocalMonoBehaviour,
-    ModOwnedMonoBehaviour
+    ModOwnedMonoBehaviour,
+    ModOwnedOrProxyComponent
 }
 
 public sealed record ManagedCallBridgeRewriteSpec(
@@ -3239,7 +4488,26 @@ public sealed record ManagedCallBridgeRewriteSpec(
     string? ErasedType = null,
     bool AppendCallsiteToken = false,
     string? AppendOwnerId = null,
-    bool AllowUnproxiedSource = false);
+    bool AllowUnproxiedSource = false,
+    // Constructor sources match `newobj` instead of `call`/`callvirt`. Replacing
+    // `newobj T::.ctor(args)` with `call Bridge(args) : object` keeps the stack balanced
+    // (both pop the args and push one reference), and the existing AllowObjectReturnCast
+    // path inserts the castclass back to T.
+    bool SourceIsConstructor = false,
+    // Lets one non-generic bridge serve a generic source overload. The generic argument only
+    // selects which Unity type is produced; the bridge takes and returns object and the
+    // existing AllowObjectReturnCast path restores the concrete type at the callsite.
+    bool EraseBridgeGenericArity = false,
+    // Struct-valued Unity properties (Vector2, Color, ...) cannot be forwarded to a bridge that
+    // takes `object` by a reference conversion, and their proxy struct types are only known at
+    // runtime so no bridge can name them. These two flags box on the way in and unbox on the way
+    // out, letting the bridge store and replay the value opaquely.
+    //
+    // Boxing is restricted to the LAST source parameter: `box` has to run while the value is on
+    // top of the stack, and spilling trailing arguments to locals to reach an earlier one is not
+    // worth the IL for any audited callsite.
+    bool BoxLastValueTypeArgument = false,
+    bool AllowValueTypeReturnUnbox = false);
 
 public sealed record ManagedFieldConstantRewriteSpec(
     string SourceAssembly,
@@ -3293,7 +4561,8 @@ internal sealed record RewritePlan(
     MethodDef Method,
     Instruction Instruction,
     IMethod Accessor,
-    IMethod? ArrayConverter,
+    IMethod? ArgumentConverter,
+    IMethod? ReturnConverter,
     RewriteRecord Record);
 
 internal sealed record FieldConstantRewritePlan(
@@ -3306,7 +4575,9 @@ internal sealed record MethodRewritePlan(
     IMethod ProxyMethod,
     int ArgumentIndex,
     IMethod? ArgumentConverter,
-    IMethod? ReturnConverter);
+    IMethod? ReturnConverter,
+    bool DuplicateInstanceForReturnConverter = false,
+    string? ReturnConverterStringArgument = null);
 
 internal sealed record ManagedBridgeRewritePlan(
     MethodDef Method,
@@ -3315,7 +4586,11 @@ internal sealed record ManagedBridgeRewritePlan(
     int DroppedArguments,
     ITypeDefOrRef? ReturnCastType,
     int? AppendedInt32 = null,
-    string? AppendedString = null);
+    string? AppendedString = null,
+    // Struct argument boxed on the way into an `object` bridge parameter (last argument only).
+    ITypeDefOrRef? BoxArgumentType = null,
+    // Struct return unboxed on the way out of an `object` bridge return.
+    ITypeDefOrRef? ReturnUnboxType = null);
 
 internal sealed record ProxyCastRewritePlan(
     MethodDef Method,
@@ -3348,7 +4623,13 @@ internal sealed record OpaqueTypeErasurePlan(
     IReadOnlyList<MethodDef> Returns,
     IReadOnlyList<(MethodDef Method, int Index)> Parameters,
     IReadOnlyList<(MethodDef Method, Local Local)> Locals,
-    IReadOnlyList<(MethodDef Method, Instruction Instruction)> TypeInstructions);
+    IReadOnlyList<(MethodDef Method, Instruction Instruction)> TypeInstructions,
+    IReadOnlyList<OpaqueOperatorRewritePlan> OperatorRewrites);
+
+internal sealed record OpaqueOperatorRewritePlan(
+    MethodDef Method,
+    Instruction Instruction,
+    IMethod BridgeMethod);
 
 internal readonly record struct ArgumentBridge(int ParameterIndex, IMethod Converter);
 
@@ -3365,7 +4646,8 @@ internal enum ManagedCallFilterResult
 
 public static class ModAssemblyRewriteApi
 {
-    public const string FormatVersion = "xphorror.pcmod-proxy-rewrite.v18-external-valuetype-kind";
+    public const string FormatVersion =
+        "xphorror.pcmod-proxy-rewrite.v22-proxy-component-query-filter";
 
     public static RewriteReport Rewrite(
         string inputPath,
@@ -3381,7 +4663,9 @@ public static class ModAssemblyRewriteApi
         IReadOnlyList<ManagedFieldConstantRewriteSpec>? managedFieldConstantRewrites = null,
         ManagedReadProgressGuardSpec? managedReadProgressGuard = null,
         ManagedPollingWaitRewriteSpec? managedPollingWaitRewrite = null,
-        ManagedOptionalDelegateRewriteSpec? managedOptionalDelegateRewrite = null)
+        ManagedOptionalDelegateRewriteSpec? managedOptionalDelegateRewrite = null,
+        IReadOnlyList<ManagedWritableCollectionSpec>? managedWritableCollections = null,
+        IReadOnlyList<ManagedRenderComponentSpec>? managedRenderComponents = null)
     {
         var options = Options.Create(
             inputPath,
@@ -3397,7 +4681,9 @@ public static class ModAssemblyRewriteApi
             managedFieldConstantRewrites,
             managedReadProgressGuard,
             managedPollingWaitRewrite,
-            managedOptionalDelegateRewrite);
+            managedOptionalDelegateRewrite,
+            managedWritableCollections,
+            managedRenderComponents);
         var report = ProxyFieldRewriter.Rewrite(options);
         Directory.CreateDirectory(Path.GetDirectoryName(options.ReportPath)!);
         File.WriteAllText(
@@ -3425,6 +4711,10 @@ internal sealed class Options
         Array.Empty<ManagedCallBridgeRewriteSpec>();
     public IReadOnlyList<ManagedFieldConstantRewriteSpec> ManagedFieldConstantRewrites { get; init; } =
         Array.Empty<ManagedFieldConstantRewriteSpec>();
+    public IReadOnlyList<ManagedWritableCollectionSpec> ManagedWritableCollections { get; init; } =
+        Array.Empty<ManagedWritableCollectionSpec>();
+    public IReadOnlyList<ManagedRenderComponentSpec> ManagedRenderComponents { get; init; } =
+        Array.Empty<ManagedRenderComponentSpec>();
     public ManagedProxyCastBridgeSpec? ManagedProxyCastBridge { get; init; }
     public ManagedReadProgressGuardSpec? ManagedReadProgressGuard { get; init; }
     public ManagedPollingWaitRewriteSpec? ManagedPollingWaitRewrite { get; init; }
@@ -3478,7 +4768,9 @@ internal sealed class Options
         IReadOnlyList<ManagedFieldConstantRewriteSpec>? managedFieldConstantRewrites = null,
         ManagedReadProgressGuardSpec? managedReadProgressGuard = null,
         ManagedPollingWaitRewriteSpec? managedPollingWaitRewrite = null,
-        ManagedOptionalDelegateRewriteSpec? managedOptionalDelegateRewrite = null)
+        ManagedOptionalDelegateRewriteSpec? managedOptionalDelegateRewrite = null,
+        IReadOnlyList<ManagedWritableCollectionSpec>? managedWritableCollections = null,
+        IReadOnlyList<ManagedRenderComponentSpec>? managedRenderComponents = null)
     {
         input = Path.GetFullPath(input);
         proxies = Path.GetFullPath(proxies);
@@ -3497,9 +4789,14 @@ internal sealed class Options
                                  Array.Empty<ManagedCallBridgeRewriteSpec>();
         var fieldConstantRewrites = managedFieldConstantRewrites?.ToArray() ??
                                     Array.Empty<ManagedFieldConstantRewriteSpec>();
+        var writableCollections = managedWritableCollections?.ToArray() ??
+                                  Array.Empty<ManagedWritableCollectionSpec>();
+        var renderComponents = managedRenderComponents?.ToArray() ??
+                               Array.Empty<ManagedRenderComponentSpec>();
         if (bridgeRewrites.Length != 0 || callBridgeRewrites.Length != 0 ||
             managedProxyCastBridge is not null || managedReadProgressGuard is not null ||
-            managedPollingWaitRewrite is not null || managedOptionalDelegateRewrite is not null)
+            managedPollingWaitRewrite is not null || managedOptionalDelegateRewrite is not null ||
+            writableCollections.Length != 0)
         {
             if (string.IsNullOrWhiteSpace(managedBridgeAssemblyPath))
                 throw new InvalidOperationException("Managed bridge rewrites require a bridge assembly path.");
@@ -3520,6 +4817,8 @@ internal sealed class Options
             ManagedBridgeRewrites = bridgeRewrites,
             ManagedCallBridgeRewrites = callBridgeRewrites,
             ManagedFieldConstantRewrites = fieldConstantRewrites,
+            ManagedWritableCollections = writableCollections,
+            ManagedRenderComponents = renderComponents,
             ManagedProxyCastBridge = managedProxyCastBridge,
             ManagedReadProgressGuard = managedReadProgressGuard,
             ManagedPollingWaitRewrite = managedPollingWaitRewrite,

@@ -232,6 +232,14 @@ public static class ResourceIrBinary
                     asset.Prefab != null || asset.CloneCapabilityAsset)
                     return Fail($"Alpha8 texture resource is invalid: {asset.Id}", out error);
                 break;
+            case ResourceIrMaterializationKind.FontFromFile:
+                if (!ValidId(asset.PayloadId, 128) || !payloadIds.Contains(asset.PayloadId) ||
+                    asset.Compatibility == ResourceIrCompatibility.Unsupported ||
+                    asset.CapabilityStableId.Length != 0 || asset.Texture != null ||
+                    asset.Sprite != null || asset.Material != null || asset.TmpFont != null ||
+                    asset.Prefab != null || asset.CloneCapabilityAsset)
+                    return Fail($"font file resource is invalid: {asset.Id}", out error);
+                break;
             case ResourceIrMaterializationKind.SpriteFromTexture:
                 if (asset.PayloadId.Length != 0 || asset.Texture != null || asset.Material != null ||
                     asset.TmpFont != null ||

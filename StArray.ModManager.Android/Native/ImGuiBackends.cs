@@ -2,6 +2,32 @@
 
 namespace StArray.ModManager.Android.Native;
 
+[Flags]
+public enum ImGuiImeStateFlags
+{
+    None = 0,
+    ContextReady = 1 << 0,
+    WantTextInput = 1 << 1,
+    TextInputActive = 1 << 2,
+    WantTextInputNextFrame = 1 << 3
+}
+
+public readonly record struct ImGuiImeState(
+    ImGuiImeStateFlags Flags,
+    uint ActiveId,
+    uint InputTextId,
+    ulong TouchDownSequence)
+{
+    public bool ContextReady => (Flags & ImGuiImeStateFlags.ContextReady) != 0;
+
+    public bool TextInputActive => (Flags & ImGuiImeStateFlags.TextInputActive) != 0;
+
+    public bool ImeRequested =>
+        (Flags & (ImGuiImeStateFlags.WantTextInput |
+                  ImGuiImeStateFlags.TextInputActive |
+                  ImGuiImeStateFlags.WantTextInputNextFrame)) != 0;
+}
+
 /// <summary>
 /// ImGui Android Backend (imgui_impl_android.cpp)
 /// </summary>
@@ -21,6 +47,32 @@ public static class ImGuiImplAndroid
 
     [DllImport("starray_modmanager", EntryPoint = "modmanager_imgui_drain_forwarded_motion_events")]
     public static extern int DrainForwardedMotionEvents();
+
+    [DllImport("starray_modmanager", EntryPoint = "modmanager_imgui_drain_observed_text_glyphs")]
+    private static extern unsafe int DrainObservedTextGlyphsNative(
+        ushort* output,
+        uint capacity);
+
+    public static unsafe int DrainObservedTextGlyphs(Span<ushort> output)
+    {
+        fixed (ushort* pointer = output)
+            return DrainObservedTextGlyphsNative(pointer, (uint)output.Length);
+    }
+
+    [DllImport("starray_modmanager", EntryPoint = "modmanager_imgui_get_ime_state")]
+    private static extern int GetImeStateNative(
+        out uint activeId,
+        out uint inputTextId,
+        out ulong touchDownSequence);
+
+    public static ImGuiImeState GetImeState()
+    {
+        var flags = (ImGuiImeStateFlags)GetImeStateNative(
+            out var activeId,
+            out var inputTextId,
+            out var touchDownSequence);
+        return new ImGuiImeState(flags, activeId, inputTextId, touchDownSequence);
+    }
 }
 
 /// <summary>
@@ -45,6 +97,12 @@ public static class ImGuiImplOpenGL3
 
     [DllImport("starray_modmanager", EntryPoint = "ImGui_ImplOpenGL3_DestroyFontsTexture")]
     public static extern void DestroyFontsTexture();
+
+    public static bool RecreateFontsTexture()
+    {
+        DestroyFontsTexture();
+        return CreateFontsTexture();
+    }
 
     [DllImport("starray_modmanager", EntryPoint = "ImGui_ImplOpenGL3_CreateDeviceObjects")]
     public static extern bool CreateDeviceObjects();
@@ -93,6 +151,15 @@ public static class ImGuiImplVulkan
 
     [DllImport("starray_modmanager", EntryPoint = "ImGui_ImplVulkan_DestroyFontsTexture")]
     public static extern void DestroyFontsTexture();
+
+    public static bool RecreateFontsTexture()
+    {
+        // CreateFontsTexture() does not replace the backend-owned upload
+        // resources when the atlas pointer is reused. Dispose the old upload
+        // before creating the descriptor/image for the rebuilt atlas.
+        DestroyFontsTexture();
+        return CreateFontsTexture();
+    }
 
     [DllImport("starray_modmanager", EntryPoint = "ImGui_ImplVulkan_SetMinImageCount")]
     public static extern void SetMinImageCount(uint minImageCount);

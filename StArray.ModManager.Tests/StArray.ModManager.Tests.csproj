@@ -21,19 +21,43 @@
         <Using Include="NUnit.Framework"/>
     </ItemGroup>
 
+    <ItemGroup Condition="'$(SkipWindowsNativeTests)' == 'true'">
+        <Compile Remove="HookTests.cs" />
+    </ItemGroup>
+
     <ItemGroup>
+        <ProjectReference Include="..\StArray.ModManager.Windows\StArray.ModManager.Windows.csproj"
+                          Condition="'$(SkipWindowsNativeTests)' != 'true'" />
         <ProjectReference Include="..\StArray.ModManager\StArray.ModManager.csproj" />
+        <ProjectReference Include="..\StArray.ModManager.Android\StArray.ModManager.Android.csproj" />
         <!-- Harmony aggregation fixtures annotate themselves with the real shim attributes, so the
              reference is explicit instead of transitive through JALib. -->
         <ProjectReference Include="..\xphorror.PcModCompat\shims\0Harmony\0Harmony.csproj" />
         <ProjectReference Include="..\xphorror.PcModCompat\shims\JALib\JALib.csproj" />
         <ProjectReference Include="..\xphorror.PcModCompat\shims\UnityEngine.CoreModule\UnityEngine.CoreModule.csproj" />
+        <!-- The render-component fixtures declare a stand-in that derives the real MaskableGraphic and
+             overrides OnPopulateMesh(VertexHelper), because the render component registry matches on
+             the exact type name and offers no test injection seam. -->
+        <ProjectReference Include="..\xphorror.PcModCompat\shims\UnityEngine.UI\UnityEngine.UI.csproj" />
         <ProjectReference Include="..\xphorror.PcModCompat\tools\ModAssemblyRewriter\ModAssemblyRewriter.csproj" />
+        <ProjectReference Include="..\xphorror.PcModCompat\tools\CilSemanticPack\CilSemanticPack.csproj" />
         <ProjectReference Include="..\xphorror.PcModCompat\tools\ProxySurfaceScanner\ProxySurfaceScanner.csproj" />
         <ProjectReference Include="..\xphorror.PcModCompat\Resources\xphorror.PcModCompat.Resources.csproj" />
         <ProjectReference Include="..\StArray.ModManager.SourceGenerator\StArray.ModManager.SourceGenerator.csproj"
                           OutputItemType="Analyzer"
                           ReferenceOutputAssembly="false" />
     </ItemGroup>
+
+    <!-- ─── GCC 编译 test_native.c → test_native.dll ─── -->
+    <Target Name="BuildNativeTestDll" BeforeTargets="BeforeBuild" Condition="'$(SkipNativeTestDll)' != 'true'">
+        <PropertyGroup>
+            <NativeSource>$(MSBuildProjectDirectory)\native\test_native.c</NativeSource>
+            <NativeOutput>$(OutputPath)test_native.dll</NativeOutput>
+            <_Gcc>gcc</_Gcc>
+        </PropertyGroup>
+        <Exec Command="&quot;$(_Gcc)&quot; -shared -O2 -Wall -Werror -o &quot;$(NativeOutput)&quot; &quot;$(NativeSource)&quot;"
+              ConsoleToMSBuild="true" />
+        <Message Text="test_native.dll compiled" Importance="high" />
+    </Target>
 
 </Project>

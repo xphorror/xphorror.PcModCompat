@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using StArray.ModManager.Manager;
@@ -17,25 +18,53 @@ public static class PcCompatDobbyBridge
     private static bool s_started;
     private static bool s_syncing;
     private static bool s_syncRequested;
-    private static int s_reverseSnapshotRefreshActive;
-    private static uint s_reverseSnapshotGeneration;
-    private static bool s_reverseSnapshotRefreshFailed;
     private static readonly Dictionary<string, HashSet<string>> LoadedRuntimeRulePathsByMod =
         new(StringComparer.OrdinalIgnoreCase);
 
-    private static uint s_hitMarginsNativeGeneration;
-    private static nint s_hitMarginsTrackerPointer;
+    private static readonly ConcurrentDictionary<ReversePatchSessionKey, ReversePatchRefreshState>
+        ReversePatchStates = new();
+    private static readonly ReversePatchRefreshState UnscopedReversePatchState = new();
     private static bool s_hitMarginsStructuralFailure;
     private static long s_hitMarginsRefreshAttempts;
     private static long s_hitMarginsRefreshSuccesses;
     private static long s_hitMarginsRefreshFailures;
     private static long s_hitMarginsRefreshSkips;
     private static long s_hitMarginsRefreshThrottled;
-    private static long s_hitMarginsLastSuccessTimestamp;
-    private static long s_hitMarginsNextFallbackTimestamp;
-    private static int s_hitMarginsLastLength;
-    private static int s_hitMarginsLastChecksum;
-    private static string s_hitMarginsLastIssue = "none";
+
+    private readonly record struct ReversePatchSessionKey(
+        string ModId,
+        long ResourceSessionGeneration);
+
+    private sealed class ReversePatchRefreshState
+    {
+        public int SnapshotRefreshActive;
+        public uint SnapshotGeneration;
+        public int SnapshotRefreshFailed;
+        public uint HitMarginsNativeGeneration;
+        public nint HitMarginsTrackerPointer;
+        public long HitMarginsLastSuccessTimestamp;
+        public long HitMarginsNextFallbackTimestamp;
+        public int HitMarginsLastLength;
+        public int HitMarginsLastChecksum;
+        public string HitMarginsLastIssue = "none";
+    }
+
+    private static ReversePatchRefreshState GetReversePatchState(out string? modId)
+    {
+        var execution = PcCompatManagedExecutionContext.Current;
+        if (execution is null || string.IsNullOrWhiteSpace(execution.ModId))
+        {
+            modId = null;
+            return UnscopedReversePatchState;
+        }
+
+        modId = execution.ModId;
+        return ReversePatchStates.GetOrAdd(
+            new ReversePatchSessionKey(
+                execution.ModId,
+                execution.ResourceSessionGeneration),
+            static _ => new ReversePatchRefreshState());
+    }
 
     public static void Install()
     {
@@ -48,7 +77,8 @@ public static class PcCompatDobbyBridge
 
         PcCompatOverlayRuntime.RegisterProvider(
             PcCompatNativeHookRules.GetOverlaySnapshot,
-            PcCompatNativeHookRules.GetOverlayVisible);
+            PcCompatNativeHookRules.GetOverlayVisible,
+            ownerProvider: PcCompatNativeHookRules.GetOverlaySnapshot);
         PcCompatInputHudRuntime.RegisterProvider(PcCompatNativeHookRules.GetInputHudSnapshot);
         PcCompatInputOriginRuntime.RegisterProvider(PcCompatNativeHookRules.GetInputOrigin);
         PcCompatKeyViewerEventRuntime.RegisterProvider(PcCompatNativeHookRules.ReadRawInputEvents);
@@ -204,6 +234,14 @@ public static class PcCompatDobbyBridge
 
         foreach (var bundle in bundles)
         {
+            if (!PcCompatRuntime.IsPcModSessionActive(bundle.ModId))
+            {
+                RetireRuntimeRuleBundlesCore(bundle.ModId);
+                Logger.Warn(
+                    LogTag,
+                    $"runtime rule bundle blocked by inactive PC MOD session mod={bundle.ModId}");
+                continue;
+            }
             if (string.IsNullOrWhiteSpace(bundle.RecipePath) && string.IsNullOrWhiteSpace(bundle.RulesPath))
                 continue;
 
@@ -334,22 +372,26 @@ public static class PcCompatDobbyBridge
 
     private static void RefreshReversePatchSnapshot()
     {
-        if (s_reverseSnapshotRefreshFailed ||
-            Interlocked.Exchange(ref s_reverseSnapshotRefreshActive, 1) != 0)
+        var state = GetReversePatchState(out var modId);
+        if (Volatile.Read(ref state.SnapshotRefreshFailed) != 0 ||
+            Interlocked.Exchange(ref state.SnapshotRefreshActive, 1) != 0)
             return;
 
         try
         {
-            var overlay = PcCompatNativeHookRules.GetOverlaySnapshot();
+            // Reverse patches expose official game facts. Do not read the current
+            // MOD's HUD reducer here: a consumer may have no visible overlay, and
+            // borrowing another owner would leak its private presentation state.
+            var overlay = PcCompatNativeHookRules.GetSharedGameSnapshot();
             if (!overlay.ProviderAvailable)
                 return;
 
-            var previousGeneration = Volatile.Read(ref s_reverseSnapshotGeneration);
+            var previousGeneration = Volatile.Read(ref state.SnapshotGeneration);
             if (previousGeneration == overlay.Generation)
                 return;
 
-            RefreshHitMarginsCountThrottled();
-            var tracker = s_hitMarginsTrackerPointer;
+            RefreshHitMarginsCountThrottled(state);
+            var tracker = state.HitMarginsTrackerPointer;
 
             if (tracker != nint.Zero)
             {
@@ -359,28 +401,28 @@ public static class PcCompatDobbyBridge
                     overlay.PercentXAcc);
             }
 
-            PcCompatReversePatchBridge.PublishSnapshot(new PcCompatGameSnapshot
-            {
-                PlanetSpeed = overlay.PlanetSpeed,
-                PercentAcc = overlay.AccuracySnapshotCount == 0 ? 0f : overlay.PercentAcc,
-                PercentXAcc = overlay.AccuracySnapshotCount == 0 ? 0f : overlay.PercentXAcc,
-                Progress = overlay.Progress,
-                ComboCount = overlay.ComboCount,
-                AttemptCount = overlay.AttemptCount,
-                TileBpm = overlay.TileBpm,
-                Kps = overlay.Kps,
-                PlayerCount = Math.Max(1, overlay.PlayerCount)
-            });
-            Volatile.Write(ref s_reverseSnapshotGeneration, overlay.Generation);
+            var execution = PcCompatManagedExecutionContext.Current;
+            if (execution is null || execution.ResourceSessionGeneration <= 0)
+                return;
+            var snapshot = PcCompatGameSnapshot.FromOverlay(
+                overlay,
+                execution.ResourceSessionGeneration);
+            if (snapshot.ValidFields == PcCompatGameSnapshotFields.None)
+                return;
+            PcCompatReversePatchBridge.PublishSnapshot(snapshot);
+            Volatile.Write(ref state.SnapshotGeneration, overlay.Generation);
         }
         catch (Exception ex)
         {
-            s_reverseSnapshotRefreshFailed = true;
-            Logger.Error(LogTag, $"native reverse-patch snapshot refresh disabled after failure: {ex}");
+            Volatile.Write(ref state.SnapshotRefreshFailed, 1);
+            Logger.Error(
+                LogTag,
+                "native reverse-patch snapshot refresh disabled after failure " +
+                $"mod={modId ?? "<unscoped>"}: {ex}");
         }
         finally
         {
-            Volatile.Write(ref s_reverseSnapshotRefreshActive, 0);
+            Volatile.Write(ref state.SnapshotRefreshActive, 0);
         }
     }
 
@@ -389,12 +431,15 @@ public static class PcCompatDobbyBridge
     // native generation changes. This keeps checkpoint mutations visible without proxy
     // construction, reflection, boxing, or per-element object[] allocations.
     private static void RefreshHitMarginsCount()
+        => RefreshHitMarginsCount(GetReversePatchState(out _));
+
+    private static void RefreshHitMarginsCount(ReversePatchRefreshState state)
     {
         Interlocked.Increment(ref s_hitMarginsRefreshAttempts);
         if (s_hitMarginsStructuralFailure)
         {
             Interlocked.Increment(ref s_hitMarginsRefreshSkips);
-            Volatile.Write(ref s_hitMarginsLastIssue, "native-abi-fuse");
+            Volatile.Write(ref state.HitMarginsLastIssue, "native-abi-fuse");
             return;
         }
 
@@ -402,7 +447,7 @@ public static class PcCompatDobbyBridge
         {
             Span<int> counts = stackalloc int[PcCompatNativeHookRules.HitMarginSnapshotMaxCounts];
             if (!PcCompatNativeHookRules.TryReadHitMarginSnapshot(
-                    Volatile.Read(ref s_hitMarginsNativeGeneration),
+                    Volatile.Read(ref state.HitMarginsNativeGeneration),
                     counts,
                     out var generation,
                     out var changed,
@@ -412,74 +457,77 @@ public static class PcCompatDobbyBridge
                     out var tracker))
             {
                 Interlocked.Increment(ref s_hitMarginsRefreshFailures);
-                Volatile.Write(ref s_hitMarginsLastIssue, "native-read-unavailable");
+                Volatile.Write(ref state.HitMarginsLastIssue, "native-read-unavailable");
                 return;
             }
 
-            s_hitMarginsTrackerPointer = tracker;
+            state.HitMarginsTrackerPointer = tracker;
             if (changed)
             {
-                Volatile.Write(ref s_hitMarginsNativeGeneration, generation);
+                Volatile.Write(ref state.HitMarginsNativeGeneration, generation);
                 if (!valid)
                 {
                     PcCompatReversePatchBridge.ClearHitMarginsCount();
-                    Volatile.Write(ref s_hitMarginsLastLength, 0);
-                    Volatile.Write(ref s_hitMarginsLastChecksum, 0);
+                    Volatile.Write(ref state.HitMarginsLastLength, 0);
+                    Volatile.Write(ref state.HitMarginsLastChecksum, 0);
                 }
                 else
                 {
                     PcCompatReversePatchBridge.PublishHitMarginsCount(counts[..length]);
-                    Volatile.Write(ref s_hitMarginsLastLength, length);
-                    Volatile.Write(ref s_hitMarginsLastChecksum, checksum);
+                    Volatile.Write(ref state.HitMarginsLastLength, length);
+                    Volatile.Write(ref state.HitMarginsLastChecksum, checksum);
                 }
             }
             Interlocked.Increment(ref s_hitMarginsRefreshSuccesses);
             var now = Stopwatch.GetTimestamp();
-            Volatile.Write(ref s_hitMarginsLastSuccessTimestamp, now);
+            Volatile.Write(ref state.HitMarginsLastSuccessTimestamp, now);
             Volatile.Write(
-                ref s_hitMarginsNextFallbackTimestamp,
+                ref state.HitMarginsNextFallbackTimestamp,
                 now + HitMarginsFallbackRefreshIntervalTicks);
-            Volatile.Write(ref s_hitMarginsLastIssue, "none");
+            Volatile.Write(ref state.HitMarginsLastIssue, "none");
         }
         catch (Exception ex)
         {
             Interlocked.Increment(ref s_hitMarginsRefreshFailures);
-            s_hitMarginsTrackerPointer = nint.Zero;
+            state.HitMarginsTrackerPointer = nint.Zero;
             s_hitMarginsStructuralFailure = ex is EntryPointNotFoundException or MarshalDirectiveException;
-            Volatile.Write(ref s_hitMarginsLastIssue, $"{ex.GetType().Name}:{ex.Message}");
+            Volatile.Write(ref state.HitMarginsLastIssue, $"{ex.GetType().Name}:{ex.Message}");
             Logger.Warn(LogTag, $"native hit-margin snapshot read failed: {ex.GetType().Name}: {ex.Message}");
         }
     }
 
-    private static void RefreshHitMarginsCountThrottled()
+    private static void RefreshHitMarginsCountThrottled(ReversePatchRefreshState state)
     {
         var now = Stopwatch.GetTimestamp();
         while (true)
         {
-            var next = Volatile.Read(ref s_hitMarginsNextFallbackTimestamp);
+            var next = Volatile.Read(ref state.HitMarginsNextFallbackTimestamp);
             if (now < next)
             {
                 Interlocked.Increment(ref s_hitMarginsRefreshThrottled);
                 return;
             }
             if (Interlocked.CompareExchange(
-                    ref s_hitMarginsNextFallbackTimestamp,
+                    ref state.HitMarginsNextFallbackTimestamp,
                     now + HitMarginsFallbackRefreshIntervalTicks,
                     next) == next)
                 break;
         }
 
-        RefreshHitMarginsCount();
+        RefreshHitMarginsCount(state);
     }
 
     private static string BuildPlatformRuntimeStats()
     {
+        var state = GetReversePatchState(out var modId);
         var now = Stopwatch.GetTimestamp();
-        var lastSuccess = Volatile.Read(ref s_hitMarginsLastSuccessTimestamp);
+        var lastSuccess = Volatile.Read(ref state.HitMarginsLastSuccessTimestamp);
         var successAgeMs = lastSuccess == 0
             ? -1
             : Math.Max(0, (long)((now - lastSuccess) * 1000d / Stopwatch.Frequency));
-        var overlay = PcCompatNativeHookRules.GetOverlaySnapshot();
+        var overlay = modId is null
+            ? PcCompatNativeHookRules.GetOverlaySnapshot()
+            : PcCompatNativeHookRules.GetOverlaySnapshot(modId);
         var counts = PcCompatReversePatchBridge.SnapshotHitMarginsCount();
         return
             $"frame[{PcCompatManagedSelfRenderBridge.GetDiagnostics()}] " +
@@ -493,12 +541,12 @@ public static class PcCompatDobbyBridge
             $"failures={Interlocked.Read(ref s_hitMarginsRefreshFailures)} " +
             $"skips={Interlocked.Read(ref s_hitMarginsRefreshSkips)} " +
             $"throttled={Interlocked.Read(ref s_hitMarginsRefreshThrottled)} " +
-            $"lastSuccessAgeMs={successAgeMs} generation={Volatile.Read(ref s_hitMarginsNativeGeneration)} " +
-            $"tracker=0x{s_hitMarginsTrackerPointer:x} " +
-            $"length={Volatile.Read(ref s_hitMarginsLastLength)} " +
-            $"checksum={Volatile.Read(ref s_hitMarginsLastChecksum)} " +
+            $"lastSuccessAgeMs={successAgeMs} generation={Volatile.Read(ref state.HitMarginsNativeGeneration)} " +
+            $"tracker=0x{state.HitMarginsTrackerPointer:x} " +
+            $"length={Volatile.Read(ref state.HitMarginsLastLength)} " +
+            $"checksum={Volatile.Read(ref state.HitMarginsLastChecksum)} " +
             $"counts={string.Join(',', counts)} " +
-            $"issue={Volatile.Read(ref s_hitMarginsLastIssue)}]";
+            $"issue={Volatile.Read(ref state.HitMarginsLastIssue)}]";
     }
 
     private static void InitializeHitMarginsCountLayout()

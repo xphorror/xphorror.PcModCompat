@@ -5,6 +5,7 @@ using System.Text.Json.Serialization;
 using AsmResolver.DotNet;
 using AsmResolver.DotNet.Signatures;
 using AsmResolver.IO;
+using Xphorror.PcModCompat.Tools;
 
 var options = CommandLineOptions.Parse(args);
 if (options is null)
@@ -184,6 +185,12 @@ internal sealed class ClosureBuilder
     {
         foreach (var entry in ReadStrictUtf8Lines(_options.SurfacePath))
         {
+            // Bridge-owned calls are rewritten to host implementations and must not enter a
+            // shared proxy static constructor. Keeping one here makes an unrelated MOD fail as
+            // soon as that proxy type initializes, even if it never calls the owned member.
+            if (ManagedBridgeOwnedSurface.Contains(entry))
+                continue;
+
             var parts = entry.Split('|');
             if (parts.Length < 3)
                 throw new InvalidDataException($"Invalid proxy surface entry: {entry}");
@@ -213,68 +220,123 @@ internal sealed class ClosureBuilder
                 case "P" or "G" when parts.Length == 4:
                 {
                     var properties = type.Properties.Where(property => property.Name == parts[3]).ToArray();
-                    if (properties.Length != 1)
+                    if (properties.Length == 1)
+                    {
+                        node.Properties.Add(properties[0]);
+                        var getter = properties[0].GetMethod;
+                        var setter = properties[0].SetMethod;
+                        if (getter is not null)
+                            node.Methods.Add(getter);
+                        else if (parts[0] == "G")
+                            throw new InvalidDataException($"Getter-only surface property has no getter: {entry}");
+                        if (parts[0] == "P")
+                        {
+                            if (setter is null)
+                                throw new InvalidDataException(
+                                    $"Read/write proxy surface property has no setter: {entry}");
+                            node.Methods.Add(setter);
+                        }
+                        break;
+                    }
+
+                    if (properties.Length != 0)
                         throw new InvalidDataException($"Proxy surface property must resolve uniquely: {entry}");
-                    node.Properties.Add(properties[0]);
-                    var getter = properties[0].GetMethod;
-                    var setter = properties[0].SetMethod;
-                    if (getter is not null)
-                        node.Methods.Add(getter);
-                    else if (parts[0] == "G")
-                        throw new InvalidDataException($"Getter-only surface property has no getter: {entry}");
-                    if (parts[0] == "P" && setter is not null)
-                        node.Methods.Add(setter);
-                    break;
+
+                    // The PC reference assemblies describe some IL2CPP fields as C# fields while
+                    // the Android metadata generator exposes the same runtime slot through the
+                    // generated get_*/set_* property facade. A complete P surface is explicitly
+                    // read/write, so selecting the PC field is the correct generator input: the
+                    // upstream field-accessor pass emits both accessors without inventing a second
+                    // native ABI. Getter-only G entries cannot use this fallback because F would
+                    // incorrectly add a setter; they remain fail-closed until a read-only field
+                    // surface encoding is introduced deliberately.
+                    var fields = type.Fields.Where(field => field.Name == parts[3]).ToArray();
+                    if (parts[0] == "P" && fields.Length == 1)
+                    {
+                        node.Fields.Add(fields[0]);
+                        break;
+                    }
+
+                    if (parts[0] == "G" && fields.Length == 1)
+                        throw new InvalidDataException(
+                            $"Getter-only proxy surface resolves to a field; use P for its generated read/write facade: {entry}");
+
+                    throw new InvalidDataException($"Proxy surface property must resolve uniquely: {entry}");
                 }
                 case "RF" when parts.Length == 4:
                 {
-                    var fields = type.Fields.Where(field => field.Name == parts[3]).ToArray();
-                    if (fields.Length == 0)
+                    var resolved = FindReflectedFieldInHierarchy(type, parts[3], entry);
+                    if (resolved is null)
                     {
                         _unresolvedReflectedMembers.Add(new UnresolvedReflectedMemberRecord(
                             entry,
                             "field absent from target PC metadata; reflection will return null"));
                         break;
                     }
-                    if (fields.Length != 1)
-                        throw new InvalidDataException($"Reflected field must resolve at most once: {entry}");
-                    node.Fields.Add(fields[0]);
+                    var owner = AddType(
+                        resolved.DeclaringType,
+                        node.Key,
+                        $"surface:{entry}:reflected-declaring-type");
+                    if (ReferenceEquals(owner, ClosureNode.Missing))
+                    {
+                        _unresolvedReflectedMembers.Add(new UnresolvedReflectedMemberRecord(
+                            entry,
+                            "field declaring type is absent from Android metadata"));
+                        break;
+                    }
+                    owner.Fields.Add(resolved.Member);
                     break;
                 }
                 case "RP" when parts.Length == 4:
                 {
-                    var properties = type.Properties.Where(property => property.Name == parts[3]).ToArray();
-                    if (properties.Length == 0)
+                    var resolved = FindReflectedPropertyInHierarchy(type, parts[3], entry);
+                    if (resolved is null)
                     {
                         _unresolvedReflectedMembers.Add(new UnresolvedReflectedMemberRecord(
                             entry,
                             "property absent from target PC metadata; reflection will return null"));
                         break;
                     }
-                    if (properties.Length != 1)
-                        throw new InvalidDataException($"Reflected property must resolve at most once: {entry}");
-                    node.Properties.Add(properties[0]);
-                    if (properties[0].GetMethod is { } getter)
-                        node.Methods.Add(getter);
-                    if (properties[0].SetMethod is { } setter)
-                        node.Methods.Add(setter);
+                    var owner = AddType(
+                        resolved.DeclaringType,
+                        node.Key,
+                        $"surface:{entry}:reflected-declaring-type");
+                    if (ReferenceEquals(owner, ClosureNode.Missing))
+                    {
+                        _unresolvedReflectedMembers.Add(new UnresolvedReflectedMemberRecord(
+                            entry,
+                            "property declaring type is absent from Android metadata"));
+                        break;
+                    }
+                    owner.Properties.Add(resolved.Member);
+                    if (resolved.Member.GetMethod is { } getter)
+                        owner.Methods.Add(getter);
+                    if (resolved.Member.SetMethod is { } setter)
+                        owner.Methods.Add(setter);
                     break;
                 }
                 case "RN" when parts.Length == 4:
                 {
-                    var methods = type.Methods.Where(method => method.Name == parts[3]).ToArray();
-                    if (methods.Length == 0)
+                    var resolved = FindReflectedMethodInHierarchy(type, parts[3], entry);
+                    if (resolved is null)
                     {
                         _unresolvedReflectedMembers.Add(new UnresolvedReflectedMemberRecord(
                             entry,
                             "method absent from target PC metadata; reflection will return null"));
                         break;
                     }
-                    if (methods.Length != 1)
-                        throw new InvalidDataException(
-                            $"Reflected method name is ambiguous in target PC metadata: {entry} " +
-                            $"(matches={methods.Length})");
-                    node.Methods.Add(methods[0]);
+                    var owner = AddType(
+                        resolved.DeclaringType,
+                        node.Key,
+                        $"surface:{entry}:reflected-declaring-type");
+                    if (ReferenceEquals(owner, ClosureNode.Missing))
+                    {
+                        _unresolvedReflectedMembers.Add(new UnresolvedReflectedMemberRecord(
+                            entry,
+                            "method declaring type is absent from Android metadata"));
+                        break;
+                    }
+                    owner.Methods.Add(resolved.Member);
                     break;
                 }
                 case "N" when parts.Length == 4:
@@ -287,19 +349,94 @@ internal sealed class ClosureBuilder
                     node.Methods.Add(methods[0]);
                     break;
                 }
-                case "M" when parts.Length == 8:
+                case "M" or "MM" when parts.Length == 8:
                 {
                     var identity = MethodIdentity.Parse(parts);
                     var methods = type.Methods.Where(method => MethodIdentity.From(method) == identity).ToArray();
                     if (methods.Length != 1)
                         throw new InvalidDataException($"Proxy surface method must resolve uniquely: {entry}");
                     node.Methods.Add(methods[0]);
+                    if (parts[0] == "MM")
+                        node.ManagedMethods.Add(methods[0]);
                     break;
                 }
                 default:
                     throw new InvalidDataException($"Invalid proxy surface entry: {entry}");
             }
         }
+    }
+
+    // Type.GetField/GetProperty/GetMethod search public inherited members. The scanner records the
+    // receiver's static type from MOD IL, while the generator must retain the member on the type
+    // that actually declares it. Resolve each level independently: a derived declaration hides a
+    // base declaration, but ambiguity within one declaring type stays fail-closed.
+    private static ReflectedMemberResolution<FieldDefinition>? FindReflectedFieldInHierarchy(
+        TypeDefinition type,
+        string memberName,
+        string entry)
+        => FindReflectedMemberInHierarchy(
+            type,
+            memberName,
+            entry,
+            "field",
+            candidate => candidate.Fields,
+            candidate => candidate.Name?.ToString());
+
+    private static ReflectedMemberResolution<PropertyDefinition>? FindReflectedPropertyInHierarchy(
+        TypeDefinition type,
+        string memberName,
+        string entry)
+        => FindReflectedMemberInHierarchy(
+            type,
+            memberName,
+            entry,
+            "property",
+            candidate => candidate.Properties,
+            candidate => candidate.Name?.ToString());
+
+    private static ReflectedMemberResolution<MethodDefinition>? FindReflectedMethodInHierarchy(
+        TypeDefinition type,
+        string memberName,
+        string entry)
+        => FindReflectedMemberInHierarchy(
+            type,
+            memberName,
+            entry,
+            "method",
+            candidate => candidate.Methods,
+            candidate => candidate.Name?.ToString());
+
+    private static ReflectedMemberResolution<TMember>? FindReflectedMemberInHierarchy<TMember>(
+        TypeDefinition type,
+        string memberName,
+        string entry,
+        string memberKind,
+        Func<TypeDefinition, IEnumerable<TMember>> getMembers,
+        Func<TMember, string?> getName)
+        where TMember : class
+    {
+        var visited = new HashSet<TypeDefinition>();
+        for (var current = type; current is not null; current = current.BaseType?.Resolve())
+        {
+            if (!visited.Add(current))
+                throw new InvalidDataException(
+                    $"Inheritance cycle while resolving reflected {memberKind}: {entry}");
+
+            var matches = getMembers(current)
+                .Where(member => string.Equals(getName(member), memberName, StringComparison.Ordinal))
+                .ToArray();
+            if (matches.Length == 0)
+                continue;
+            if (matches.Length != 1)
+            {
+                throw new InvalidDataException(
+                    $"Reflected {memberKind} name is ambiguous in target PC metadata: {entry} " +
+                    $"(declaringType={current.FullName}, matches={matches.Length})");
+            }
+            return new ReflectedMemberResolution<TMember>(current, matches[0]);
+        }
+
+        return null;
     }
 
     private void AddRequiredCorlibType(string fullName)
@@ -568,6 +705,11 @@ internal sealed class ClosureBuilder
         }
     }
 
+    private sealed record ReflectedMemberResolution<TMember>(
+        TypeDefinition DeclaringType,
+        TMember Member)
+        where TMember : class;
+
     internal sealed class ClosureNode
     {
         public static readonly ClosureNode Corlib = new(default, null!, null, "corlib", MemberMode.All);
@@ -589,6 +731,7 @@ internal sealed class ClosureBuilder
         public MemberMode Mode { get; }
         public HashSet<FieldDefinition> Fields { get; } = new();
         public HashSet<MethodDefinition> Methods { get; } = new();
+        public HashSet<MethodDefinition> ManagedMethods { get; } = new();
         public HashSet<PropertyDefinition> Properties { get; } = new();
     }
 
@@ -630,7 +773,8 @@ internal sealed record ClosureResult(
                 allowList.Append("P|").Append(node.Key.AssemblyName).Append('|').Append(node.Key.FullName)
                     .Append('|').AppendLine(property.Name);
             foreach (var method in node.Methods.OrderBy(method => MethodIdentity.From(method).ToString(), StringComparer.Ordinal))
-                allowList.Append("M|").Append(node.Key.AssemblyName).Append('|').Append(node.Key.FullName)
+                allowList.Append(node.ManagedMethods.Contains(method) ? "MM|" : "M|")
+                    .Append(node.Key.AssemblyName).Append('|').Append(node.Key.FullName)
                     .Append('|').AppendLine(MethodIdentity.From(method).ToString());
         }
         await File.WriteAllTextAsync(options.AllowListOutputPath, allowList.ToString(), new UTF8Encoding(false));
@@ -641,7 +785,7 @@ internal sealed record ClosureResult(
 
         var report = new
         {
-            formatVersion = "xphorror.il2cpp-proxy-closure.v2",
+            formatVersion = "xphorror.il2cpp-proxy-closure.v3-field-backed-property-surface",
             generatedUtc = DateTime.UtcNow.ToString("O"),
             source = new
             {
@@ -707,7 +851,20 @@ internal readonly record struct TypeKey(string AssemblyName, string FullName)
         return result.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) ? result[..^4] : result;
     }
 
-    public static string NormalizeTypeName(string value) => value.Trim().Replace('/', '+');
+    /// <summary>
+    /// Normalizes a type name so the two libraries in this pipeline agree on it.
+    /// </summary>
+    /// <remarks>
+    /// The surface manifest is written by ProxySurfaceScanner (dnlib) and read back here
+    /// (AsmResolver). The two render a generic instantiation's argument list differently -
+    /// AsmResolver puts a space after each comma, dnlib does not - so
+    /// <c>UnityAction`2&lt;Scene, LoadSceneMode&gt;</c> and <c>UnityAction`2&lt;Scene,LoadSceneMode&gt;</c>
+    /// are the same method but compared unequal, and the manifest entry then resolved to 0 methods.
+    /// Stripping the spaces after commas makes both spellings converge. Nested-type separators
+    /// (<c>/</c> vs <c>+</c>) are the same class of divergence and were already handled.
+    /// </remarks>
+    public static string NormalizeTypeName(string value)
+        => value.Trim().Replace('/', '+').Replace(", ", ",");
 }
 
 internal readonly record struct MethodIdentity(

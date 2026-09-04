@@ -1,8 +1,9 @@
 using StArray.ModManager.Il2Cpp;
+using StArray.ModManager.Mono;
 
 namespace StArray.ModManager.RuntimeAbstractions;
 
-/// <summary>统一 IL2CPP managed object-reference array。</summary>
+/// <summary>统一 managed object-reference array。</summary>
 public readonly unsafe struct RuntimeArray
 {
     public nint Ptr { get; }
@@ -11,13 +12,39 @@ public readonly unsafe struct RuntimeArray
     public RuntimeArray(nint ptr) => Ptr = ptr;
     public RuntimeArray(RuntimeObject obj) => Ptr = obj.Ptr;
 
-    public int Length => RuntimeManager.IsIl2Cpp && Ptr != 0
-        ? (int)Il2CppFunctions.il2cpp_array_length(Ptr)
-        : 0;
+    public int Length
+    {
+        get
+        {
+            if (Ptr == 0) return 0;
+            if (RuntimeManager.IsIl2Cpp)
+            {
+                if (OperatingSystem.IsAndroid())
+                    return Il2CppArrayReader.TryReadLength(Ptr, out var length) ? length : 0;
+                return (int)Il2CppFunctions.il2cpp_array_length(Ptr);
+            }
+            if (RuntimeManager.IsMono)
+                return (int)MonoFunctions.MonoArrayLength(Ptr);
+            return 0;
+        }
+    }
 
-    public nint DataPtr => RuntimeManager.IsIl2Cpp
-        ? Il2CppRuntimeApi.GetArrayDataPointer(Ptr)
-        : 0;
+    public nint DataPtr
+    {
+        get
+        {
+            if (Ptr == 0) return 0;
+            if (RuntimeManager.IsIl2Cpp)
+            {
+                if (OperatingSystem.IsAndroid())
+                    return Il2CppArrayReader.TryGetDataAddress(Ptr, out var data) ? data : 0;
+                return Il2CppRuntimeApi.GetArrayDataPointer(Ptr);
+            }
+            if (RuntimeManager.IsMono && Length > 0)
+                return MonoFunctions.MonoArrayAddrWithSize(Ptr, nint.Size, 0);
+            return 0;
+        }
+    }
 
     internal static nint GetIl2CppDataPtr(nint array)
         => Il2CppRuntimeApi.GetArrayDataPointer(array);
@@ -26,6 +53,10 @@ public readonly unsafe struct RuntimeArray
     {
         get
         {
+            if (RuntimeManager.IsIl2Cpp && OperatingSystem.IsAndroid())
+                return Il2CppArrayReader.TryReadPointerElement(Ptr, index, out var value)
+                    ? value
+                    : 0;
             var data = DataPtr;
             return index >= 0 && index < Length && data != 0
                 ? *(nint*)(data + index * nint.Size)
@@ -63,7 +94,7 @@ public readonly unsafe struct RuntimeArray
     public static implicit operator RuntimeObject(RuntimeArray array) => new(array.Ptr);
 }
 
-/// <summary>统一 IL2CPP managed value array。</summary>
+/// <summary>统一 managed value array。</summary>
 public readonly unsafe struct RuntimeArray<T> where T : unmanaged
 {
     public nint Ptr { get; }
@@ -73,9 +104,22 @@ public readonly unsafe struct RuntimeArray<T> where T : unmanaged
     public RuntimeArray(RuntimeObject obj) => Ptr = obj.Ptr;
     public RuntimeArray(RuntimeArray array) => Ptr = array.Ptr;
 
-    public int Length => RuntimeManager.IsIl2Cpp && Ptr != 0
-        ? (int)Il2CppFunctions.il2cpp_array_length(Ptr)
-        : 0;
+    public int Length
+    {
+        get
+        {
+            if (Ptr == 0) return 0;
+            if (RuntimeManager.IsIl2Cpp)
+            {
+                if (OperatingSystem.IsAndroid())
+                    return Il2CppArrayReader.TryReadLength(Ptr, out var length) ? length : 0;
+                return (int)Il2CppFunctions.il2cpp_array_length(Ptr);
+            }
+            if (RuntimeManager.IsMono)
+                return (int)MonoFunctions.MonoArrayLength(Ptr);
+            return 0;
+        }
+    }
 
     private nint DataPtr => RuntimeManager.IsIl2Cpp
         ? RuntimeArray.GetIl2CppDataPtr(Ptr)
@@ -85,6 +129,16 @@ public readonly unsafe struct RuntimeArray<T> where T : unmanaged
     {
         get
         {
+            if (RuntimeManager.IsMono)
+            {
+                return index >= 0 && index < Length
+                    ? *(T*)MonoFunctions.MonoArrayAddrWithSize(Ptr, sizeof(T), (nuint)index)
+                    : default;
+            }
+            if (RuntimeManager.IsIl2Cpp && OperatingSystem.IsAndroid())
+                return Il2CppArrayReader.TryReadValueElement<T>(Ptr, index, out var value)
+                    ? value
+                    : default;
             var data = DataPtr;
             return index >= 0 && index < Length && data != 0
                 ? *(T*)(data + index * sizeof(T))

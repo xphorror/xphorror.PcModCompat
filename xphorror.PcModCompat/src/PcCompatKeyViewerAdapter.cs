@@ -160,6 +160,11 @@ public sealed class PcCompatKeyViewerRoleBinding
     public required string TypeName { get; init; }
     public string? MemberName { get; init; }
     public string? MemberKind { get; init; }
+    /// <summary>
+    /// Proven destination lane base at the input-transaction call site. Zero identifies the primary
+    /// lane group; a positive value identifies an appended group. Null is deliberately unranked.
+    /// </summary>
+    public int? ConsumerLaneBase { get; init; }
     public required PcCompatAdapterEvidence Evidence { get; init; }
 }
 
@@ -204,7 +209,7 @@ public sealed class PcCompatKeyViewerFeatureAdapter
 
 public sealed class PcCompatKeyViewerAdapterDocument
 {
-    public const string CurrentFormatVersion = "keyviewer-adapter-v1";
+    public const string CurrentFormatVersion = "keyviewer-adapter-v2-lane-origin";
 
     public string FormatVersion { get; init; } = CurrentFormatVersion;
     public required string ModId { get; init; }
@@ -420,6 +425,8 @@ public static class PcCompatKeyViewerAdapterValidator
             RequireId(role.Role, $"{path} role", errors);
             RequireId(role.AssemblyName, $"{path} role '{role.Role}' assembly", errors);
             RequireId(role.TypeName, $"{path} role '{role.Role}' type", errors);
+            if (role.ConsumerLaneBase < 0)
+                errors.Add($"{path} role '{role.Role}' consumerLaneBase: must not be negative.");
             ValidateEvidence(role.Evidence, $"{path} role '{role.Role}'", errors);
         }
         ValidateEvidenceMatrix(feature.Capabilities, path, errors);

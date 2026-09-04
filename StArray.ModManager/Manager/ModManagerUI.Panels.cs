@@ -1,5 +1,6 @@
 using StArray.ModManager.Resources;
 using System.Numerics;
+using System.Text;
 using System.Text.Json;
 using IconFonts;
 using ImGuiNET;
@@ -123,7 +124,24 @@ partial class ModManagerUI
                 ImGui.Spacing();
             }
             ImGui.PushTextWrapPos();
-            settings.OnGui();
+            if (mod.TryEnterRuntimeCallback(out var callbackLease))
+            {
+                using (callbackLease)
+                using (HookHelper.EnterOwnerScope(
+                           mod.RuntimeOwnerId,
+                           mod.RuntimeSession,
+                           mod.RuntimeKey))
+                {
+                    // Fault boundary inside the Host's Begin/End pair: an exception escaping
+                    // here would skip PopTextWrapPos and End and corrupt the whole frame's
+                    // window stack, taking the manager's own UI down with the MOD.
+                    UiOwnerScope.TryDraw(
+                        mod.RuntimeOwnerId,
+                        mod.RuntimeKey.Generation,
+                        "settings OnGui",
+                        settings.OnGui);
+                }
+            }
             ImGui.PopTextWrapPos();
 
             if (layout?.ShowSaveButton != false)
@@ -148,11 +166,28 @@ partial class ModManagerUI
         {
             var path = Path.Combine(mod.FolderPath, "settings.json");
             var members = ModInspector.GetSettingMembers(settings.GetType());
-            var dict = new Dictionary<string, object?>();
+            var dict = new Dictionary<string, JsonElement>();
             foreach (var member in members)
-                dict[member.Name] = member.Get(settings);
-            var json = JsonSerializer.Serialize(dict, ModManagerJsonContext.Default.DictionaryStringObject);
-            File.WriteAllText(path, json);
+            {
+                try
+                {
+                    var value = member.Get(settings);
+                    dict[member.Name] = JsonSerializer.SerializeToElement(
+                        value,
+                        member.ValueType,
+                        ModInspector.SettingsJson);
+                }
+                catch (Exception ex)
+                {
+                    Logger.Warn(nameof(ModManagerUI),
+                        $"SaveSettings skipped mod={mod.Id} member={member.Name} " +
+                        $"type={member.ValueType.FullName}: {ex.GetType().Name}: {SingleLine(ex.Message)}");
+                }
+            }
+            var json = JsonSerializer.Serialize(
+                dict,
+                ModManagerJsonContext.Default.DictionaryStringJsonElement);
+            File.WriteAllText(path, json, Encoding.UTF8);
             _toastMessage = L10n.Get("Toast.ModSaved", mod.Name);
             _toastTimer = 2.5f;
         }
@@ -172,7 +207,7 @@ partial class ModManagerUI
             var path = Path.Combine(mod.FolderPath, "settings.json");
             if (!File.Exists(path)) return;
 
-            var json = File.ReadAllText(path);
+            var json = File.ReadAllText(path, Encoding.UTF8);
             var dict = JsonSerializer.Deserialize(json, ModManagerJsonContext.Default.DictionaryStringJsonElement);
             if (dict == null) return;
 
@@ -183,7 +218,7 @@ partial class ModManagerUI
 
                 try
                 {
-                    var value = elem.Deserialize(member.ValueType);
+                    var value = elem.Deserialize(member.ValueType, ModInspector.SettingsJson);
                     if (value == null && member.ValueType.IsValueType &&
                         Nullable.GetUnderlyingType(member.ValueType) == null)
                     {
@@ -211,6 +246,7 @@ partial class ModManagerUI
         if (_toastTimer <= 0) return;
 
         _toastTimer -= ImGui.GetIO().DeltaTime;
+        L10n.RegisterDynamicGlyphText(_toastMessage);
 
         float alpha = Math.Min(_toastTimer / 0.5f, 1f);
         ImGui.PushStyleVar(ImGuiStyleVar.Alpha, alpha);

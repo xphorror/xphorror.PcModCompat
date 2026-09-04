@@ -8,13 +8,15 @@ namespace Xphorror.PcModCompat;
 
 public sealed class PcCompatStaticPatchScanReport
 {
-    public const string CurrentFormatVersion = "static-patch-scan-v2";
+    public const string CurrentFormatVersion = "static-patch-scan-v4-render-components";
 
     public string FormatVersion { get; init; } = CurrentFormatVersion;
     public required string ModId { get; init; }
     public int TargetGameRevision { get; init; }
     public IReadOnlyList<string> AssembliesScanned { get; init; } = Array.Empty<string>();
     public IReadOnlyList<PcCompatPatchDescriptor> Patches { get; init; } = Array.Empty<PcCompatPatchDescriptor>();
+    public IReadOnlyList<PcCompatManagedRenderComponentDescriptor> ManagedRenderComponents { get; init; } =
+        Array.Empty<PcCompatManagedRenderComponentDescriptor>();
     public IReadOnlyList<PcCompatStaticPatchScanIssue> Issues { get; init; } = Array.Empty<PcCompatStaticPatchScanIssue>();
 
     [JsonIgnore]
@@ -31,6 +33,20 @@ public sealed class PcCompatStaticPatchScanReport
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
         Converters = { new JsonStringEnumConverter() }
     };
+}
+
+public sealed class PcCompatManagedRenderComponentDescriptor
+{
+    public required string ModId { get; init; }
+    public required string ComponentAssembly { get; init; }
+    public required string ComponentType { get; init; }
+    public required string BaseAssembly { get; init; }
+    public required string BaseType { get; init; }
+    public required string HostAssembly { get; init; }
+    public required string HostType { get; init; }
+    public required string RenderMethod { get; init; }
+    public required string RenderParameterType { get; init; }
+    public required string Reason { get; init; }
 }
 
 public sealed class PcCompatStaticPatchScanIssue
@@ -54,6 +70,7 @@ public static class PcCompatStaticPatchScanner
     {
         var assemblies = ResolveAssemblyPaths(manifest).ToArray();
         var patches = new List<PcCompatPatchDescriptor>();
+        var renderComponents = new List<PcCompatManagedRenderComponentDescriptor>();
         var issues = new List<PcCompatStaticPatchScanIssue>();
         var scanned = new List<string>();
 
@@ -68,11 +85,17 @@ public static class PcCompatStaticPatchScanner
 
         foreach (var assemblyPath in assemblies)
         {
-            ScanAssembly(assemblyPath, manifest.Id, patches, issues);
+            ScanAssembly(assemblyPath, manifest.Id, patches, renderComponents, issues);
             scanned.Add(assemblyPath);
         }
 
-        return BuildReport(manifest.Id, targetGameRevision, scanned, patches, issues);
+        return BuildReport(
+            manifest.Id,
+            targetGameRevision,
+            scanned,
+            patches,
+            renderComponents,
+            issues);
     }
 
     private static PcCompatStaticPatchScanReport BuildReport(
@@ -80,19 +103,29 @@ public static class PcCompatStaticPatchScanner
         int targetGameRevision,
         IReadOnlyList<string> scanned,
         IReadOnlyList<PcCompatPatchDescriptor> patches,
-        IReadOnlyList<PcCompatStaticPatchScanIssue> issues)
+        IReadOnlyList<PcCompatManagedRenderComponentDescriptor> renderComponents,
+        List<PcCompatStaticPatchScanIssue> issues)
     {
+        var normalizedPatches = PcCompatKnownModPatchActivationPolicy.Apply(modId, patches, issues);
         return new PcCompatStaticPatchScanReport
         {
             ModId = modId,
             TargetGameRevision = targetGameRevision,
             AssembliesScanned = scanned,
-            Patches = patches
+            Patches = normalizedPatches
                 .OrderBy(patch => patch.CallbackType, StringComparer.Ordinal)
                 .ThenBy(patch => patch.CallbackMethod, StringComparer.Ordinal)
                 .ThenBy(patch => patch.TargetType, StringComparer.Ordinal)
                 .ThenBy(patch => patch.TargetMethod, StringComparer.Ordinal)
                 .ThenBy(patch => patch.MinVersion)
+                .ToArray(),
+            ManagedRenderComponents = renderComponents
+                .GroupBy(
+                    item => item.ComponentAssembly + "\0" + item.ComponentType,
+                    StringComparer.OrdinalIgnoreCase)
+                .Select(group => group.First())
+                .OrderBy(item => item.ComponentAssembly, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(item => item.ComponentType, StringComparer.Ordinal)
                 .ToArray(),
             Issues = issues.ToArray()
         };
@@ -108,6 +141,7 @@ public static class PcCompatStaticPatchScanner
         int targetGameRevision = DefaultTargetGameRevision)
     {
         var patches = new List<PcCompatPatchDescriptor>();
+        var renderComponents = new List<PcCompatManagedRenderComponentDescriptor>();
         var issues = new List<PcCompatStaticPatchScanIssue>();
         var scanned = new List<string>();
 
@@ -120,11 +154,17 @@ public static class PcCompatStaticPatchScanner
             }
 
             var assemblyPath = Path.GetFullPath(candidate);
-            ScanAssembly(assemblyPath, modId, patches, issues);
+            ScanAssembly(assemblyPath, modId, patches, renderComponents, issues);
             scanned.Add(assemblyPath);
         }
 
-        return BuildReport(modId, targetGameRevision, scanned, patches, issues);
+        return BuildReport(
+            modId,
+            targetGameRevision,
+            scanned,
+            patches,
+            renderComponents,
+            issues);
     }
 
     private static IEnumerable<string> ResolveAssemblyPaths(PcModManifest manifest)
@@ -163,6 +203,7 @@ public static class PcCompatStaticPatchScanner
         string assemblyPath,
         string modId,
         List<PcCompatPatchDescriptor> patches,
+        List<PcCompatManagedRenderComponentDescriptor> renderComponents,
         List<PcCompatStaticPatchScanIssue> issues)
     {
         try
@@ -176,10 +217,21 @@ public static class PcCompatStaticPatchScanner
             }
 
             var reader = peReader.GetMetadataReader();
+            var assemblyName = reader.IsAssembly
+                ? reader.GetString(reader.GetAssemblyDefinition().Name)
+                : Path.GetFileNameWithoutExtension(assemblyPath);
             foreach (var typeHandle in reader.TypeDefinitions)
             {
                 var type = reader.GetTypeDefinition(typeHandle);
                 var callbackType = GetTypeDefinitionFullName(reader, typeHandle);
+                TryDiscoverManagedRenderComponent(
+                    reader,
+                    typeHandle,
+                    type,
+                    modId,
+                    assemblyName,
+                    callbackType,
+                    renderComponents);
 
                 foreach (var methodHandle in type.GetMethods())
                 {
@@ -234,6 +286,80 @@ public static class PcCompatStaticPatchScanner
         {
             issues.Add(Issue("MetadataReadFailed", $"{ex.GetType().Name}: {ex.Message}", assemblyPath));
         }
+    }
+
+    private static void TryDiscoverManagedRenderComponent(
+        MetadataReader reader,
+        TypeDefinitionHandle typeHandle,
+        TypeDefinition type,
+        string modId,
+        string componentAssembly,
+        string componentType,
+        List<PcCompatManagedRenderComponentDescriptor> renderComponents)
+    {
+        if (!TryGetTypeIdentity(reader, type.BaseType, componentAssembly, out var baseAssembly, out var baseType))
+            return;
+
+        var matchingMethods = 0;
+        foreach (var methodHandle in type.GetMethods())
+        {
+            var method = reader.GetMethodDefinition(methodHandle);
+            if (!string.Equals(reader.GetString(method.Name), "OnPopulateMesh", StringComparison.Ordinal) ||
+                (method.Attributes & System.Reflection.MethodAttributes.Static) != 0 ||
+                PcCompatMetadataNames.GetMethodReturnType(reader, methodHandle) != "System.Void")
+            {
+                continue;
+            }
+            var parameters = PcCompatMetadataNames.GetMethodParameterTypes(reader, methodHandle);
+            if (parameters.Count == 1 && parameters[0] == "UnityEngine.UI.VertexHelper")
+                ++matchingMethods;
+        }
+
+        if (PcCompatManagedRenderComponentCatalog.TryDescribeMetadataType(
+                modId,
+                componentAssembly,
+                componentType,
+                baseAssembly,
+                baseType,
+                (type.Attributes & System.Reflection.TypeAttributes.Abstract) != 0,
+                type.GetGenericParameters().Count != 0,
+                matchingMethods,
+                out var descriptor))
+        {
+            renderComponents.Add(descriptor);
+        }
+    }
+
+    private static bool TryGetTypeIdentity(
+        MetadataReader reader,
+        EntityHandle handle,
+        string currentAssembly,
+        out string assemblyName,
+        out string typeName)
+    {
+        assemblyName = string.Empty;
+        typeName = string.Empty;
+        if (handle.IsNil)
+            return false;
+        if (handle.Kind == HandleKind.TypeDefinition)
+        {
+            assemblyName = currentAssembly;
+            typeName = GetTypeDefinitionFullName(reader, (TypeDefinitionHandle)handle);
+            return true;
+        }
+        if (handle.Kind != HandleKind.TypeReference)
+            return false;
+
+        var referenceHandle = (TypeReferenceHandle)handle;
+        var reference = reader.GetTypeReference(referenceHandle);
+        typeName = GetTypeReferenceFullName(reader, referenceHandle);
+        var scope = reference.ResolutionScope;
+        while (scope.Kind == HandleKind.TypeReference)
+            scope = reader.GetTypeReference((TypeReferenceHandle)scope).ResolutionScope;
+        assemblyName = scope.Kind == HandleKind.AssemblyReference
+            ? reader.GetString(reader.GetAssemblyReference((AssemblyReferenceHandle)scope).Name)
+            : currentAssembly;
+        return true;
     }
 
     private static void DecodeJAPatchAttribute(

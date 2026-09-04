@@ -1,9 +1,10 @@
 #include "unity_presentation_sink.h"
 
+#include "dobby_hook_internal.h"
 #include "hook_broker.h"
 #include "hud_deadline_scheduler.h"
 #include "hud_logic_worker.h"
-#include "runtime_il2cpp_bridge.h"
+#include "pccompat_open_runtime.h"
 #include "pccompat_metadata_resolver.h"
 #include "unity_presentation_objects.h"
 
@@ -104,10 +105,70 @@ constexpr int64_t kManagedPendingIntervalNs = 250'000'000;
 constexpr int64_t kOnGUIBorrowedHostReselectNs = 250'000'000;
 constexpr int32_t kNoBorrowedOnGUIInstance = std::numeric_limits<int32_t>::min();
 constexpr uint32_t kMaxPresentationCommandsPerOpportunity = 16;
+constexpr uint32_t kPrimaryContinuationDescriptorSlot = 0x70000001u;
+constexpr uint32_t kFallbackContinuationDescriptorSlot = 0x70000002u;
+constexpr uint32_t kBeginGuiContinuationDescriptorSlot = 0x70000003u;
+constexpr uint32_t kProcessEventContinuationDescriptorSlot = 0x70000004u;
+constexpr uint32_t kTextCoreContinuationDescriptorSlot = 0x70000005u;
+constexpr uint32_t kEventSystemContinuationDescriptorSlot = 0x70000006u;
+constexpr uint32_t kUnityMainWorkCallbackDescriptorSlot = 0x70000101u;
+constexpr uint32_t kManagedFrameCallbackDescriptorSlot = 0x70000102u;
+constexpr uint32_t kManagedOnGuiCallbackDescriptorSlot = 0x70000103u;
+constexpr uint32_t kResourceResolverCallbackDescriptorSlot = 0x70000104u;
 
 int64_t steady_now_ns() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+void *protect_pccompat_managed_callback(
+    void *callback,
+    uint32_t descriptor_slot,
+    const char *name) {
+    if (callback == nullptr)
+        return nullptr;
+    uintptr_t protected_callback = 0;
+    if (PC_COMPAT_RESOLVE_CONTINUATION(
+            0,
+            0,
+            descriptor_slot,
+            reinterpret_cast<uintptr_t>(callback),
+            &protected_callback) != 1 ||
+        protected_callback != reinterpret_cast<uintptr_t>(callback)) {
+        LOGE("managed callback descriptor rejected: %s", name);
+        return nullptr;
+    }
+    return reinterpret_cast<void *>(protected_callback);
+}
+
+bool install_protected_presentation_hook(const char *owner,
+                                         uint32_t descriptor_slot,
+                                         void *target,
+                                         void *detour,
+                                         void **continuation,
+                                         std::string &error) {
+    if (continuation == nullptr) {
+        error = "continuation output is null";
+        return false;
+    }
+    *continuation = nullptr;
+    const int result = modmanager_hook_broker_install_protected(
+        owner,
+        0,
+        0,
+        descriptor_slot,
+        target,
+        detour,
+        continuation);
+    if (result != 0 || *continuation == nullptr) {
+        error = "hook broker install failed ret=" + std::to_string(result) +
+            " broker=" +
+            (modmanager_hook_broker_get_last_error() == nullptr
+                ? std::string{}
+                : modmanager_hook_broker_get_last_error());
+        return false;
+    }
+    return true;
 }
 
 bool take_trace_budget(std::atomic<uint32_t> &budget) {
@@ -319,7 +380,7 @@ void gui_utility_process_event(int event_id,
                                void *method_info) {
     const auto original = reinterpret_cast<ProcessEventFn>(
         g_ongui_process_original.load(std::memory_order_acquire));
-    if (!modmanager_runtime_enabled()) {
+    if (!pccompat_runtime_enabled(0)) {
         if (original != nullptr)
             original(event_id, native_event, result, method_info);
         return;
@@ -348,7 +409,7 @@ void gui_utility_begin_gui(int skin_mode,
         g_ongui_begin_original.load(std::memory_order_acquire));
     if (original != nullptr)
         original(skin_mode, instance_id, use_guilayout, method_info);
-    if (!modmanager_runtime_enabled())
+    if (!pccompat_runtime_enabled(0))
         return;
     const auto begin_count =
         g_ongui_begin_gui_count.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -414,7 +475,7 @@ void *text_settings_get_cached_font_asset(void *text_settings,
                                           void *method_info) {
     const auto original = reinterpret_cast<GetCachedFontAssetFn>(
         g_text_core_font_original.load(std::memory_order_acquire));
-    if (!modmanager_runtime_enabled()) {
+    if (!pccompat_runtime_enabled(0)) {
         return original == nullptr
             ? nullptr
             : original(text_settings, font, method_info);
@@ -429,7 +490,7 @@ void *text_settings_get_cached_font_asset(void *text_settings,
 void event_system_update(void *instance, void *method_info) {
     const auto original = reinterpret_cast<InstanceVoid0Fn>(
         g_event_system_update_original.load(std::memory_order_acquire));
-    if (!modmanager_runtime_enabled()) {
+    if (!pccompat_runtime_enabled(0)) {
         if (original != nullptr)
             original(instance, method_info);
         return;
@@ -515,7 +576,7 @@ void consume_latest_snapshot() {
 void canvas_send_pre_will_render_canvases(void *method_info) {
     const auto original = reinterpret_cast<StaticVoid0Fn>(
         g_primary_original.load(std::memory_order_acquire));
-    if (modmanager_runtime_enabled())
+    if (pccompat_runtime_enabled(0))
         consume_latest_snapshot();
     if (original != nullptr)
         original(method_info);
@@ -524,7 +585,7 @@ void canvas_send_pre_will_render_canvases(void *method_info) {
 void canvas_update_registry_perform_update(void *instance, void *method_info) {
     const auto original = reinterpret_cast<InstanceVoid0Fn>(
         g_fallback_original.load(std::memory_order_acquire));
-    if (modmanager_runtime_enabled())
+    if (pccompat_runtime_enabled(0))
         consume_latest_snapshot();
     if (original != nullptr)
         original(instance, method_info);
@@ -548,17 +609,15 @@ bool resolve_and_install_primary(std::string &error) {
     }
 
     void *continuation = nullptr;
-    const int result = modmanager_hook_broker_install(
-        "PcCompat:UnityPresentationSink:Canvas",
-        method.function,
-        reinterpret_cast<void *>(&canvas_send_pre_will_render_canvases),
-        &continuation);
-    if (result != 0 || continuation == nullptr) {
-        error = "Canvas.SendPreWillRenderCanvases hook failed ret=" +
-            std::to_string(result) + " broker=" +
-            (modmanager_hook_broker_get_last_error() == nullptr
-                ? std::string{}
-                : modmanager_hook_broker_get_last_error());
+    std::string install_error;
+    if (!install_protected_presentation_hook(
+            "PcCompat:UnityPresentationSink:Canvas",
+            kPrimaryContinuationDescriptorSlot,
+            method.function,
+            reinterpret_cast<void *>(&canvas_send_pre_will_render_canvases),
+            &continuation,
+            install_error)) {
+        error = "Canvas.SendPreWillRenderCanvases hook failed: " + install_error;
         return false;
     }
 
@@ -589,17 +648,15 @@ bool resolve_and_install_fallback(std::string &error) {
     }
 
     void *continuation = nullptr;
-    const int result = modmanager_hook_broker_install(
-        "PcCompat:UnityPresentationSink:CanvasUpdateRegistry",
-        method.function,
-        reinterpret_cast<void *>(&canvas_update_registry_perform_update),
-        &continuation);
-    if (result != 0 || continuation == nullptr) {
-        error = "CanvasUpdateRegistry.PerformUpdate hook failed ret=" +
-            std::to_string(result) + " broker=" +
-            (modmanager_hook_broker_get_last_error() == nullptr
-                ? std::string{}
-                : modmanager_hook_broker_get_last_error());
+    std::string install_error;
+    if (!install_protected_presentation_hook(
+            "PcCompat:UnityPresentationSink:CanvasUpdateRegistry",
+            kFallbackContinuationDescriptorSlot,
+            method.function,
+            reinterpret_cast<void *>(&canvas_update_registry_perform_update),
+            &continuation,
+            install_error)) {
+        error = "CanvasUpdateRegistry.PerformUpdate hook failed: " + install_error;
         return false;
     }
 
@@ -633,17 +690,15 @@ bool resolve_and_install_ongui(std::string &error) {
     }
 
     void *begin_continuation = nullptr;
-    const int begin_result = modmanager_hook_broker_install(
-        "PcCompat:UnityPresentationSink:GUIUtility.BeginGUI",
-        begin_method.function,
-        reinterpret_cast<void *>(&gui_utility_begin_gui),
-        &begin_continuation);
-    if (begin_result != 0 || begin_continuation == nullptr) {
-        error = "GUIUtility.BeginGUI hook failed ret=" +
-            std::to_string(begin_result) + " broker=" +
-            (modmanager_hook_broker_get_last_error() == nullptr
-                ? std::string{}
-                : modmanager_hook_broker_get_last_error());
+    std::string begin_install_error;
+    if (!install_protected_presentation_hook(
+            "PcCompat:UnityPresentationSink:GUIUtility.BeginGUI",
+            kBeginGuiContinuationDescriptorSlot,
+            begin_method.function,
+            reinterpret_cast<void *>(&gui_utility_begin_gui),
+            &begin_continuation,
+            begin_install_error)) {
+        error = "GUIUtility.BeginGUI hook failed: " + begin_install_error;
         return false;
     }
     g_ongui_begin_original.store(begin_continuation, std::memory_order_release);
@@ -667,17 +722,17 @@ bool resolve_and_install_ongui(std::string &error) {
              process_resolve_error.c_str());
     } else {
         void *process_continuation = nullptr;
-        const int process_result = modmanager_hook_broker_install(
-            "PcCompat:UnityPresentationSink:GUIUtility.ProcessEvent",
-            process_method.function,
-            reinterpret_cast<void *>(&gui_utility_process_event),
-            &process_continuation);
-        if (process_result != 0 || process_continuation == nullptr) {
-            const auto process_error = "GUIUtility.ProcessEvent telemetry hook failed ret=" +
-                std::to_string(process_result) + " broker=" +
-                (modmanager_hook_broker_get_last_error() == nullptr
-                    ? std::string{}
-                    : modmanager_hook_broker_get_last_error());
+        std::string process_install_error;
+        if (!install_protected_presentation_hook(
+                "PcCompat:UnityPresentationSink:GUIUtility.ProcessEvent",
+                kProcessEventContinuationDescriptorSlot,
+                process_method.function,
+                reinterpret_cast<void *>(&gui_utility_process_event),
+                &process_continuation,
+                process_install_error)) {
+            const auto process_error =
+                "GUIUtility.ProcessEvent telemetry hook failed: " +
+                process_install_error;
             LOGE("%s", process_error.c_str());
         } else {
             g_ongui_process_original.store(
@@ -714,17 +769,15 @@ bool resolve_and_install_text_core_font_cache(std::string &error) {
     }
 
     void *continuation = nullptr;
-    const int result = modmanager_hook_broker_install(
-        "PcCompat:UnityPresentationSink:TextSettings.GetCachedFontAsset",
-        method.function,
-        reinterpret_cast<void *>(&text_settings_get_cached_font_asset),
-        &continuation);
-    if (result != 0 || continuation == nullptr) {
-        error = "TextSettings.GetCachedFontAsset hook failed ret=" +
-            std::to_string(result) + " broker=" +
-            (modmanager_hook_broker_get_last_error() == nullptr
-                ? std::string{}
-                : modmanager_hook_broker_get_last_error());
+    std::string install_error;
+    if (!install_protected_presentation_hook(
+            "PcCompat:UnityPresentationSink:TextSettings.GetCachedFontAsset",
+            kTextCoreContinuationDescriptorSlot,
+            method.function,
+            reinterpret_cast<void *>(&text_settings_get_cached_font_asset),
+            &continuation,
+            install_error)) {
+        error = "TextSettings.GetCachedFontAsset hook failed: " + install_error;
         return false;
     }
 
@@ -757,17 +810,15 @@ bool resolve_and_install_event_system_gate(std::string &error) {
     }
 
     void *continuation = nullptr;
-    const int result = modmanager_hook_broker_install(
-        "PcCompat:UnityPresentationSink:EventSystem.Update",
-        method.function,
-        reinterpret_cast<void *>(&event_system_update),
-        &continuation);
-    if (result != 0 || continuation == nullptr) {
-        error = "EventSystem.Update hook failed ret=" +
-            std::to_string(result) + " broker=" +
-            (modmanager_hook_broker_get_last_error() == nullptr
-                ? std::string{}
-                : modmanager_hook_broker_get_last_error());
+    std::string install_error;
+    if (!install_protected_presentation_hook(
+            "PcCompat:UnityPresentationSink:EventSystem.Update",
+            kEventSystemContinuationDescriptorSlot,
+            method.function,
+            reinterpret_cast<void *>(&event_system_update),
+            &continuation,
+            install_error)) {
+        error = "EventSystem.Update hook failed: " + install_error;
         return false;
     }
 
@@ -954,6 +1005,10 @@ extern "C" int modmanager_pccompat_unregister_imgui_font_mapping(void *font) {
 
 extern "C" void modmanager_pccompat_set_unity_main_work_callback(void *callback) {
     using namespace starray::unity_presentation_sink;
+    callback = protect_pccompat_managed_callback(
+        callback,
+        kUnityMainWorkCallbackDescriptorSlot,
+        "unity-main-work");
     g_unity_main_work_callback.store(
         reinterpret_cast<UnityMainWorkCallback>(callback),
         std::memory_order_release);
@@ -985,6 +1040,10 @@ extern "C" int modmanager_pccompat_request_unity_main_work() {
 
 extern "C" void modmanager_pccompat_set_managed_frame_callback(void *callback) {
     using namespace starray::unity_presentation_sink;
+    callback = protect_pccompat_managed_callback(
+        callback,
+        kManagedFrameCallbackDescriptorSlot,
+        "managed-frame");
     g_managed_frame_callback.store(
         reinterpret_cast<ManagedFrameCallback>(callback),
         std::memory_order_release);
@@ -994,6 +1053,10 @@ extern "C" void modmanager_pccompat_set_managed_frame_callback(void *callback) {
 
 extern "C" void modmanager_pccompat_set_managed_ongui_callback(void *callback) {
     using namespace starray::unity_presentation_sink;
+    callback = protect_pccompat_managed_callback(
+        callback,
+        kManagedOnGuiCallbackDescriptorSlot,
+        "managed-ongui");
     g_managed_ongui_callback.store(
         reinterpret_cast<ManagedOnGUICallback>(callback),
         std::memory_order_release);
@@ -1049,6 +1112,11 @@ extern "C" void modmanager_pccompat_set_managed_frame_mode(int mode) {
 }
 
 extern "C" void modmanager_pccompat_set_ui_resource_resolver(void *callback) {
+    using namespace starray::unity_presentation_sink;
+    callback = protect_pccompat_managed_callback(
+        callback,
+        kResourceResolverCallbackDescriptorSlot,
+        "resource-resolver");
     starray::unity_presentation_objects::set_resource_resolver_callback(callback);
 }
 

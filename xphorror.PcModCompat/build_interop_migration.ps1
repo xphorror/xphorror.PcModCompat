@@ -2,11 +2,8 @@ param(
     [ValidateSet('Release', 'Debug')]
     [string]$Configuration = 'Release',
 
-    [Parameter(Mandatory = $true)]
-    [string]$DumpPath,
-
-    [Parameter(Mandatory = $true)]
-    [string]$PcAssemblyDirectory,
+    [string]$DumpPath = 'E:\ADOFAI\ADOFAI_312_DUMP\dump.cs',
+    [string]$PcAssemblyDirectory = 'E:\ADOFAI\scnEditor_312_unity6\AssetRipper_export_20260620_031057\AuxiliaryFiles\GameAssemblies',
     [string]$TypeSeedPath,
     [string]$SurfacePath,
     [string]$AutoSurfaceModPath,
@@ -15,7 +12,8 @@ param(
     [switch]$SkipForkBuild,
     [switch]$SkipAndroidBuild,
     [switch]$SkipProxyGeneration,
-    [switch]$IncludeAutoSurfaceIgnored
+    [switch]$IncludeAutoSurfaceIgnored,
+    [switch]$Rebuild
 )
 
 $ErrorActionPreference = 'Stop'
@@ -28,6 +26,10 @@ $ClosureToolProject = Join-Path $CompatRoot 'tools\ProxyInputClosure\ProxyInputC
 $AuditToolProject = Join-Path $CompatRoot 'tools\ProxyAssemblyAudit\ProxyAssemblyAudit.csproj'
 $RewriteToolProject = Join-Path $CompatRoot 'tools\ModAssemblyRewriter\ModAssemblyRewriter.csproj'
 $SurfaceScannerProject = Join-Path $CompatRoot 'tools\ProxySurfaceScanner\ProxySurfaceScanner.csproj'
+$buildTarget = @()
+if ($Rebuild) {
+    $buildTarget += '-t:Rebuild'
+}
 
 if ([string]::IsNullOrWhiteSpace($TypeSeedPath)) {
     $TypeSeedPath = Join-Path $CompatRoot 'tools\AndroidDumpIndex\proxy_seed_types.txt'
@@ -115,24 +117,24 @@ Push-Location $RepoRoot
 try {
     if (!$SkipForkBuild) {
         Invoke-Checked 'build forked Il2CppInterop' {
-            dotnet build '.\Il2CppInterop\Il2CppInterop.sln' -c $Configuration --nologo
+            dotnet build '.\Il2CppInterop\Il2CppInterop.sln' -c $Configuration --nologo @buildTarget
         }
     }
 
     Invoke-Checked 'build Android dump indexer' {
-        dotnet build $ToolProject -c $Configuration --nologo
+        dotnet build $ToolProject -c $Configuration --nologo @buildTarget
     }
     Invoke-Checked 'build proxy dependency closure tool' {
-        dotnet build $ClosureToolProject -c $Configuration --nologo
+        dotnet build $ClosureToolProject -c $Configuration --nologo @buildTarget
     }
     Invoke-Checked 'build generated proxy audit tool' {
-        dotnet build $AuditToolProject -c $Configuration --nologo
+        dotnet build $AuditToolProject -c $Configuration --nologo @buildTarget
     }
     Invoke-Checked 'build PC MOD proxy member rewriter' {
-        dotnet build $RewriteToolProject -c $Configuration --nologo
+        dotnet build $RewriteToolProject -c $Configuration --nologo @buildTarget
     }
     Invoke-Checked 'build PC MOD proxy surface scanner' {
-        dotnet build $SurfaceScannerProject -c $Configuration --nologo
+        dotnet build $SurfaceScannerProject -c $Configuration --nologo @buildTarget
     }
 
     $ToolDll = Join-Path $CompatRoot "tools\AndroidDumpIndex\bin\$Configuration\net10.0\AndroidDumpIndex.dll"
@@ -234,7 +236,8 @@ try {
             dotnet build '.\StArray.ModManager.Android\StArray.ModManager.Android.csproj' `
                 -c $Configuration `
                 -p:Il2CppInteropAndroidSlim=true `
-                --nologo
+                --nologo `
+                @buildTarget
         }
 
         $ManagedOut = Join-Path $RepoRoot "StArray.ModManager.Android\bin\$Configuration\net10.0"

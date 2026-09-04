@@ -43,6 +43,10 @@ void process_triggers(
 // Called from verified fixed-op hooks. Only scalar state crosses into the
 // worker; Unity objects remain owned by the UnityMain presentation sink.
 void publish_overlay_state(uint32_t generation, bool visible);
+void publish_bundle_overlay_state(
+    uint32_t bundle_id,
+    uint32_t generation,
+    bool visible);
 
 ExecutionOutcome execute_scheduled_task(
     const hud_logic::ScheduledPresentationTask &task,

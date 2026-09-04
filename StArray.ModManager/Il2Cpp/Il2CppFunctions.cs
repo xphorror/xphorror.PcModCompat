@@ -651,7 +651,7 @@ public unsafe class Il2CppFunctions
     public static void SetIl2CppLibraryPath(string path)
     {
         //用DllImportResolver处理
-        NativeLibrary.SetDllImportResolver(typeof(Il2CppFunctions).Assembly, (libraryName, assembly, searchPath) =>
+        NativeLibrary.SetDllImportResolver(typeof(Il2CppFunctions).Assembly, (libraryName, assembly, searchPath) => 
         {
             if (libraryName == "IL2CPP_LIBRARY_NAME") return NativeLibrary.Load(path);
             return IntPtr.Zero;

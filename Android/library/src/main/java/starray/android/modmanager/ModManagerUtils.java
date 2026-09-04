@@ -118,7 +118,7 @@ public class ModManagerUtils {
             lp.gravity = android.view.Gravity.BOTTOM | android.view.Gravity.LEFT;
             sHiddenEditText.setLayoutParams(lp);
             frameLayout.addView(sHiddenEditText);
-
+            
             sHiddenEditText.requestFocus();
             sEditTextAdded = true;
             Log.i("ModManagerUtils", "EditText added to UnityPlayer.getFrameLayout(), focus=" + sHiddenEditText.hasFocus());

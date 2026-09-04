@@ -1,5 +1,6 @@
 using System.Reflection;
 using System.Runtime.Loader;
+using StArray.ModManager.Runtime;
 
 namespace Xphorror.PcModCompat;
 
@@ -8,6 +9,17 @@ public static class PcCompatManagedLoader
     public static PcCompatManagedModSession Load(PcModManifest manifest, PcCompatLoadOptions? options = null)
     {
         options ??= new PcCompatLoadOptions();
+        var pcModSession = options.PcModSession;
+        var ownsPcModSession = false;
+        if (pcModSession == null)
+        {
+            var request = PcCompatModSessionIdentity.Create(manifest, 1, 1);
+            pcModSession = PcCompatModSessionLease.CreateLocal(request);
+            ownsPcModSession = true;
+        }
+        if (pcModSession?.IsActive != true)
+            throw new InvalidOperationException(
+                $"Native PC MOD session is unavailable before managed load for mod={manifest.Id}.");
 
         var hasRewrittenAssembly = !string.IsNullOrWhiteSpace(options.TargetAssemblyPath);
         var hasProxyFolder = !string.IsNullOrWhiteSpace(options.ProxyFolder);
@@ -39,17 +51,25 @@ public static class PcCompatManagedLoader
             manifest.FolderPath,
             shimFolder,
             options.ProxyFolder,
-            options.RewrittenAssemblyPaths);
+            options.RewrittenAssemblyPaths,
+            pcModSession);
         object? instance = null;
+        PcCompatManagedModSession? session = null;
+        var managedBindingsBound = false;
         try
         {
+            var resourceSession = RunStage(
+                "resolve managed session generation",
+                () => ResolveResourceSessionIdentity(manifest, pcModSession));
+            var resourceSessionGeneration = resourceSession.Generation;
+            RunStage(
+                "bind managed session roots",
+                () => PcCompatManagedSessionBindings.Bind(manifest, resourceSessionGeneration));
+            managedBindingsBound = true;
+
             var modEntry = RunStage(
                 "create UnityModManager entry",
                 () => CreateUnityModEntry(context, manifest));
-            var resourceSessionGeneration =
-                PcCompatResourceRecipeRuntime.TryGetSessionGeneration(manifest.Id, out var generation)
-                    ? generation
-                    : 0;
 
             // Clear before any MOD code runs, not after bootstrap: the shim registries are statics that
             // outlive a single load when the shim assemblies resolve outside the collectible context, and
@@ -64,6 +84,9 @@ public static class PcCompatManagedLoader
                 : manifest.EntryAssemblyPath;
             if (options.TryBootstrap && File.Exists(bootstrapAssemblyPath) && !string.IsNullOrWhiteSpace(manifest.EntryMethod))
             {
+                if (!pcModSession.IsActive)
+                    throw new InvalidOperationException(
+                        $"Native PC MOD session expired before bootstrap for mod={manifest.Id}.");
                 bootstrapAttempted = true;
                 using var execution = PcCompatManagedExecutionContext.Enter(
                     new PcCompatManagedExecutionState(
@@ -77,40 +100,64 @@ public static class PcCompatManagedLoader
                     bootstrapAssemblyPath);
             }
 
+            if (!pcModSession.IsActive)
+                throw new InvalidOperationException(
+                    $"Native PC MOD session expired before assembly load for mod={manifest.Id}.");
             var assembly = RunStage(
                 "load rewritten assembly",
                 () => context.LoadFromAssemblyPath(targetAssemblyPath));
-            var mainType = RunStage(
-                "resolve main type",
-                () => assembly.GetType(ResolveMainTypeName(manifest), throwOnError: true)!);
-            instance = RunStage(
-                "construct main instance",
-                () => Activator.CreateInstance(mainType)
-                      ?? throw new InvalidOperationException(
-                          $"Could not create PC MOD main instance: {mainType.FullName}"));
-
-            using (PcCompatManagedExecutionContext.Enter(
-                       new PcCompatManagedExecutionState(
-                           manifest.Id,
-                           resourceSessionGeneration,
-                           PcCompatManagedExecutionPhase.Setup)))
+            var setupCompleted = false;
+            if (manifest.Kind == PcModKind.UnityModManager)
             {
-                RunStage(
-                    "invoke CompatSetup",
-                    () => InvokeLifecycle(
-                        instance,
-                        "CompatSetup",
-                        new object?[] { manifest.FolderPath },
-                        required: true));
+                // UMM's EntryMethod is a static loader callback. It creates the MOD's event
+                // adapter during bootstrap; treating its declaring type as a normal main MOD
+                // instance makes reflection try to construct an abstract static class.
+                if (!bootstrapAttempted || !bootstrapSucceeded)
+                {
+                    throw new InvalidOperationException(
+                        $"UMM MOD bootstrap did not complete for mod={manifest.Id} " +
+                        $"entry={manifest.EntryMethod}.");
+                }
+
+                instance = new PcCompatUmmLifecycleAdapter(modEntry);
+                setupCompleted = true;
             }
-            var setupCompleted = true;
+            else
+            {
+                var mainType = RunStage(
+                    "resolve main type",
+                    () => assembly.GetType(ResolveMainTypeName(manifest), throwOnError: true)!);
+                instance = RunStage(
+                    "construct main instance",
+                    () => Activator.CreateInstance(mainType)
+                          ?? throw new InvalidOperationException(
+                              $"Could not create PC MOD main instance: {mainType.FullName}"));
+
+                using (PcCompatManagedExecutionContext.Enter(
+                           new PcCompatManagedExecutionState(
+                               manifest.Id,
+                               resourceSessionGeneration,
+                               PcCompatManagedExecutionPhase.Setup)))
+                {
+                    if (!pcModSession.IsActive)
+                        throw new InvalidOperationException(
+                            $"Native PC MOD session expired before CompatSetup for mod={manifest.Id}.");
+                    RunStage(
+                        "invoke CompatSetup",
+                        () => InvokeLifecycle(
+                            instance,
+                            "CompatSetup",
+                            new object?[] { manifest.FolderPath },
+                            required: true));
+                }
+                setupCompleted = true;
+            }
 
             var patches = RunStage(
                 "snapshot registered patches",
                 () => SnapshotPatches(context, manifest.Id));
 
             var enableCompleted = false;
-            PcCompatManagedModSession? session = null;
             session = new PcCompatManagedModSession(
                 manifest,
                 context,
@@ -123,7 +170,14 @@ public static class PcCompatManagedLoader
                 setupCompleted,
                 enableCompleted,
                 resourceSessionGeneration,
-                usesRewrittenAssembly: hasRewrittenAssembly);
+                usesRewrittenAssembly: hasRewrittenAssembly,
+                hasResourceRecipeSession: resourceSession.HasRecipeSession,
+                options.RuntimeSession,
+                 options.RuntimeKey,
+                 pcModSession,
+                 ownsPcModSession);
+            // The managed session now owns the generation bindings and revokes them from Disable.
+            managedBindingsBound = false;
             if (options.Enable)
             {
                 if (!session.TryEnable(out var enableError))
@@ -141,7 +195,18 @@ public static class PcCompatManagedLoader
             // A collectible ALC that never reached a session must not linger: any
             // Default-ALC static registrations made by bootstrap/setup would anchor
             // it forever and double-register on the next load attempt.
-            if (instance is IDisposable disposable)
+            if (session != null)
+            {
+                try
+                {
+                    session.Dispose();
+                }
+                catch
+                {
+                    // Best-effort cleanup on the failure path.
+                }
+            }
+            else if (instance is IDisposable disposable)
             {
                 try
                 {
@@ -154,7 +219,68 @@ public static class PcCompatManagedLoader
             }
             if (context.IsCollectible)
                 context.Unload();
+            if (managedBindingsBound)
+            {
+                var generation = ResolveBestEffortGeneration(manifest, pcModSession);
+                PcCompatManagedSessionBindings.Clear(manifest.Id, generation);
+            }
+            if (ownsPcModSession)
+                pcModSession.Dispose();
             throw;
+        }
+    }
+
+    internal static long ResolveResourceSessionGeneration(
+        PcModManifest manifest,
+        PcCompatModSessionLease pcModSession)
+        => ResolveResourceSessionIdentity(manifest, pcModSession).Generation;
+
+    internal static PcCompatManagedResourceSessionIdentity ResolveResourceSessionIdentity(
+        PcModManifest manifest,
+        PcCompatModSessionLease pcModSession)
+    {
+        ArgumentNullException.ThrowIfNull(manifest);
+        ArgumentNullException.ThrowIfNull(pcModSession);
+
+        var nativeGeneration = pcModSession.Request.ResourceGeneration;
+        if (nativeGeneration <= 0)
+            throw new InvalidOperationException(
+                $"Native PC MOD session returned an invalid resource generation for mod={manifest.Id}.");
+
+        if (PcCompatResourceRecipeRuntime.TryGetSessionGeneration(
+                manifest.Id,
+                out var recipeGeneration) &&
+            recipeGeneration > 0)
+        {
+            if (recipeGeneration != nativeGeneration)
+            {
+                throw new InvalidOperationException(
+                    $"PC MOD resource generation mismatch for mod={manifest.Id}: " +
+                    $"native={nativeGeneration} recipe={recipeGeneration}.");
+            }
+            return new PcCompatManagedResourceSessionIdentity(
+                recipeGeneration,
+                HasRecipeSession: true);
+        }
+
+        // JPOV has no resource recipe. The native lease is still authoritative; zero would
+        // leave bootstrap filesystem and network calls outside the MOD's generation scope.
+        return new PcCompatManagedResourceSessionIdentity(
+            nativeGeneration,
+            HasRecipeSession: false);
+    }
+
+    private static long ResolveBestEffortGeneration(
+        PcModManifest manifest,
+        PcCompatModSessionLease pcModSession)
+    {
+        try
+        {
+            return ResolveResourceSessionGeneration(manifest, pcModSession);
+        }
+        catch
+        {
+            return pcModSession.Request.ResourceGeneration;
         }
     }
 
@@ -272,8 +398,8 @@ public static class PcCompatManagedLoader
             var method = type.GetMethod(methodName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static)
                 ?? throw new MissingMethodException(type.FullName, methodName);
             var parameters = BuildArguments(method, modEntry, manifest.FolderPath);
-            method.Invoke(null, parameters);
-            return true;
+            var result = method.Invoke(null, parameters);
+            return result is not bool success || success;
         }
         catch (Exception exception)
         {
@@ -326,6 +452,62 @@ public static class PcCompatManagedLoader
         }
 
         method.Invoke(instance, args);
+    }
+
+    private sealed class PcCompatUmmLifecycleAdapter : IDisposable
+    {
+        private readonly object _entry;
+        private readonly PropertyInfo _activeProperty;
+        private readonly FieldInfo _updateField;
+        private int _disposed;
+
+        public PcCompatUmmLifecycleAdapter(object entry)
+        {
+            _entry = entry ?? throw new ArgumentNullException(nameof(entry));
+            var entryType = entry.GetType();
+            _activeProperty = entryType.GetProperty(
+                                  "Active",
+                                  BindingFlags.Public | BindingFlags.Instance)
+                              ?? throw new MissingMemberException(entryType.FullName, "Active");
+            _updateField = entryType.GetField(
+                               "OnUpdate",
+                               BindingFlags.Public | BindingFlags.Instance)
+                           ?? throw new MissingFieldException(entryType.FullName, "OnUpdate");
+        }
+
+        public void CompatEnable()
+        {
+            ThrowIfDisposed();
+            _activeProperty.SetValue(_entry, true);
+            if (_activeProperty.GetValue(_entry) is not true)
+                throw new InvalidOperationException("UMM MOD rejected activation.");
+        }
+
+        public void CompatUpdate(float deltaTime)
+        {
+            ThrowIfDisposed();
+            var callback = _updateField.GetValue(_entry) as Delegate;
+            callback?.DynamicInvoke(_entry, deltaTime);
+        }
+
+        public void CompatDisable()
+        {
+            if (Volatile.Read(ref _disposed) != 0)
+                return;
+            _activeProperty.SetValue(_entry, false);
+        }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) == 0)
+                _activeProperty.SetValue(_entry, false);
+        }
+
+        private void ThrowIfDisposed()
+        {
+            if (Volatile.Read(ref _disposed) != 0)
+                throw new ObjectDisposedException(nameof(PcCompatUmmLifecycleAdapter));
+        }
     }
 
     private static T RunStage<T>(string stage, Func<T> action)
@@ -450,6 +632,10 @@ public static class PcCompatManagedLoader
         };
 }
 
+internal readonly record struct PcCompatManagedResourceSessionIdentity(
+    long Generation,
+    bool HasRecipeSession);
+
 internal sealed class PcCompatAssemblyLoadContext : AssemblyLoadContext
 {
     private static readonly HashSet<string> SharedRuntimeAssemblyNames = new(
@@ -466,15 +652,18 @@ internal sealed class PcCompatAssemblyLoadContext : AssemblyLoadContext
 
     private readonly Dictionary<string, string> _assemblyPaths;
     private readonly HashSet<string> _proxyAssemblyNames;
+    private readonly PcCompatModSessionLease? _pcModSession;
 
     public PcCompatAssemblyLoadContext(
         string modId,
         string modFolder,
         string shimFolder,
         string? proxyFolder = null,
-        IReadOnlyDictionary<string, string>? rewrittenAssemblyPaths = null)
+        IReadOnlyDictionary<string, string>? rewrittenAssemblyPaths = null,
+        PcCompatModSessionLease? pcModSession = null)
         : base($"PcCompat:{modId}", isCollectible: true)
     {
+        _pcModSession = pcModSession;
         _proxyAssemblyNames = !string.IsNullOrWhiteSpace(proxyFolder) && Directory.Exists(proxyFolder)
             ? Directory.GetFiles(proxyFolder, "*.dll")
                 .Select(Path.GetFileNameWithoutExtension)
@@ -505,6 +694,9 @@ internal sealed class PcCompatAssemblyLoadContext : AssemblyLoadContext
 
     protected override Assembly? Load(AssemblyName assemblyName)
     {
+        if (_pcModSession != null && !_pcModSession.IsActive)
+            throw new InvalidOperationException(
+                $"PC MOD session expired while resolving assembly '{assemblyName.Name}'.");
         var simpleName = assemblyName.Name ?? string.Empty;
         if (_proxyAssemblyNames.Contains(simpleName) ||
             SharedRuntimeAssemblyNames.Contains(simpleName))

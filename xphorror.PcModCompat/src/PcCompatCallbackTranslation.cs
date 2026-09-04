@@ -33,7 +33,7 @@ public sealed class PcCompatCallbackTranslationItem
 
 public sealed class PcCompatCallbackTranslationReport
 {
-    public const string CurrentFormatVersion = "callback-translation-v8-editor-rabbit-writeback";
+    public const string CurrentFormatVersion = "callback-translation-v9-managed-only-catalog";
 
     public string FormatVersion { get; init; } = CurrentFormatVersion;
     public required string ModId { get; init; }

@@ -7,6 +7,7 @@ using System.Reflection.Emit;
 using System.Collections.Immutable;
 using System.Text;
 using System.Text.Json;
+using Xphorror.PcModCompat.Tools;
 
 var options = CommandLineOptions.Parse(args);
 if (options is null)
@@ -132,6 +133,7 @@ internal static class ProxyAuditor
 
             AuditAllGenericProxyStaticConstructors(reader, pe, assemblyName, issues);
             AuditNativePointerProducerGuards(reader, pe, assemblyName, issues);
+            AuditManagedBridgeOwnedSurface(reader, assemblyName, issues);
         }
 
         foreach (var expected in new[]
@@ -758,30 +760,44 @@ internal static class ProxyAuditor
             issues);
         AuditRequiredMethod(reader, assetBundle, "LoadFromFileAsync", 1, isStatic: true, issues);
         AuditRequiredMethod(reader, assetBundle, "LoadAssetAsync", 2, isStatic: false, issues);
-        AuditRequiredMethod(reader, assetBundle, "Unload", 1, isStatic: false, issues);
-        AuditForbiddenMethod(reader, assetBundle, "LoadFromFile", issues);
-        AuditForbiddenMethod(reader, assetBundle, "LoadAsset", issues);
-        AuditForbiddenMethod(reader, assetBundle, "LoadAllAssets", issues);
         AuditRequiredMethod(reader, createRequest, "get_assetBundle", 0, isStatic: false, issues);
         AuditRequiredMethod(reader, assetRequest, "get_asset", 0, isStatic: false, issues);
     }
 
-    private static void AuditForbiddenMethod(
+    private static void AuditManagedBridgeOwnedSurface(
         MetadataReader reader,
-        TypeDefinition? type,
-        string methodName,
+        string assemblyName,
         List<string> issues)
     {
-        if (type is null)
-            return;
-        var count = type.Value.GetMethods()
-            .Select(reader.GetMethodDefinition)
-            .Count(method => reader.GetString(method.Name) == methodName);
-        if (count != 0)
+        foreach (var typeHandle in reader.TypeDefinitions)
         {
-            issues.Add(
-                $"Bridge-owned method leaked into Android native proxy surface: " +
-                $"{GetTypeDefinitionFullName(reader, type.Value)}.{methodName}; count={count}.");
+            var type = reader.GetTypeDefinition(typeHandle);
+            var typeName = ManagedBridgeOwnedSurface.Normalize(
+                GetTypeDefinitionFullName(reader, type));
+            foreach (var methodHandle in type.GetMethods())
+            {
+                var method = reader.GetMethodDefinition(methodHandle);
+                var signature = method.DecodeSignature(
+                    ProxySignatureTypeProvider.Instance,
+                    genericContext: null);
+                var entry = string.Join(
+                    '|',
+                    "M",
+                    assemblyName,
+                    typeName,
+                    method.Attributes.HasFlag(MethodAttributes.Static) ? "static" : "instance",
+                    method.GetGenericParameters().Count,
+                    ManagedBridgeOwnedSurface.Normalize(signature.ReturnType),
+                    reader.GetString(method.Name),
+                    string.Join(
+                        ';',
+                        signature.ParameterTypes.Select(ManagedBridgeOwnedSurface.Normalize)));
+                if (ManagedBridgeOwnedSurface.Contains(entry))
+                {
+                    issues.Add(
+                        $"Bridge-owned method leaked into Android native proxy surface: {entry}.");
+                }
+            }
         }
     }
 
@@ -978,7 +994,9 @@ internal static class ProxyAuditor
         {
             AuditRequiredMethod(reader, text, setter, 1, false, issues, genericParameterCount: 0);
         }
+        AuditRequiredMethod(reader, tmpAsset, "get_faceInfo", 0, false, issues, genericParameterCount: 0);
         AuditRequiredMethod(reader, tmpAsset, "set_faceInfo", 1, false, issues, genericParameterCount: 0);
+        AuditRequiredMethod(reader, tmpAsset, "get_material", 0, false, issues, genericParameterCount: 0);
         AuditRequiredMethod(reader, tmpAsset, "set_material", 1, false, issues, genericParameterCount: 0);
         AuditRequiredMethod(reader, tmpAsset, "set_hashCode", 1, false, issues, genericParameterCount: 0);
         AuditRequiredMethod(
@@ -992,6 +1010,25 @@ internal static class ProxyAuditor
             AuditRequiredMethod(reader, fontAsset, setter, 1, false, issues, genericParameterCount: 0);
         AuditRequiredMethod(
             reader, fontAsset, "ReadFontAssetDefinition", 0, false, issues, genericParameterCount: 0);
+        if (fontAsset is not null)
+        {
+            foreach (var parameters in new[]
+                     {
+                         new[] { "System.String", "System.Boolean" },
+                         new[] { "System.String", "System.String&", "System.Boolean" }
+                     })
+            {
+                AuditRequiredMethodSignature(
+                    reader,
+                    fontAsset.Value,
+                    "TryAddCharacters",
+                    isStatic: false,
+                    genericParameterCount: 0,
+                    returnType: "System.Boolean",
+                    parameterTypes: parameters,
+                    issues);
+            }
+        }
         foreach (var property in new[]
                  {
                      "m_ElementType", "m_Unicode", "m_TextAsset", "m_Glyph", "m_GlyphIndex",
@@ -1168,6 +1205,23 @@ internal static class ProxyAuditor
         return string.IsNullOrEmpty(ns) ? name : ns + "." + name;
     }
 
+    private static string GetTypeReferenceFullName(
+        MetadataReader reader,
+        TypeReferenceHandle handle)
+    {
+        var type = reader.GetTypeReference(handle);
+        var name = reader.GetString(type.Name);
+        if (type.ResolutionScope.Kind == HandleKind.TypeReference)
+        {
+            return GetTypeReferenceFullName(
+                       reader,
+                       (TypeReferenceHandle)type.ResolutionScope) + "/" + name;
+        }
+
+        var ns = reader.GetString(type.Namespace);
+        return string.IsNullOrEmpty(ns) ? name : ns + "." + name;
+    }
+
     private sealed class ProxySignatureTypeProvider : ISignatureTypeProvider<string, object?>
     {
         public static readonly ProxySignatureTypeProvider Instance = new();
@@ -1182,7 +1236,29 @@ internal static class ProxyAuditor
         public string GetModifiedType(string modifier, string unmodifiedType, bool isRequired) => unmodifiedType;
         public string GetPinnedType(string elementType) => elementType;
         public string GetPointerType(string elementType) => elementType + "*";
-        public string GetPrimitiveType(PrimitiveTypeCode typeCode) => typeCode.ToString();
+        public string GetPrimitiveType(PrimitiveTypeCode typeCode)
+            => typeCode switch
+            {
+                PrimitiveTypeCode.Boolean => "System.Boolean",
+                PrimitiveTypeCode.Byte => "System.Byte",
+                PrimitiveTypeCode.Char => "System.Char",
+                PrimitiveTypeCode.Double => "System.Double",
+                PrimitiveTypeCode.Int16 => "System.Int16",
+                PrimitiveTypeCode.Int32 => "System.Int32",
+                PrimitiveTypeCode.Int64 => "System.Int64",
+                PrimitiveTypeCode.IntPtr => "System.IntPtr",
+                PrimitiveTypeCode.Object => "System.Object",
+                PrimitiveTypeCode.SByte => "System.SByte",
+                PrimitiveTypeCode.Single => "System.Single",
+                PrimitiveTypeCode.String => "System.String",
+                PrimitiveTypeCode.TypedReference => "System.TypedReference",
+                PrimitiveTypeCode.UInt16 => "System.UInt16",
+                PrimitiveTypeCode.UInt32 => "System.UInt32",
+                PrimitiveTypeCode.UInt64 => "System.UInt64",
+                PrimitiveTypeCode.UIntPtr => "System.UIntPtr",
+                PrimitiveTypeCode.Void => "System.Void",
+                _ => typeCode.ToString()
+            };
         public string GetSZArrayType(string elementType) => elementType + "[]";
 
         public string GetTypeFromDefinition(
@@ -1195,12 +1271,7 @@ internal static class ProxyAuditor
             MetadataReader reader,
             TypeReferenceHandle handle,
             byte rawTypeKind)
-        {
-            var type = reader.GetTypeReference(handle);
-            var name = reader.GetString(type.Name);
-            var ns = reader.GetString(type.Namespace);
-            return string.IsNullOrEmpty(ns) ? name : ns + "." + name;
-        }
+            => GetTypeReferenceFullName(reader, handle);
 
         public string GetTypeFromSpecification(
             MetadataReader reader,
@@ -1213,6 +1284,20 @@ internal static class ProxyAuditor
     private static void AuditAssemblyCSharp(MetadataReader reader, List<string> issues)
     {
         AuditRequiredType(reader, string.Empty, "HitMargin", issues);
+
+        var controller = AuditRequiredType(reader, string.Empty, "scrController", issues);
+        if (controller is not null)
+        {
+            var controllerProperties = controller.Value.GetProperties()
+                .Select(handle => reader.GetPropertyDefinition(handle))
+                .ToDictionary(property => reader.GetString(property.Name), StringComparer.Ordinal);
+            AuditReadableWritableProperty(
+                reader,
+                controllerProperties,
+                "txtLevelNameOriginalPosition",
+                "Nullable`1",
+                issues);
+        }
 
         TypeDefinition? tracker = null;
         foreach (var handle in reader.TypeDefinitions)
@@ -1248,6 +1333,45 @@ internal static class ProxyAuditor
             isStatic: true,
             issues,
             genericParameterCount: 0);
+    }
+
+    private static void AuditReadableWritableProperty(
+        MetadataReader reader,
+        IReadOnlyDictionary<string, PropertyDefinition> properties,
+        string name,
+        string expectedValueTypeSuffix,
+        List<string> issues)
+    {
+        if (!properties.TryGetValue(name, out var property))
+        {
+            issues.Add($"scrController proxy property is missing: {name}.");
+            return;
+        }
+
+        var accessors = property.GetAccessors();
+        if (accessors.Getter.IsNil || accessors.Setter.IsNil)
+        {
+            issues.Add($"scrController.{name} must expose both getter and setter.");
+            return;
+        }
+
+        var getterSignature = reader.GetMethodDefinition(accessors.Getter).DecodeSignature(
+            ProxySignatureTypeProvider.Instance,
+            genericContext: null);
+        var setterSignature = reader.GetMethodDefinition(accessors.Setter).DecodeSignature(
+            ProxySignatureTypeProvider.Instance,
+            genericContext: null);
+        var getterType = getterSignature.ReturnType;
+        var setterType = setterSignature.ParameterTypes.Length == 1
+            ? setterSignature.ParameterTypes[0]
+            : string.Empty;
+        if (!getterType.Contains(expectedValueTypeSuffix, StringComparison.Ordinal) ||
+            !string.Equals(getterType, setterType, StringComparison.Ordinal))
+        {
+            issues.Add(
+                $"scrController.{name} has unexpected nullable value type: " +
+                $"getter={getterType}; setter={setterType}.");
+        }
     }
 
     private static void AuditReadableProperty(

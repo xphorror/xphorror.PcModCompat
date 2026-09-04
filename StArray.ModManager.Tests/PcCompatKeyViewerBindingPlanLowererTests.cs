@@ -12,7 +12,7 @@ public sealed class PcCompatKeyViewerBindingPlanLowererTests
         var result = PcCompatKeyViewerBindingPlanLowerer.Lower(
             adapter,
             overrides,
-            _ => (true, [97, 0x1000 + 0x5A], null));
+            (_, _) => (true, [97, 0x1000 + 0x5A], null));
 
         Assert.That(result.Issues, Is.Empty);
         var plan = result.Plans.Single();
@@ -29,6 +29,117 @@ public sealed class PcCompatKeyViewerBindingPlanLowererTests
         });
     }
 
+    /// <summary>
+    /// The lowerer already invokes the provider, so it is the only place that can report the raw
+    /// sequence without a second call into MOD code. The change watcher needs that sequence as its
+    /// baseline.
+    /// </summary>
+    [Test]
+    public void LoweringReportsOnlyTheSelectedProviderSequenceForChangeWatching()
+    {
+        var (adapter, overrides) = CreateConfiguration();
+        var feature = adapter.Features.Single();
+        ((List<PcCompatKeyViewerRoleBinding>)feature.Roles).Add(new PcCompatKeyViewerRoleBinding
+        {
+            Role = "BindingProvider",
+            AssemblyName = "TestMod",
+            TypeName = "TestMod.Viewer",
+            MemberName = "GetGhostKeys",
+            MemberKind = "Method",
+            Evidence = new PcCompatAdapterEvidence
+            {
+                Status = PcCompatAdapterEvidenceStatus.Probable,
+                Evidence = ["alternate ghost provider"],
+                FirstBreak = "runtime provider"
+            }
+        });
+
+        var result = PcCompatKeyViewerBindingPlanLowerer.Lower(
+            adapter,
+            overrides,
+            (role, _) => role.MemberName == "GetKeys"
+                ? (true, [97, 98], null)
+                : (true, [0, 0], null));
+
+        var resolved = result.ResolvedProviders.Single();
+        Assert.Multiple(() =>
+        {
+            // Rejected candidates must not be watched: polling them every interval would run MOD
+            // code that backs no live plan.
+            Assert.That(resolved.Role.MemberName, Is.EqualTo("GetKeys"));
+            Assert.That(resolved.FeatureId, Is.EqualTo(feature.Id));
+            Assert.That(resolved.Values, Is.EqualTo(new[] { 97, 98 }));
+        });
+    }
+
+    [Test]
+    public void RecoveredProviderIsTheOneReportedForChangeWatching()
+    {
+        var (adapter, overrides) = CreateConfiguration();
+        var feature = adapter.Features.Single();
+        ((List<PcCompatKeyViewerRoleBinding>)feature.Roles).Add(new PcCompatKeyViewerRoleBinding
+        {
+            Role = "BindingProvider",
+            AssemblyName = "TestMod",
+            TypeName = "TestMod.Viewer",
+            MemberName = "GetMainKeys",
+            MemberKind = "Method",
+            Evidence = new PcCompatAdapterEvidence
+            {
+                Status = PcCompatAdapterEvidenceStatus.Probable,
+                Evidence = ["alternate counted provider"],
+                FirstBreak = "runtime provider"
+            }
+        });
+
+        var result = PcCompatKeyViewerBindingPlanLowerer.Lower(
+            adapter,
+            overrides,
+            (role, _) => role.MemberName == "GetMainKeys"
+                ? (true, [97, 98], null)
+                : (true, [0, 0], null));
+
+        var resolved = result.ResolvedProviders.Single();
+        Assert.Multiple(() =>
+        {
+            Assert.That(resolved.Role.MemberName, Is.EqualTo("GetMainKeys"));
+            Assert.That(resolved.Values, Is.EqualTo(new[] { 97, 98 }));
+        });
+    }
+
+    /// <summary>
+    /// External mode publishes no consumer plan but still renders labels from the provider, so its
+    /// sequence has to be watched too or the labels go stale.
+    /// </summary>
+    [Test]
+    public void PresentationOnlyFeaturesAreStillReportedForChangeWatching()
+    {
+        var (adapter, overrides) = CreateConfiguration();
+        overrides.Features.Single().InputMode = PcCompatKeyViewerInputMode.External;
+
+        var result = PcCompatKeyViewerBindingPlanLowerer.Lower(
+            adapter,
+            overrides,
+            (_, _) => (true, [97, 98], null));
+
+        Assert.That(result.Plans, Is.Empty);
+        Assert.That(result.ResolvedProviders.Single().Values, Is.EqualTo(new[] { 97, 98 }));
+    }
+
+    [Test]
+    public void FailedLoweringReportsNoProviderSequence()
+    {
+        var (adapter, overrides) = CreateConfiguration();
+
+        var result = PcCompatKeyViewerBindingPlanLowerer.Lower(
+            adapter,
+            overrides,
+            (_, _) => (true, [97], null));
+
+        Assert.That(result.Plans, Is.Empty);
+        Assert.That(result.ResolvedProviders, Is.Empty);
+    }
+
     [Test]
     public void ExternalModeBuildsPresentationPlanWithoutRegisteringTouchConsumerPlan()
     {
@@ -38,7 +149,7 @@ public sealed class PcCompatKeyViewerBindingPlanLowererTests
         var result = PcCompatKeyViewerBindingPlanLowerer.Lower(
             adapter,
             overrides,
-            _ => (true, [97, 0x1000 + 0x5A], null));
+            (_, _) => (true, [97, 0x1000 + 0x5A], null));
 
         Assert.Multiple(() =>
         {
@@ -60,7 +171,7 @@ public sealed class PcCompatKeyViewerBindingPlanLowererTests
         var result = PcCompatKeyViewerBindingPlanLowerer.Lower(
             adapter,
             overrides,
-            _ => (true, [97, 98], null));
+            (_, _) => (true, [97, 98], null));
 
         Assert.That(result.Plans, Is.Empty);
         Assert.That(result.Issues.Single(), Does.Contain("proven IdentityTransform"));
@@ -74,7 +185,7 @@ public sealed class PcCompatKeyViewerBindingPlanLowererTests
         var result = PcCompatKeyViewerBindingPlanLowerer.Lower(
             adapter,
             overrides,
-            _ => (true, [97], null));
+            (_, _) => (true, [97], null));
 
         Assert.That(result.Plans, Is.Empty);
         Assert.That(result.Issues.Single(), Does.Contain("2 touch lanes"));
@@ -88,12 +199,71 @@ public sealed class PcCompatKeyViewerBindingPlanLowererTests
         var result = PcCompatKeyViewerBindingPlanLowerer.Lower(
             adapter,
             overrides,
-            _ => (true, [97, 97], null));
+            (_, _) => (true, [97, 97], null));
 
         Assert.That(result.Issues, Is.Empty);
         Assert.That(result.Plans.Single().Lanes
             .SelectMany(lane => lane.Identities)
             .Select(identity => identity.Value), Is.EqualTo(new[] { "97", "97" }));
+    }
+
+    [Test]
+    public void RegistryAcceptsVerifiedRewiredActionIdentities()
+    {
+        var (adapter, overrides) = CreateConfiguration();
+        var provider = overrides.Features.Single().Roles.Single(role => role.Role == "BindingProvider");
+        var plan = new PcCompatKeyViewerLoweredConsumerPlan
+        {
+            ModId = adapter.ModId,
+            PackageSha256 = adapter.PackageSha256,
+            ProxySurfaceHash = adapter.ProxySurfaceHash,
+            TargetGameRevision = adapter.TargetGameRevision,
+            FeatureId = adapter.Features.Single().Id,
+            BindingProviderCandidateKey = provider.CandidateKey,
+            Lanes =
+            [
+                new PcCompatKeyViewerLoweredLaneBinding
+                {
+                    Lane = 0,
+                    Identities =
+                    [
+                        new PcCompatInputIdentity
+                        {
+                            Kind = PcCompatInputIdentityKind.ActionId,
+                            Value = "97"
+                        }
+                    ]
+                },
+                new PcCompatKeyViewerLoweredLaneBinding
+                {
+                    Lane = 1,
+                    Identities =
+                    [
+                        new PcCompatInputIdentity
+                        {
+                            Kind = PcCompatInputIdentityKind.ActionId,
+                            Value = "98"
+                        }
+                    ]
+                }
+            ]
+        };
+
+        try
+        {
+            Assert.That(
+                PcCompatKeyViewerLoweredConsumerPlanRegistry.Register(
+                    adapter,
+                    overrides,
+                    plan,
+                    out var error),
+                Is.True,
+                error);
+        }
+        finally
+        {
+            PcCompatKeyViewerLoweredConsumerPlanRegistry.Remove(adapter.ModId);
+        }
     }
 
     [Test]
@@ -119,7 +289,7 @@ public sealed class PcCompatKeyViewerBindingPlanLowererTests
         var result = PcCompatKeyViewerBindingPlanLowerer.Lower(
             adapter,
             overrides,
-            role => role.MemberName == "GetMainKeys"
+            (role, _) => role.MemberName == "GetMainKeys"
                 ? (true, [97, 98], null)
                 : (true, [0, 0], null));
 
@@ -160,7 +330,7 @@ public sealed class PcCompatKeyViewerBindingPlanLowererTests
         var result = PcCompatKeyViewerBindingPlanLowerer.Lower(
             adapter,
             overrides,
-            role => role.MemberName == "GetKeys"
+            (role, _) => role.MemberName == "GetKeys"
                 ? (true, [0, 0], null)
                 : (true, role.MemberName == "GetMainKeysA" ? [97, 98] : [99, 100], null));
 
@@ -192,7 +362,7 @@ public sealed class PcCompatKeyViewerBindingPlanLowererTests
         var result = PcCompatKeyViewerBindingPlanLowerer.Lower(
             adapter,
             overrides,
-            role => role.MemberName == "GetKeys"
+            (role, _) => role.MemberName == "GetKeys"
                 ? (true, [97, 98], null)
                 : (true, [0, 0], null));
 
@@ -240,7 +410,7 @@ public sealed class PcCompatKeyViewerBindingPlanLowererTests
         var result = PcCompatKeyViewerBindingPlanLowerer.Lower(
             adapter,
             overrides,
-            role => role.MemberName == "GetKeys"
+            (role, _) => role.MemberName == "GetKeys"
                 ? (true, [97, 98], null)
                 : (true, [99, 100], null));
 

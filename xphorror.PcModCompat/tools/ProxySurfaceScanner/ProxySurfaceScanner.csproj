@@ -10,6 +10,9 @@
     <ProjectReference Include="..\..\..\dnlib\src\dnlib.csproj" />
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="..\ProxySurfaceContract\ManagedBridgeOwnedSurface.cs" Link="ManagedBridgeOwnedSurface.cs" />
+  </ItemGroup>
+  <ItemGroup>
     <InternalsVisibleTo Include="StArray.ModManager.Tests" />
   </ItemGroup>
 </Project>

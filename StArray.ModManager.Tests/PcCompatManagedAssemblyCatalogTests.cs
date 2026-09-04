@@ -11,7 +11,6 @@ public sealed class PcCompatManagedAssemblyCatalogTests
     {
         var root = FindRepoRoot();
         var modFolder = Path.Combine(root, "JipperResourcePack_release");
-        Assume.That(Directory.Exists(modFolder), Is.True, $"missing sample mod dir: {modFolder}");
         Assert.That(
             PcModManifestReader.TryRead(modFolder, out var manifest, out var error),
             Is.True,
@@ -149,7 +148,7 @@ public sealed class PcCompatManagedAssemblyCatalogTests
         var directory = new DirectoryInfo(TestContext.CurrentContext.TestDirectory);
         while (directory != null)
         {
-            if (File.Exists(Path.Combine(directory.FullName, "StArray.ModManager.slnx")))
+            if (Directory.Exists(Path.Combine(directory.FullName, "JipperResourcePack_release")))
                 return directory.FullName;
             directory = directory.Parent;
         }

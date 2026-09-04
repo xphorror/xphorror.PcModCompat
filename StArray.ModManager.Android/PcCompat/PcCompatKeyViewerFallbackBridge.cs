@@ -42,7 +42,8 @@ internal static class PcCompatKeyViewerFallbackBridge
                 var frame = frames[index];
                 var key = Key(frame.ModId, frame.FeatureId);
                 if (!Visuals.TryGetValue(key, out var visual) ||
-                    visual.LaneCount != frame.LaneCount)
+                    visual.LaneCount != frame.LaneCount ||
+                    visual.SessionGeneration != frame.SessionGeneration)
                 {
                     if (visual != null)
                         visual.Destroy(s_api);
@@ -162,7 +163,13 @@ internal static class PcCompatKeyViewerFallbackBridge
         api.SetCanvasRendererMaterial(rainRenderer, material);
         api.SetCanvasRendererColor(rainRenderer, 0.32f, 0.82f, 1f, 0.72f);
         api.DontDestroyOnLoad(root);
-        return new Visual(root, titleRect, rainRenderer, rainMesh, lanes);
+        return new Visual(
+            root,
+            titleRect,
+            rainRenderer,
+            rainMesh,
+            lanes,
+            frame.SessionGeneration);
     }
 
     private static string Key(string modId, string featureId)
@@ -180,6 +187,7 @@ internal static class PcCompatKeyViewerFallbackBridge
         private readonly nint _rainRenderer;
         private readonly nint _rainMesh;
         private readonly LaneVisual[] _lanes;
+        private readonly long _sessionGeneration;
         private uint _heldMask = uint.MaxValue;
         private readonly ulong[] _counts;
         private readonly string?[] _labels;
@@ -194,18 +202,21 @@ internal static class PcCompatKeyViewerFallbackBridge
             nint titleRect,
             nint rainRenderer,
             nint rainMesh,
-            LaneVisual[] lanes)
+            LaneVisual[] lanes,
+            long sessionGeneration)
         {
             _root = root;
             _titleRect = titleRect;
             _rainRenderer = rainRenderer;
             _rainMesh = rainMesh;
             _lanes = lanes;
+            _sessionGeneration = sessionGeneration;
             _counts = Enumerable.Repeat(ulong.MaxValue, lanes.Length).ToArray();
             _labels = new string?[lanes.Length];
         }
 
         public int LaneCount => _lanes.Length;
+        public long SessionGeneration => _sessionGeneration;
         public uint SeenGeneration { get; set; }
 
         public void Apply(

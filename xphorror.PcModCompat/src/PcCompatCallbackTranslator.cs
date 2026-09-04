@@ -120,6 +120,42 @@ public static class PcCompatCallbackTranslator
                 "cannot be served by a managed callback path.");
         }
 
+        if (PcCompatManagedOnlyCallbackCatalog.TryFind(patch, out var knownManagedOnly))
+        {
+            if (!knownManagedOnly.Supported || knownManagedOnly.TargetSignature == null)
+            {
+                return Item(
+                    patch,
+                    PcCompatCallbackTranslationStatus.Unsupported,
+                    "Known managed-only callback remains fail-closed: " + knownManagedOnly.Reason,
+                    managedDispatchRequired: false);
+            }
+
+            var knownMethods = contexts
+                .SelectMany(context => context.FindMethods(
+                    patch.CallbackType,
+                    patch.CallbackMethod,
+                    patch.CallbackParameterTypeNames))
+                .ToArray();
+            if (knownMethods.Length != 1)
+            {
+                return Item(
+                    patch,
+                    PcCompatCallbackTranslationStatus.Unsupported,
+                    knownMethods.Length == 0
+                        ? "Callback method body with the scanned parameter signature was not found."
+                        : "Callback parameter signature resolved to multiple method bodies.",
+                    managedDispatchRequired: false);
+            }
+
+            return Item(
+                patch,
+                PcCompatCallbackTranslationStatus.Translated,
+                knownManagedOnly.Reason + ". Signature: " + knownManagedOnly.TargetSignature,
+                managedDispatchRequired: true,
+                resolvedTarget: knownManagedOnly.TargetSignature);
+        }
+
         if (!PcCompatTargetSignatureResolver.IsProviderRegistered)
         {
             return Item(

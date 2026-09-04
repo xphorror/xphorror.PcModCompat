@@ -117,6 +117,9 @@ public sealed class PcCompatManagedVirtualBundleActivationTests
 
         var target = new ManagedTarget();
         using var session = CreateSession(manifest, target, generation);
+        var activationNotifications = new List<long>();
+        session.RegisterActivationCompletedObserver(
+            completed => activationNotifications.Add(completed.ResourceSessionGeneration));
         Directory.CreateDirectory(Path.GetDirectoryName(session.ManagedFailureReportPath)!);
         File.WriteAllText(session.ManagedFailureReportPath, "stale failure");
         session.RequestActivation();
@@ -124,9 +127,114 @@ public sealed class PcCompatManagedVirtualBundleActivationTests
         Assert.That(session.TryDispatchUpdate(0.016f), Is.True);
         Assert.That(target.EnableCount, Is.EqualTo(1));
         Assert.That(session.EnableCompleted, Is.True);
+        Assert.That(activationNotifications, Is.Empty);
+        session.NotifyActivationCompletedObservers();
+        Assert.That(activationNotifications, Is.EqualTo(new[] { generation }));
         Assert.That(File.Exists(session.ManagedFailureReportPath), Is.False);
         Assert.That(legacyLoadCalls, Is.Zero,
             "VirtualBundle activation must never ask Unity to load the desktop bundle.");
+    }
+
+    [Test]
+    public void RejectedRawDesktopCandidateDoesNotBlockReadyVirtualBundleActivation()
+    {
+        const string bundleId = "vb.2123456789abcdef0123456789abcdef";
+        const string assetId = "res.2123456789abcdef0123456789abcdef";
+        var bundlePath = Path.Combine(_root, "bundle");
+        File.WriteAllBytes(bundlePath, "desktop-bundle-fixture"u8.ToArray());
+        var candidateSha = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(bundlePath)))
+            .ToLowerInvariant();
+        var recipePath = Path.Combine(_root, "resource_recipe.bin");
+        WriteResourceRecipe(
+            recipePath,
+            bundlePath,
+            candidateSha,
+            platformHint: "Windows",
+            unityVersion: "0.0.0",
+            versionGate: "ForcedOnly",
+            loadPolicy: "Rejected");
+        var manifest = new PcModManifest
+        {
+            FolderPath = _root,
+            Id = ModId,
+            DisplayName = ModId,
+            AssemblyName = "fixture.dll",
+            Kind = PcModKind.UnityModManager
+        };
+
+        Assert.That(PcCompatResourceRecipeRuntime.TryLoadForMod(manifest, recipePath), Is.True);
+        Assert.That(
+            PcCompatResourceRecipeRuntime.TryGetSessionGeneration(ModId, out var generation),
+            Is.True);
+        Assert.That(
+            PcCompatResourceRecipeRuntime.GetReadinessSummary(ModId).ReadyCandidateCount,
+            Is.Zero,
+            "the raw Windows candidate must remain rejected for direct Android Unity loading");
+
+        var resourceIrPath = Path.Combine(_root, "resource_ir.bin");
+        File.WriteAllText(resourceIrPath, "fixture");
+        PcCompatVirtualBundleRegistry.RegisterSession(
+            ModId,
+            generation,
+            _root,
+            resourceIrPath,
+            new PcCompatResourceIrDocument
+            {
+                ModId = ModId,
+                TargetUnityVersion = "6000.3.10f1",
+                Bundles =
+                [
+                    new PcCompatResourceIrBundle
+                    {
+                        Id = bundleId,
+                        CandidateSha256Hex = candidateSha,
+                        SourceFileName = "bundle",
+                        SourceRelativePath = "bundle",
+                        PlatformHint = "Windows",
+                        UnityVersion = "0.0.0",
+                        LoadPolicy = "Rejected",
+                        SelectedForRuntime = true,
+                        AssetIds = [assetId]
+                    }
+                ],
+                Assets =
+                [
+                    new PcCompatResourceIrAsset
+                    {
+                        Id = assetId,
+                        BundleId = bundleId,
+                        Name = "Required",
+                        SourceType = "MonoBehaviour",
+                        ExpectedType = "TMPro.TMP_FontAsset",
+                        Container = "CAB-activation",
+                        AssetsFileName = "bundle.assets",
+                        PathId = 1,
+                        TypeId = 114,
+                        RequiredByMod = true,
+                        MaterializationKind = PcCompatResourceIrMaterializationKind.CapabilityReference,
+                        Compatibility = PcCompatResourceIrCompatibility.Compatible,
+                        CapabilityStableId = "font.test"
+                    }
+                ]
+            });
+        PcCompatVirtualBundleRegistry.RegisterAssetResolver(_ =>
+            new PcCompatVirtualAssetResolveResult(
+                PcCompatVirtualAssetResolveStatus.Ready,
+                new object()));
+
+        var target = new ManagedTarget();
+        using var session = CreateSession(manifest, target, generation);
+        session.RequestActivation();
+
+        Assert.That(session.TryDispatchUpdate(0.016f), Is.True);
+        var virtualReadiness = PcCompatVirtualBundleRegistry.GetSessionReadiness(ModId, generation);
+        Assert.Multiple(() =>
+        {
+            Assert.That(target.EnableCount, Is.EqualTo(1));
+            Assert.That(session.EnableCompleted, Is.True);
+            Assert.That(virtualReadiness.IsReady, Is.True);
+            Assert.That(virtualReadiness.RequiredReadyCount, Is.EqualTo(1));
+        });
     }
 
     [Test]
@@ -279,6 +387,7 @@ public sealed class PcCompatManagedVirtualBundleActivationTests
                 true,
                 false,
                 generation,
+                true,
                 true
             ],
             culture: null);
@@ -286,7 +395,14 @@ public sealed class PcCompatManagedVirtualBundleActivationTests
             ?? throw new AssertionException("Could not construct managed session fixture."));
     }
 
-    private static void WriteResourceRecipe(string path, string bundlePath, string sha256Hex)
+    private static void WriteResourceRecipe(
+        string path,
+        string bundlePath,
+        string sha256Hex,
+        string platformHint = "Android",
+        string unityVersion = "6000.3.10f1",
+        string versionGate = "Auto",
+        string loadPolicy = "AutoLoad")
     {
         var json = $$"""
         {
@@ -297,10 +413,10 @@ public sealed class PcCompatManagedVirtualBundleActivationTests
           "candidates":[{
             "sourcePath":{{JsonSerializer.Serialize(bundlePath)}},
             "fileName":"bundle",
-            "platformHint":"Android",
-            "unityVersion":"6000.3.10f1",
-            "versionGate":"Auto",
-            "loadPolicy":"AutoLoad",
+            "platformHint":{{JsonSerializer.Serialize(platformHint)}},
+            "unityVersion":{{JsonSerializer.Serialize(unityVersion)}},
+            "versionGate":{{JsonSerializer.Serialize(versionGate)}},
+            "loadPolicy":{{JsonSerializer.Serialize(loadPolicy)}},
             "fileSize":{{new FileInfo(bundlePath).Length}},
             "sha256Hex":"{{sha256Hex}}",
             "hasEmbeddedTypeTree":true,
@@ -313,8 +429,8 @@ public sealed class PcCompatManagedVirtualBundleActivationTests
             "id":"overlay.test",
             "displayName":"Managed activation test",
             "selectedCandidateSha256Hex":"{{sha256Hex}}",
-            "selectedPlatform":"Android",
-            "loadPolicy":"AutoLoad",
+            "selectedPlatform":{{JsonSerializer.Serialize(platformHint)}},
+            "loadPolicy":{{JsonSerializer.Serialize(loadPolicy)}},
             "assetNames":[],
             "notes":[]
           }],

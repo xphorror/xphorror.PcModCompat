@@ -6,7 +6,7 @@ public class DL
 {
     [DllImport("dl")]
     public static extern IntPtr dlopen(string fileName, Flags flags);
-
+    
     [DllImport("dl")]
     public static extern IntPtr dlsym(IntPtr handle, string symbol);
 

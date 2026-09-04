@@ -24,6 +24,9 @@ struct ProgramState {
     std::atomic<uint32_t> active{1};
     std::atomic<uint32_t> presentation_enabled{1};
     std::atomic<uint32_t> queued{0};
+    std::atomic<uint32_t> overlay_available{0};
+    std::atomic<uint32_t> overlay_generation{0};
+    std::atomic<uint32_t> overlay_visible{0};
     bool bundle_load_attempted = false;
     bool deferred = false;
     uint32_t last_session_generation = std::numeric_limits<uint32_t>::max();
@@ -60,6 +63,16 @@ OverlayStateSnapshot read_overlay_state() {
         return snapshot;
     snapshot.generation = g_overlay_generation.load(std::memory_order_acquire);
     snapshot.visible = g_overlay_visible.load(std::memory_order_acquire);
+    return snapshot;
+}
+
+OverlayStateSnapshot read_overlay_state(const ProgramState &state) {
+    OverlayStateSnapshot snapshot{};
+    snapshot.available = state.overlay_available.load(std::memory_order_acquire);
+    if (snapshot.available == 0)
+        return read_overlay_state();
+    snapshot.generation = state.overlay_generation.load(std::memory_order_acquire);
+    snapshot.visible = state.overlay_visible.load(std::memory_order_acquire);
     return snapshot;
 }
 
@@ -191,7 +204,7 @@ bool schedule_program_locked(
     ProgramState &state,
     const hud_logic::CompletedInputSnapshot &input,
     const hud_logic::ClockAnchorSnapshot &anchor) {
-    const auto overlay = read_overlay_state();
+    const auto overlay = read_overlay_state(state);
     if (state.active.load(std::memory_order_acquire) == 0 ||
         state.queued.exchange(1, std::memory_order_acq_rel) != 0)
         return false;
@@ -247,6 +260,9 @@ void initialize_program_state(
     state.deferred_overlay_generation = 0;
     state.deferred_retry_raw_ns = 0;
     state.queued.store(0, std::memory_order_release);
+    state.overlay_available.store(0, std::memory_order_release);
+    state.overlay_generation.store(0, std::memory_order_release);
+    state.overlay_visible.store(0, std::memory_order_release);
     state.presentation_enabled.store(1, std::memory_order_release);
     state.active.store(1, std::memory_order_release);
 }
@@ -412,6 +428,9 @@ bool retire_bundle(uint32_t bundle_id) {
             state.deferred_input_generation = 0;
             state.deferred_clock_generation = 0;
             state.deferred_overlay_generation = 0;
+            state.overlay_available.store(0, std::memory_order_release);
+            state.overlay_generation.store(0, std::memory_order_release);
+            state.overlay_visible.store(0, std::memory_order_release);
             state.bundle_id = 0;
         }
         refresh_clock_wakeup_interest_locked();
@@ -455,7 +474,6 @@ int64_t next_deferred_retry_raw_ns(
     const hud_logic::ClockAnchorSnapshot &anchor) {
     if (g_worker_rescan_requested.exchange(0, std::memory_order_acq_rel) != 0)
         return realtime::monotonic_now_ns();
-    const auto overlay = read_overlay_state();
     std::lock_guard<std::mutex> guard(g_registry_lock);
     int64_t next = 0;
     for (const auto &state : g_programs) {
@@ -463,6 +481,7 @@ int64_t next_deferred_retry_raw_ns(
             state.active.load(std::memory_order_acquire) == 0 ||
             state.presentation_enabled.load(std::memory_order_acquire) == 0)
             continue;
+        const auto overlay = read_overlay_state(state);
         const bool dependency_changed =
             state.deferred_input_generation != input.publication_generation ||
             state.deferred_clock_generation != anchor.publication_generation ||
@@ -479,13 +498,13 @@ void process_triggers(
     const hud_logic::CompletedInputSnapshot &input,
     const hud_logic::ClockAnchorSnapshot &anchor) {
     const int64_t now_ns = realtime::monotonic_now_ns();
-    const auto overlay = read_overlay_state();
     std::lock_guard<std::mutex> guard(g_registry_lock);
     for (size_t index = 0; index < g_programs.size(); ++index) {
         auto &state = g_programs[index];
         if (state.active.load(std::memory_order_acquire) == 0 ||
             state.presentation_enabled.load(std::memory_order_acquire) == 0)
             continue;
+        const auto overlay = read_overlay_state(state);
 
         if (state.last_session_generation != input.session_generation) {
             state.last_session_generation = input.session_generation;
@@ -543,6 +562,32 @@ void publish_overlay_state(uint32_t generation, bool visible) {
     realtime::notify_waiters();
 }
 
+void publish_bundle_overlay_state(
+    uint32_t bundle_id,
+    uint32_t generation,
+    bool visible) {
+    if (bundle_id == 0)
+        return;
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> guard(g_registry_lock);
+        for (auto &state : g_programs) {
+            if (state.bundle_id != bundle_id ||
+                state.active.load(std::memory_order_acquire) == 0) {
+                continue;
+            }
+            state.overlay_visible.store(visible ? 1u : 0u, std::memory_order_relaxed);
+            state.overlay_generation.store(generation, std::memory_order_release);
+            state.overlay_available.store(1u, std::memory_order_release);
+            found = true;
+        }
+    }
+    if (!found)
+        return;
+    g_worker_rescan_requested.store(1u, std::memory_order_release);
+    realtime::notify_waiters();
+}
+
 ExecutionOutcome execute_scheduled_task(
     const hud_logic::ScheduledPresentationTask &task,
     const hud_logic::CompletedInputSnapshot &input,
@@ -565,7 +610,7 @@ ExecutionOutcome execute_scheduled_task(
     }
 
     rule_vm::ExecutionResult result{};
-    const auto overlay = read_overlay_state();
+    const auto overlay = read_overlay_state(*state);
     const auto status = rule_vm::execute(
         rule_vm::ProgramView{
             state->instructions.data(),

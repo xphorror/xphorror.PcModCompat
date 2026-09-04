@@ -77,17 +77,27 @@ public sealed class PcCompatCapabilityBundlePackagingTests
     }
 
     [Test]
-    public void BuildChainPackagesCapabilityArtifactsFromRepository()
+    public void BuildChainRequiresCapabilityArtifactsWithoutChangingBuildParameters()
     {
         var root = FindModManagerRoot();
-        var build = File.ReadAllText(Path.Combine(root, "build.ps1"));
+        var androidBuild = File.ReadAllText(Path.Combine(root, "build_android_single.ps1"));
+        var installer = File.ReadAllText(Path.Combine(root, "install_android_overlay.ps1"));
+        var verifier = File.ReadAllText(Path.Combine(root, "_pccompat_capability_assets.ps1"));
+        var topLevelBuild = File.ReadAllText(Path.Combine(root, "build.ps1"));
 
         Assert.Multiple(() =>
         {
-            Assert.That(build, Does.Contain("pc_compat_capabilities"));
-            Assert.That(build, Does.Contain(BundleName));
-            Assert.That(build, Does.Contain(BundleName + ".manifest.json"));
-            Assert.That(build, Does.Contain("pccompat_capability_whitelist.json"));
+            Assert.That(androidBuild, Does.Contain("_pccompat_capability_assets.ps1"));
+            Assert.That(androidBuild, Does.Contain("function Copy-PcCompatCapabilityAssets"));
+            Assert.That(androidBuild, Does.Contain("Copy-PcCompatCapabilityAssets $RuntimeOut"));
+            Assert.That(verifier, Does.Contain("function Assert-PcCompatCapabilityAssets"));
+            Assert.That(verifier, Does.Contain("Get-FileHash -LiteralPath $bundlePath -Algorithm SHA256"));
+            Assert.That(installer, Does.Contain("pc_compat_capabilities"));
+            Assert.That(installer, Does.Contain("Assert-PcCompatCapabilityAssets $InstalledCapabilityAssets"));
+            Assert.That(installer, Does.Contain(BundleName + ".manifest.json"));
+            Assert.That(topLevelBuild, Does.Contain("assets\\runtime\\pc_compat_capabilities"));
+            Assert.That(topLevelBuild, Does.Contain("Assert-PcCompatCapabilityAssets $capabilityDir"));
+            Assert.That(topLevelBuild, Does.Contain(BundleName + ".manifest.json"));
         });
     }
 
@@ -143,7 +153,7 @@ public sealed class PcCompatCapabilityBundlePackagingTests
         var directory = new DirectoryInfo(TestContext.CurrentContext.TestDirectory);
         while (directory != null)
         {
-            if (File.Exists(Path.Combine(directory.FullName, "build.ps1")) &&
+            if (File.Exists(Path.Combine(directory.FullName, "build_android_single.ps1")) &&
                 Directory.Exists(Path.Combine(directory.FullName, "xphorror.PcModCompat")))
             {
                 return directory.FullName;

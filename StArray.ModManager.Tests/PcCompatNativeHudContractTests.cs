@@ -3,12 +3,45 @@ namespace StArray.ModManager.Tests;
 public sealed class PcCompatNativeHudContractTests
 {
     [Test]
+    public void ManagedUnityHudKeepsFailuresInsideOneOwnerSurface()
+    {
+        var bridge = File.ReadAllText(Path.Combine(
+            FindRepositoryRoot(),
+            "StArray.ModManager.Android",
+            "PcCompat",
+            "PcCompatUnityHudBridge.cs"));
+        var apply = ExtractMethodBlock(bridge, "private static void ApplySourceSnapshot");
+        var create = apply.IndexOf(
+            "surface = new HudSurface(snapshot.OwnerId, snapshot.SessionGeneration)",
+            StringComparison.Ordinal);
+        var ownerTry = apply.LastIndexOf("try", create, StringComparison.Ordinal);
+        var ownerCatch = apply.IndexOf("catch (Exception ex)", create, StringComparison.Ordinal);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(bridge, Does.Contain("Dictionary<string, HudSurface> Surfaces"));
+            Assert.That(bridge, Does.Contain("PcCompatUnityHudRuntime.SnapshotSources()"));
+            Assert.That(bridge, Does.Contain("MarkSourceRendererFailed(ownerId)"));
+            Assert.That(bridge, Does.Contain("RendererAvailableFor(snapshot.OwnerId)"));
+            Assert.That(bridge, Does.Contain("ReleaseResourcesOnUnityMain("));
+            Assert.That(create, Is.GreaterThanOrEqualTo(0));
+            Assert.That(ownerTry, Is.GreaterThanOrEqualTo(0));
+            Assert.That(ownerTry, Is.LessThan(create),
+                "Surface construction must be inside the per-owner failure boundary.");
+            Assert.That(ownerCatch, Is.GreaterThan(create));
+            Assert.That(apply, Does.Contain("hidden.Fail(ex)"));
+            Assert.That(apply, Does.Contain("Surfaces.Remove(owner)"));
+        });
+    }
+
+    [Test]
     public void NativeRuleVmUsesRegisterFileBudgetsAndBoundedFaultStorage()
     {
         var root = FindHooksRoot();
         var header = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -17,7 +50,8 @@ public sealed class PcCompatNativeHudContractTests
             "native_rule_vm.h"));
         var source = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -26,7 +60,8 @@ public sealed class PcCompatNativeHudContractTests
             "native_rule_vm.cpp"));
         var cmake = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -35,7 +70,8 @@ public sealed class PcCompatNativeHudContractTests
         var hookRules = File.ReadAllText(FindNativeHookRulesSource());
         var managed = File.ReadAllText(Path.Combine(
             root,
-                        "StArray.ModManager.Android",
+            "StArray.ModManager",
+            "StArray.ModManager.Android",
             "PcCompat",
             "PcCompatNativeHookRules.cs"));
 
@@ -105,28 +141,28 @@ public sealed class PcCompatNativeHudContractTests
         var root = FindHooksRoot();
         var native = File.ReadAllText(FindNativeHookRulesSource());
         var lifecycleHeader = File.ReadAllText(Path.Combine(
-            root, "Android", "library", "src", "main", "cpp", "core",
+            root, "StArray.ModManager", "Android", "library", "src", "main", "cpp", "core",
             "ui_recipe_lifecycle_runtime.h"));
         var lifecycleSource = File.ReadAllText(Path.Combine(
-            root, "Android", "library", "src", "main", "cpp", "core",
+            root, "StArray.ModManager", "Android", "library", "src", "main", "cpp", "core",
             "ui_recipe_lifecycle_runtime.cpp"));
         var schedulerHeader = File.ReadAllText(Path.Combine(
-            root, "Android", "library", "src", "main", "cpp", "core",
+            root, "StArray.ModManager", "Android", "library", "src", "main", "cpp", "core",
             "hud_deadline_scheduler.h"));
         var managedNative = File.ReadAllText(Path.Combine(
-            root, "StArray.ModManager.Android", "PcCompat",
+            root, "StArray.ModManager", "StArray.ModManager.Android", "PcCompat",
             "PcCompatNativeHookRules.cs"));
         var bridge = File.ReadAllText(Path.Combine(
-            root, "StArray.ModManager.Android", "PcCompat",
+            root, "StArray.ModManager", "StArray.ModManager.Android", "PcCompat",
             "PcCompatDobbyBridge.cs"));
         var runtime = File.ReadAllText(Path.Combine(
-            root, "xphorror.PcModCompat", "src", "PcCompatRuntime.cs"));
+            root, "StArray.ModManager", "xphorror.PcModCompat", "src", "PcCompatRuntime.cs"));
         var plugin = File.ReadAllText(Path.Combine(
-            root, "xphorror.PcModCompat", "src", "PcCompatModPlugin.cs"));
+            root, "StArray.ModManager", "xphorror.PcModCompat", "src", "PcCompatModPlugin.cs"));
 
         var unregister = ExtractMethodBlock(native, "modmanager_pccompat_unload_hook_rules_for_mod");
         var managedUnregister = ExtractMethodBlock(runtime, "private static void UnregisterModCore");
-        var managedUnregisterEntry = ExtractMethodBlock(runtime, "public static void UnregisterMod");
+        var managedUnregisterEntry = ExtractMethodBlock(runtime, "internal static void UnregisterMod");
         var pluginUnload = ExtractMethodBlock(plugin, "public void OnUnload");
 
         Assert.Multiple(() =>
@@ -203,6 +239,7 @@ public sealed class PcCompatNativeHudContractTests
         var pointerDispatcher = ExtractMethodBlock(source, "void dispatcher_instance_void1(");
         var gp32Dispatcher = ExtractMethodBlock(source, "void dispatcher_instance_void_int1(");
         var retireSession = ExtractMethodBlock(source, "bool retire_overlay_session(");
+        var retireSharedSession = ExtractMethodBlock(source, "void retire_shared_overlay_session(");
 
         Assert.Multiple(() =>
         {
@@ -213,9 +250,10 @@ public sealed class PcCompatNativeHudContractTests
             Assert.That(gp32Dispatcher, Does.Contain("kTargetKindEditorResetScene"));
             Assert.That(gp32Dispatcher, Does.Contain("kTargetKindEditorSwitchToEditMode"));
             Assert.That(gp32Dispatcher, Does.Contain("args.has_reset_to_editor = true"));
-            Assert.That(retireSession, Does.Contain("reset_overlay_session_metrics()"));
-            Assert.That(retireSession, Does.Contain("starray::realtime::begin_session("),
+            Assert.That(retireSession, Does.Contain("reset_owner_overlay_session_metrics()"));
+            Assert.That(retireSharedSession, Does.Contain("starray::realtime::begin_session("),
                 "Retiring a gameplay HUD must advance the realtime session generation.");
+            Assert.That(retireSharedSession, Does.Contain("reset_shared_overlay_session_facts()"));
             Assert.That(retireSession, Does.Contain("visible.exchange(0"),
                 "ResetScene and SwitchToEditMode may nest, so retirement must be idempotent.");
         });
@@ -258,6 +296,10 @@ public sealed class PcCompatNativeHudContractTests
             Assert.That(source, Does.Contain(
                 "publish_hit_margin_snapshot(tracker_method ? args.instance : nullptr)"));
             Assert.That(source, Does.Contain("void *tracker = preferred_tracker;"));
+            Assert.That(source, Does.Contain("current_margin_tracker_from_static_array()"));
+            Assert.That(source, Does.Not.Contain("PcCompatHitMarginSnapshotV2"));
+            Assert.That(source, Does.Not.Contain("modmanager_pccompat_read_hit_margin_snapshot_v2"));
+            Assert.That(source, Does.Not.Contain("modmanager_pccompat_get_margin_tracker_index"));
             Assert.That(source, Does.Not.Contain(
                 "if (session_active && tracker_method"));
         });
@@ -267,17 +309,54 @@ public sealed class PcCompatNativeHudContractTests
     public void TimelineAndInputSnapshotUseVersionedNativeAbi()
     {
         var source = File.ReadAllText(FindNativeHookRulesSource());
+        var managedSnapshotType = typeof(StArray.ModManager.Android.PcCompat.PcCompatNativeHookRules)
+            .GetNestedType(
+                "OverlaySnapshotNative",
+                System.Reflection.BindingFlags.NonPublic);
 
-        Assert.That(source, Does.Contain("constexpr uint32_t kOverlaySnapshotAbiVersion = 4"));
-        Assert.That(source, Does.Contain("static_assert(sizeof(PcCompatOverlaySnapshotV1) == 240)"));
+        Assert.That(managedSnapshotType, Is.Not.Null);
+        Assert.That(
+            System.Runtime.InteropServices.Marshal.SizeOf(managedSnapshotType!),
+            Is.EqualTo(352));
+        Assert.That(source, Does.Contain("constexpr uint32_t kOverlaySnapshotAbiVersion = 7"));
+        Assert.That(source, Does.Contain("static_assert(sizeof(PcCompatOverlaySnapshotV1) == 352)"));
+        Assert.That(source, Does.Contain("constexpr uint32_t kOverlaySnapshotAbiVersionV6 = 6"));
+        Assert.That(source, Does.Contain("constexpr uint32_t kOverlaySnapshotV6Size = 288"));
+        Assert.That(source, Does.Contain("constexpr uint32_t kOverlaySnapshotAbiVersionV5 = 5"));
+        Assert.That(source, Does.Contain("constexpr uint32_t kOverlaySnapshotV5Size = 284"));
+        Assert.That(source, Does.Contain("constexpr uint32_t kOverlaySnapshotAbiVersionV4 = 4"));
+        Assert.That(source, Does.Contain("constexpr uint32_t kOverlaySnapshotV4Size = 240"));
         Assert.That(source, Does.Contain("constexpr uint32_t kOverlaySnapshotAbiVersionV3 = 3"));
         Assert.That(source, Does.Contain("constexpr uint32_t kOverlaySnapshotV3Size = 236"));
         Assert.That(source, Does.Contain("constexpr uint32_t kOverlaySnapshotAbiVersionV2 = 2"));
         Assert.That(source, Does.Contain("constexpr uint32_t kOverlaySnapshotV2Size = 160"));
+        Assert.That(source, Does.Contain("const bool wants_v7"));
+        Assert.That(source, Does.Contain("const bool wants_v6"));
+        Assert.That(source, Does.Contain("const bool wants_v5"));
+        Assert.That(source, Does.Contain("const bool wants_v4"));
         Assert.That(source, Does.Contain("const bool wants_v3"));
         Assert.That(source, Does.Contain("const bool wants_v2"));
         Assert.That(source, Does.Contain("snapshot.timeline_snapshot_count"));
         Assert.That(source, Does.Contain("snapshot.input_held_mask"));
+        Assert.That(source, Does.Contain("snapshot.rdc_auto"));
+        Assert.That(source, Does.Contain("snapshot.no_fail"));
+        Assert.That(source, Does.Contain("snapshot.paused"));
+        Assert.That(source, Does.Contain("snapshot.is_game_world"));
+        Assert.That(source, Does.Contain("snapshot.song_pitch"));
+        Assert.That(source, Does.Contain("snapshot.conductor_add_offset"));
+        Assert.That(source, Does.Contain("snapshot.conductor_songposition_minusi"));
+        Assert.That(source, Does.Contain("snapshot.is_scn_game"));
+        Assert.That(source, Does.Contain("snapshot.game_ready"));
+        Assert.That(source, Does.Contain("snapshot.session_epoch"));
+        Assert.That(source, Does.Contain("shared.session_epoch.fetch_add"));
+        Assert.That(source, Does.Contain(
+            "controller_instance != nullptr ? controller_instance : ado_controller"));
+        Assert.That(source, Does.Contain(
+            "conductor_instance != nullptr ? conductor_instance : ado_conductor"));
+        Assert.That(source, Does.Contain(
+            "reinterpret_cast<uintptr_t>(controller)"));
+        Assert.That(source, Does.Contain("is_game_world != 0"));
+        Assert.That(source, Does.Contain("level_maker != nullptr"));
         Assert.That(source, Does.Contain("modmanager_pccompat_get_level_identity"));
         Assert.That(source, Does.Contain("modmanager_pccompat_observe_touch_input"));
         Assert.That(source, Does.Contain("starray::realtime::read_input_snapshot"));
@@ -293,10 +372,10 @@ public sealed class PcCompatNativeHudContractTests
         var root = FindHooksRoot();
         var native = File.ReadAllText(FindNativeHookRulesSource());
         var managedNative = File.ReadAllText(Path.Combine(
-            root, "StArray.ModManager.Android", "PcCompat",
+            root, "StArray.ModManager", "StArray.ModManager.Android", "PcCompat",
             "PcCompatNativeHookRules.cs"));
         var bridge = File.ReadAllText(Path.Combine(
-            root, "StArray.ModManager.Android", "PcCompat",
+            root, "StArray.ModManager", "StArray.ModManager.Android", "PcCompat",
             "PcCompatDobbyBridge.cs"));
 
         Assert.Multiple(() =>
@@ -306,7 +385,7 @@ public sealed class PcCompatNativeHudContractTests
             Assert.That(native, Does.Contain("snapshot.planet_speed = bits_to_float("));
             Assert.That(managedNative, Does.Contain("public float PlanetSpeed;"));
             Assert.That(managedNative, Does.Contain("PlanetSpeed = native.PlanetSpeed"));
-            Assert.That(bridge, Does.Contain("PlanetSpeed = overlay.PlanetSpeed"));
+            Assert.That(bridge, Does.Contain("PcCompatGameSnapshot.FromOverlay"));
             Assert.That(bridge, Does.Not.Contain("PlanetSpeed = 0"));
         });
 
@@ -322,11 +401,11 @@ public sealed class PcCompatNativeHudContractTests
             refreshStart,
             StringComparison.Ordinal);
         var liveSpeedStore = native.IndexOf(
-            "g_overlay_state.planet_speed_bits",
+            "float_to_bits(planet_speed_value)",
             refreshStart,
             StringComparison.Ordinal);
         var startMultiplierStore = native.IndexOf(
-            "g_overlay_state.speed_multiplier_bits",
+            "float_to_bits(multiplier)",
             refreshStart,
             StringComparison.Ordinal);
 
@@ -342,6 +421,107 @@ public sealed class PcCompatNativeHudContractTests
                 "PlanetSpeed publication must not be guarded by one-time session initialization.");
             Assert.That(startMultiplierStore, Is.GreaterThan(speedInitialization),
                 "SpeedMultiplier remains the session-start multiplier used by play stats.");
+        });
+    }
+
+    [Test]
+    public void SharedGameplaySnapshotPublishesExplicitValidityAndObjectRoots()
+    {
+        var root = FindRepositoryRoot();
+        var native = File.ReadAllText(Path.Combine(
+            root,
+            "Android",
+            "library",
+            "src",
+            "main",
+            "cpp",
+            "core",
+            "pccompat_hook_rules.cpp"));
+        var managed = File.ReadAllText(Path.Combine(
+            root,
+            "StArray.ModManager.Android",
+            "PcCompat",
+            "PcCompatNativeHookRules.cs"));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(native, Does.Contain("constexpr uint32_t kOverlaySnapshotAbiVersion = 7"));
+            Assert.That(native, Does.Contain("uint64_t valid_game_snapshot_fields;"));
+            Assert.That(native, Does.Contain("uint64_t controller_pointer;"));
+            Assert.That(native, Does.Contain("uint64_t conductor_pointer;"));
+            Assert.That(native, Does.Contain("uint64_t level_maker_pointer;"));
+            Assert.That(native, Does.Contain("uint64_t current_floor_pointer;"));
+            Assert.That(native, Does.Contain("uint64_t first_floor_pointer;"));
+            Assert.That(native, Does.Contain("uint64_t song_pointer;"));
+            Assert.That(native, Does.Contain("uint64_t planetary_system_pointer;"));
+            Assert.That(managed, Does.Contain("private const uint OverlaySnapshotAbiVersion = 7"));
+            Assert.That(managed, Does.Contain("public ulong ValidGameSnapshotFields;"));
+            Assert.That(managed, Does.Contain("public ulong ControllerPointer;"));
+            Assert.That(managed, Does.Contain("ValidGameSnapshotFields ="));
+            Assert.That(managed, Does.Contain("ControllerPointer = checked((long)native.ControllerPointer)"));
+        });
+    }
+
+    [Test]
+    public void ManagedUnityMainFrameDrivesSharedTelemetryWithoutDependingOnModHookInstallation()
+    {
+        var native = File.ReadAllText(FindNativeHookRulesSource());
+        var root = FindRepositoryRoot();
+        var managed = File.ReadAllText(Path.Combine(
+            root,
+            "StArray.ModManager.Android",
+            "PcCompat",
+            "PcCompatManagedSelfRenderBridge.cs"));
+
+        var frameStart = managed.IndexOf("private static void OnManagedFrame()", StringComparison.Ordinal);
+        var frameEnd = managed.IndexOf(
+            "private static int OnManagedPrefix(",
+            frameStart,
+            StringComparison.Ordinal);
+        Assert.That(frameStart, Is.GreaterThanOrEqualTo(0));
+        Assert.That(frameEnd, Is.GreaterThan(frameStart));
+        var frame = managed[frameStart..frameEnd];
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(native, Does.Contain("int modmanager_pccompat_poll_shared_game_snapshot()"));
+            Assert.That(native, Does.Contain("OwnerOverlayScope scope(&g_legacy_overlay_session);"));
+            Assert.That(native, Does.Contain("poll_overlay_telemetry(nullptr, false)"));
+            Assert.That(managed, Does.Contain(
+                "EntryPoint = \"modmanager_pccompat_poll_shared_game_snapshot\""));
+            Assert.That(frame, Does.Contain("_ = PollSharedGameSnapshotNative();"));
+            Assert.That(
+                frame.IndexOf("PollSharedGameSnapshotNative", StringComparison.Ordinal),
+                Is.LessThan(frame.IndexOf("PcCompatRuntime.DispatchManagedFrame", StringComparison.Ordinal)));
+        });
+    }
+
+    [Test]
+    public void OptionalTelemetryAbiGroupsCannotDisableCoreGameplaySnapshot()
+    {
+        var source = File.ReadAllText(FindNativeHookRulesSource());
+        var cache = ExtractMethodBlock(
+            source,
+            "bool ensure_telemetry_runtime_cache(std::string &error) {");
+        var floorMetadata = ExtractMethodBlock(source, "bool refresh_floor_metadata(");
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(cache, Does.Contain(
+                "core gameplay classes for overlay telemetry are unavailable"));
+            Assert.That(cache, Does.Contain(
+                "core gameplay fields for overlay telemetry are unavailable"));
+            Assert.That(cache, Does.Contain("const auto resolve_optional = []("));
+            Assert.That(cache, Does.Not.Contain(
+                "cache.ffx_checkpoint_klass == nullptr ||"));
+            Assert.That(cache, Does.Not.Contain(
+                "cache.audio_source_klass == nullptr ||"));
+            Assert.That(cache, Does.Not.Contain(
+                "cache.planetary_system_klass == nullptr ||"));
+            Assert.That(floorMetadata, Does.Contain(
+                "cache.component_get_component != nullptr &&"));
+            Assert.That(floorMetadata, Does.Contain(
+                "cache.ffx_checkpoint_type_object != nullptr"));
         });
     }
 
@@ -382,9 +562,28 @@ public sealed class PcCompatNativeHudContractTests
         Assert.That(source, Does.Contain("session_generation"));
         Assert.That(source, Does.Contain("g_resource_rabbit_sprite_handle"));
         Assert.That(source, Does.Contain("apply_resource_editor_rabbit(args.instance)"));
+        Assert.That(source, Does.Contain("if (current != sprite)"));
+        Assert.That(source, Does.Contain("if (set_color != nullptr)"));
         Assert.That(source, Does.Not.Contain("TextureManager\",\n                \"LoadNewSprite\""));
         Assert.That(source, Does.Not.Contain("g_resource_rabbit_sprite_path"));
         Assert.That(source, Does.Not.Contain("Auto.png"));
+    }
+
+    [Test]
+    public void ResourceChangerTracksEachSceneObjectOnceWithoutLinearHandleScan()
+    {
+        var source = File.ReadAllText(FindNativeHookRulesSource());
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(source, Does.Contain("g_resource_planet_objects"));
+            Assert.That(source, Does.Contain("g_resource_floor_objects"));
+            Assert.That(source, Does.Contain("objects.insert(object)"));
+            Assert.That(source, Does.Not.Contain(
+                "if (g_il2cpp_metadata.gchandle_get_target(handle) == object)"));
+            Assert.That(source, Does.Contain("g_resource_planet_objects.clear()"));
+            Assert.That(source, Does.Contain("g_resource_floor_objects.clear()"));
+        });
     }
 
     [Test]
@@ -413,7 +612,7 @@ public sealed class PcCompatNativeHudContractTests
             Assert.That(File.Exists(sourceFallback), Is.False, sourceFallback);
             Assert.That(File.Exists(runtimeFallback), Is.False, runtimeFallback);
             Assert.That(
-                File.ReadAllText(Path.Combine(repository, "build.ps1")),
+                File.ReadAllText(Path.Combine(repository, "build_android_single.ps1")),
                 Does.Not.Contain("Auto.png"));
         });
     }
@@ -483,9 +682,9 @@ public sealed class PcCompatNativeHudContractTests
     {
         var root = FindHooksRoot();
         var runtime = File.ReadAllText(Path.Combine(
-            root, "xphorror.PcModCompat", "src", "PcCompatRuntime.cs"));
+            root, "StArray.ModManager", "xphorror.PcModCompat", "src", "PcCompatRuntime.cs"));
         var loader = File.ReadAllText(Path.Combine(
-            root, "StArray.ModManager.Android", "PcCompat",
+            root, "StArray.ModManager", "StArray.ModManager.Android", "PcCompat",
             "PcCompatResourceBundleLoader.cs"));
         var native = File.ReadAllText(FindNativeHookRulesSource());
 
@@ -521,9 +720,14 @@ public sealed class PcCompatNativeHudContractTests
         var source = File.ReadAllText(FindNativeHookRulesSource());
 
         Assert.That(source, Does.Contain("void begin_overlay_session(bool practice"));
-        Assert.That(source, Does.Contain("g_overlay_state.visible.store(1"));
-        Assert.That(source, Does.Contain("begin_overlay_session(false, args.seq_id, args.has_play_args);"));
-        Assert.That(source, Does.Contain("begin_overlay_session(true, 0, false);"));
+        Assert.That(source, Does.Contain("active_overlay_state().visible.store(1"));
+        Assert.That(source, Does.Contain("begin_shared_overlay_session("));
+        Assert.That(source, Does.Contain("args.seq_id,"));
+        Assert.That(source, Does.Contain("args.has_play_args,"));
+        Assert.That(source, Does.Contain("args.is_restart);"));
+        Assert.That(source, Does.Contain("begin_overlay_session(false);"));
+        Assert.That(source, Does.Contain("begin_overlay_session(true);"));
+        Assert.That(source, Does.Contain("OwnerOverlayDispatchSnapshot"));
         Assert.That(source, Does.Not.Contain("if (!show_text_path && practice_mode)"));
         Assert.That(source, Does.Not.Contain("if (show_text_path && !practice_mode && custom_level_active)"));
     }
@@ -534,10 +738,10 @@ public sealed class PcCompatNativeHudContractTests
         var root = FindHooksRoot();
         var native = File.ReadAllText(FindNativeHookRulesSource());
         var nativeBridge = File.ReadAllText(Path.Combine(
-            root, "StArray.ModManager.Android", "PcCompat",
+            root, "StArray.ModManager", "StArray.ModManager.Android", "PcCompat",
             "PcCompatNativeHookRules.cs"));
         var dobbyBridge = File.ReadAllText(Path.Combine(
-            root, "StArray.ModManager.Android", "PcCompat",
+            root, "StArray.ModManager", "StArray.ModManager.Android", "PcCompat",
             "PcCompatDobbyBridge.cs"));
 
         Assert.Multiple(() =>
@@ -555,7 +759,7 @@ public sealed class PcCompatNativeHudContractTests
             Assert.That(dobbyBridge, Does.Not.Contain("GetValue(il2cppArray"));
         });
 
-        var afterOpsStart = native.IndexOf("void run_fixed_after_ops", StringComparison.Ordinal);
+        var afterOpsStart = native.IndexOf("void run_shared_after_ops", StringComparison.Ordinal);
         var afterOpsEnd = native.IndexOf("void report_missing_original", afterOpsStart, StringComparison.Ordinal);
         var afterOps = native.Substring(afterOpsStart, afterOpsEnd - afterOpsStart);
         Assert.That(
@@ -569,16 +773,16 @@ public sealed class PcCompatNativeHudContractTests
     {
         var root = FindHooksRoot();
         var native = File.ReadAllText(Path.Combine(
-            root, "Android", "library", "src", "main", "cpp", "core",
+            root, "StArray.ModManager", "Android", "library", "src", "main", "cpp", "core",
             "pccompat_recipe_binary.cpp"));
         var cmake = File.ReadAllText(Path.Combine(
-            root, "Android", "library", "src", "main", "cpp", "CMakeLists.txt"));
+            root, "StArray.ModManager", "Android", "library", "src", "main", "cpp", "CMakeLists.txt"));
         var managed = File.ReadAllText(Path.Combine(
-            root, "xphorror.PcModCompat", "src", "PcCompatUiRecipeBinary.cs"));
+            root, "StArray.ModManager", "xphorror.PcModCompat", "src", "PcCompatUiRecipeBinary.cs"));
         var cache = File.ReadAllText(Path.Combine(
-            root, "xphorror.PcModCompat", "src", "PcCompatRecipeBundleCache.cs"));
+            root, "StArray.ModManager", "xphorror.PcModCompat", "src", "PcCompatRecipeBundleCache.cs"));
         var bridge = File.ReadAllText(Path.Combine(
-            root, "StArray.ModManager.Android", "PcCompat", "PcCompatDobbyBridge.cs"));
+            root, "StArray.ModManager", "StArray.ModManager.Android", "PcCompat", "PcCompatDobbyBridge.cs"));
 
         Assert.That(managed, Does.Contain("XPHUIRCP"));
         Assert.That(managed, Does.Contain("ComputeCrc32"));
@@ -603,13 +807,13 @@ public sealed class PcCompatNativeHudContractTests
     {
         var root = FindHooksRoot();
         var header = File.ReadAllText(Path.Combine(
-            root, "Android", "library", "src", "main", "cpp", "core",
+            root, "StArray.ModManager", "Android", "library", "src", "main", "cpp", "core",
             "hud_deadline_scheduler.h"));
         var source = File.ReadAllText(Path.Combine(
-            root, "Android", "library", "src", "main", "cpp", "core",
+            root, "StArray.ModManager", "Android", "library", "src", "main", "cpp", "core",
             "hud_deadline_scheduler.cpp"));
         var realtime = File.ReadAllText(Path.Combine(
-            root, "Android", "library", "src", "main", "cpp", "core",
+            root, "StArray.ModManager", "Android", "library", "src", "main", "cpp", "core",
             "realtime_event_core.cpp"));
 
         Assert.That(header, Does.Contain("kSchedulerQueueCount = kClockDomainCount * 2"));
@@ -630,22 +834,22 @@ public sealed class PcCompatNativeHudContractTests
     {
         var root = FindHooksRoot();
         var nativeHeader = File.ReadAllText(Path.Combine(
-            root, "Android", "library", "src", "main", "cpp", "core",
+            root, "StArray.ModManager", "Android", "library", "src", "main", "cpp", "core",
             "pccompat_presentation_abi.h"));
         var nativeSource = File.ReadAllText(Path.Combine(
-            root, "Android", "library", "src", "main", "cpp", "core",
+            root, "StArray.ModManager", "Android", "library", "src", "main", "cpp", "core",
             "pccompat_presentation_abi.cpp"));
         var sinkSource = File.ReadAllText(Path.Combine(
-            root, "Android", "library", "src", "main", "cpp", "core",
+            root, "StArray.ModManager", "Android", "library", "src", "main", "cpp", "core",
             "unity_presentation_sink.cpp"));
         var objectSource = File.ReadAllText(Path.Combine(
-            root, "Android", "library", "src", "main", "cpp", "core",
+            root, "StArray.ModManager", "Android", "library", "src", "main", "cpp", "core",
             "unity_presentation_objects.cpp"));
         var managed = File.ReadAllText(Path.Combine(
-            root, "StArray.ModManager.Android", "PcCompat",
+            root, "StArray.ModManager", "StArray.ModManager.Android", "PcCompat",
             "PcCompatNativeHookRules.cs"));
         var cmake = File.ReadAllText(Path.Combine(
-            root, "Android", "library", "src", "main", "cpp",
+            root, "StArray.ModManager", "Android", "library", "src", "main", "cpp",
             "CMakeLists.txt"));
 
         Assert.That(nativeHeader, Does.Contain("PC_COMPAT_PRESENTATION_ABI_VERSION = 1u"));
@@ -682,7 +886,7 @@ public sealed class PcCompatNativeHudContractTests
     {
         var root = FindHooksRoot();
         var objectSource = File.ReadAllText(Path.Combine(
-            root, "Android", "library", "src", "main", "cpp", "core",
+            root, "StArray.ModManager", "Android", "library", "src", "main", "cpp", "core",
             "unity_presentation_objects.cpp"));
 
         Assert.Multiple(() =>
@@ -703,7 +907,8 @@ public sealed class PcCompatNativeHudContractTests
     {
         var source = File.ReadAllText(Path.Combine(
             FindHooksRoot(),
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -753,7 +958,7 @@ public sealed class PcCompatNativeHudContractTests
     {
         var root = FindHooksRoot();
         var objectSource = File.ReadAllText(Path.Combine(
-            root, "Android", "library", "src", "main", "cpp", "core",
+            root, "StArray.ModManager", "Android", "library", "src", "main", "cpp", "core",
             "unity_presentation_objects.cpp"));
         var sourceWithoutDefinition = objectSource.Replace(
             "bool set_active(void *game_object, bool active, std::string &error)",
@@ -772,10 +977,10 @@ public sealed class PcCompatNativeHudContractTests
     {
         var root = FindHooksRoot();
         var sink = File.ReadAllText(Path.Combine(
-            root, "Android", "library", "src", "main", "cpp", "core",
+            root, "StArray.ModManager", "Android", "library", "src", "main", "cpp", "core",
             "unity_presentation_sink.cpp"));
         var resolver = File.ReadAllText(Path.Combine(
-            root, "Android", "library", "src", "main", "cpp", "core",
+            root, "StArray.ModManager", "Android", "library", "src", "main", "cpp", "core",
             "pccompat_metadata_resolver.h"));
         var rules = File.ReadAllText(FindNativeHookRulesSource());
 
@@ -823,7 +1028,8 @@ public sealed class PcCompatNativeHudContractTests
     {
         var sink = File.ReadAllText(Path.Combine(
             FindHooksRoot(),
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -912,7 +1118,7 @@ public sealed class PcCompatNativeHudContractTests
     {
         var root = FindHooksRoot();
         var sink = File.ReadAllText(Path.Combine(
-            root, "Android", "library", "src", "main", "cpp", "core",
+            root, "StArray.ModManager", "Android", "library", "src", "main", "cpp", "core",
             "unity_presentation_sink.cpp"));
 
         Assert.Multiple(() =>
@@ -933,7 +1139,7 @@ public sealed class PcCompatNativeHudContractTests
     {
         var root = FindHooksRoot();
         var sink = File.ReadAllText(Path.Combine(
-            root, "Android", "library", "src", "main", "cpp", "core",
+            root, "StArray.ModManager", "Android", "library", "src", "main", "cpp", "core",
             "unity_presentation_sink.cpp"));
 
         Assert.Multiple(() =>
@@ -957,13 +1163,13 @@ public sealed class PcCompatNativeHudContractTests
     {
         var root = FindHooksRoot();
         var objectSource = File.ReadAllText(Path.Combine(
-            root, "Android", "library", "src", "main", "cpp", "core",
+            root, "StArray.ModManager", "Android", "library", "src", "main", "cpp", "core",
             "unity_presentation_objects.cpp"));
         var objectHeader = File.ReadAllText(Path.Combine(
-            root, "Android", "library", "src", "main", "cpp", "core",
+            root, "StArray.ModManager", "Android", "library", "src", "main", "cpp", "core",
             "unity_presentation_objects.h"));
         var sink = File.ReadAllText(Path.Combine(
-            root, "Android", "library", "src", "main", "cpp", "core",
+            root, "StArray.ModManager", "Android", "library", "src", "main", "cpp", "core",
             "unity_presentation_sink.cpp"));
 
         Assert.Multiple(() =>
@@ -1012,10 +1218,10 @@ public sealed class PcCompatNativeHudContractTests
     {
         var root = FindHooksRoot();
         var loader = File.ReadAllText(Path.Combine(
-            root, "StArray.ModManager.Android", "PcCompat",
+            root, "StArray.ModManager", "StArray.ModManager.Android", "PcCompat",
             "PcCompatResourceBundleLoader.cs"));
         var sink = File.ReadAllText(Path.Combine(
-            root, "Android", "library", "src", "main", "cpp", "core",
+            root, "StArray.ModManager", "Android", "library", "src", "main", "cpp", "core",
             "unity_presentation_sink.cpp"));
 
         Assert.That(loader, Does.Contain("WorkQueueCapacity = 64"));
@@ -1133,14 +1339,13 @@ public sealed class PcCompatNativeHudContractTests
         var directory = new DirectoryInfo(TestContext.CurrentContext.TestDirectory);
         while (directory != null)
         {
-            if (File.Exists(Path.Combine(directory.FullName, "StArray.ModManager.slnx")) &&
-                Directory.Exists(Path.Combine(directory.FullName, "Android")) &&
-                Directory.Exists(Path.Combine(directory.FullName, "xphorror.PcModCompat")))
+            if (Directory.Exists(Path.Combine(directory.FullName, "StArray.ModManager")) &&
+                Directory.Exists(Path.Combine(directory.FullName, "extra_menu_activity")))
                 return directory.FullName;
             directory = directory.Parent;
         }
 
-        Assert.Fail("Could not find the public repository root from test directory");
+        Assert.Fail("Could not find ADOFAI_312_HOOKS root from test directory");
         return string.Empty;
     }
 }

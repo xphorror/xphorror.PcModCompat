@@ -486,3 +486,4 @@ public class ModManagerUpdater {
 
     private static final Handler mainHandler = new Handler(Looper.getMainLooper());
 }
+

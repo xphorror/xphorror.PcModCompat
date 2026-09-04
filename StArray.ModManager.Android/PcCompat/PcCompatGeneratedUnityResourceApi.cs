@@ -68,6 +68,7 @@ internal sealed class PcCompatGeneratedUnityResourceApi
     private readonly ConstructorInfo _colorConstructor;
     private readonly ConstructorInfo _materialConstructor;
     private readonly ConstructorInfo _fontConstructor;
+    private readonly ConstructorInfo _fontPathConstructor;
     private readonly ConstructorInfo _textCoreFontConstructor;
     private readonly ConstructorInfo _textCoreCharacterConstructor;
     private readonly ConstructorInfo _gameObjectConstructor;
@@ -282,6 +283,7 @@ internal sealed class PcCompatGeneratedUnityResourceApi
             typeof(float));
         _materialConstructor = RequiredConstructor(_materialType, _materialType);
         _fontConstructor = RequiredConstructor(_fontType);
+        _fontPathConstructor = RequiredConstructor(_fontType, typeof(string));
         _textCoreFontConstructor = RequiredConstructor(_textCoreFontAssetType);
         _textCoreCharacterConstructor = RequiredConstructor(
             _textCoreCharacterType,
@@ -882,6 +884,23 @@ internal sealed class PcCompatGeneratedUnityResourceApi
         _setName.Invoke(shellFontProxy, [asset.Name]);
         _tmpFontReadDefinition.Invoke(shellFontProxy, null);
         return ProtectFromUnload(shellFontProxy);
+    }
+
+    public object CreateFontFromFile(PcCompatResourceIrAsset asset, string path)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(path);
+        var font = _fontPathConstructor.Invoke([path])
+                   ?? throw new InvalidOperationException("Unity Font path constructor returned null.");
+        try
+        {
+            _setName.Invoke(font, [asset.Name]);
+            return ProtectFromUnload(font);
+        }
+        catch
+        {
+            Destroy(font);
+            throw;
+        }
     }
 
     public object CreateImGuiFontFromTmpAtlas(

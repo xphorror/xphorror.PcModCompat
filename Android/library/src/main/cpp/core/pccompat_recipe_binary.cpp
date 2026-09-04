@@ -235,6 +235,14 @@ bool parse_header(const std::vector<uint8_t> &data,
 
     bundle.target_game_revision = read_u32(data, 20);
     bundle.required_capabilities = read_u64(data, 24);
+    std::copy_n(data.begin() + 48, bundle.source_assembly_sha256.size(),
+                bundle.source_assembly_sha256.begin());
+    if (std::all_of(bundle.source_assembly_sha256.begin(),
+                    bundle.source_assembly_sha256.end(),
+                    [](uint8_t value) { return value == 0; })) {
+        error = "ui recipe source assembly digest is empty";
+        return false;
+    }
 
     const auto table_end = static_cast<size_t>(table_offset) + section_count * kSectionEntrySize;
     std::set<uint32_t> section_types;

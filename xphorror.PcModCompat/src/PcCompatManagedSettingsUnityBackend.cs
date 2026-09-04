@@ -5,11 +5,16 @@ using StArray.ModManager.Manager;
 
 namespace Xphorror.PcModCompat;
 
-public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettingsCanvasProbe
+public sealed class PcCompatManagedSettingsUnityBackend :
+    IPcCompatManagedSettingsCanvasProbe,
+    IPcCompatManagedSettingsImGuiTransaction
 {
     private const string DiagnosticTag = "PcCompatSettingsDiag";
     private const string DiagnosticPrefix = "[DEBUG-settings-surface-v1]";
-    private const int DiagnosticFrameBudget = 24;
+    private const string ResponsiveLayoutRevision = "v19-style-fingerprint";
+    // Detailed IMGUI telemetry performs several reflected reads and allocates large strings.
+    // Keep it disabled in normal builds; faults still force a diagnostic record below.
+    private const int DiagnosticFrameBudget = 0;
     private const int DiagnosticSampleLimit = 8;
     private readonly Type _guiContentType;
     private readonly ConstructorInfo _guiContentConstructor;
@@ -45,6 +50,7 @@ public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettin
     private readonly MethodInfo[] _paddingSetters;
     private readonly MethodInfo _guiBox;
     private readonly MethodInfo _guiLabelRect;
+    private readonly MethodInfo _guiLabelRectContentStyled;
     private readonly MethodInfo _guiButtonRect;
     private readonly MethodInfo _guiTextField;
     private readonly MethodInfo _guiSlider;
@@ -61,6 +67,7 @@ public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettin
     private readonly MethodInfo _space;
     private readonly MethodInfo _label;
     private readonly MethodInfo _button;
+    private readonly MethodInfo _buttonContentStyled;
     private readonly MethodInfo _toggle;
     private readonly MethodInfo _toggleStyled;
     private readonly MethodInfo _labelStyled;
@@ -104,12 +111,13 @@ public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettin
     private readonly HashSet<int> _claimedCanvasIds = [];
     private readonly Dictionary<Type, object> _emptyOptionsByType = new();
     private readonly Dictionary<string, object> _guiContentByText = new(StringComparer.Ordinal);
+    private readonly PcCompatManagedImGuiInteractionFence _interactionFence = new();
     private object? _scrollPosition;
     private readonly List<StyleSnapshot> _mobileStyleSnapshots = [];
     private object? _mobileSkin;
     private object? _mobileSkinFont;
     private object? _previousGuiMatrix;
-    private (float Dimension, float Font, float TouchHeight) _previousImGuiScale;
+    private (float Dimension, float Font, float TouchHeight, float InteractiveVisualHeight, float ContentWidth, int MeasurementStyleFingerprint) _previousImGuiScale;
     private bool _mobileGuiMatrixActive;
     private bool _mobileImGuiScaleActive;
     private bool _fontResolutionFailureLogged;
@@ -124,7 +132,9 @@ public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettin
     private bool _stackControlRows;
     private int _pendingAction;
     private bool _frameOpen;
+    private bool _resetInteractionFenceAfterFrame;
     private bool _legacyInputFrameOpen;
+    private bool _interactionFenceFrameOpen;
     private bool _areaOpen;
     private bool _verticalOpen;
     private bool _scrollOpen;
@@ -137,7 +147,7 @@ public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettin
     private long _diagnosticFrame;
     private int _diagnosticBudget;
     private bool _captureDiagnosticRects;
-    private bool _captureNextDiagnosticRepaint = true;
+    private bool _captureNextDiagnosticRepaint;
     private string _diagnosticStructure = string.Empty;
     private string _diagnosticTitle = string.Empty;
     private string _diagnosticEventAtBegin = "event=not-captured";
@@ -234,6 +244,13 @@ public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettin
             .ToArray();
         _guiBox = RequireMethod(gui, "Box", typeof(void), _rectType, typeof(string));
         _guiLabelRect = RequireMethod(gui, "Label", typeof(void), _rectType, typeof(string));
+        _guiLabelRectContentStyled = RequireMethod(
+            gui,
+            "Label",
+            typeof(void),
+            _rectType,
+            _guiContentType,
+            guiStyle);
         _guiButtonRect = RequireMethod(gui, "Button", typeof(bool), _rectType, typeof(string));
         _guiTextField = RequireMethod(
             gui,
@@ -280,6 +297,12 @@ public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettin
         _space = RequireMethod(layout, "Space", typeof(void), typeof(float));
         _label = RequireOptionsMethod(layout, "Label", typeof(void), typeof(string));
         _button = RequireOptionsMethod(layout, "Button", typeof(bool), typeof(string));
+        _buttonContentStyled = RequireOptionsMethod(
+            layout,
+            "DoButton",
+            typeof(bool),
+            _guiContentType,
+            guiStyle);
         _toggle = RequireOptionsMethod(
             layout,
             "Toggle",
@@ -374,7 +397,7 @@ public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettin
         _claimedCanvasIds.Clear();
         _lastDiagnosticRepaintRects.Clear();
         _captureDiagnosticRects = false;
-        _captureNextDiagnosticRepaint = true;
+        _captureNextDiagnosticRepaint = false;
         _diagnosticStructure = string.Empty;
         if (!SupportsCanvasProbe)
             return;
@@ -439,6 +462,16 @@ public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettin
         _canvasBaseline.Clear();
         _canvasOwnerIds.Clear();
         _claimedCanvasIds.Clear();
+        if (_frameOpen)
+        {
+            // A session can be disabled synchronously from its own OnGUI callback.
+            // The active fence must finish that callback before reset; otherwise its
+            // thread-static frame and the next generation can observe stale input.
+            _resetInteractionFenceAfterFrame = true;
+            return;
+        }
+
+        _interactionFence.Reset();
     }
 
     public static bool TryCreate(
@@ -488,6 +521,12 @@ public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettin
         var localizedFont = ResolveLocalizedFont();
         _gameLanguage = localizedFont.Language;
         var metrics = ComputeMobileMetrics(width, height, dpi, localizedFont.Scale);
+        var measurementStyleFingerprint = HashCode.Combine(
+            metrics.FontSize,
+            metrics.HorizontalPadding,
+            metrics.VerticalPadding,
+            StringComparer.Ordinal.GetHashCode(localizedFont.Language),
+            StringComparer.Ordinal.GetHashCode(localizedFont.Source));
         _diagnosticMetrics =
             $"screen={width}x{height} logical={metrics.LogicalWidth:0.##}x" +
             $"{metrics.LogicalHeight:0.##} dpi={dpi:0.##} scale={metrics.RenderScale:0.###} " +
@@ -497,6 +536,7 @@ public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettin
         _diagnostics =
             $"frame=rendered width={width} height={height} dpi={dpi:0.##} " +
             $"renderScale={metrics.RenderScale:0.###} " +
+            $"layoutRevision={ResponsiveLayoutRevision} " +
             $"language={localizedFont.Language} fontResolved={localizedFont.Font != null} " +
             $"fontSource={localizedFont.Source} " +
             $"fontScale={localizedFont.Scale:0.###} fontSize={metrics.FontSize} " +
@@ -506,6 +546,7 @@ public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettin
             _fontResolutionSuccessLogged = true;
             Console.WriteLine(
                 "[PcModCompat][SettingsFont][INFO] " +
+                $"layoutRevision={ResponsiveLayoutRevision} " +
                 $"language={localizedFont.Language} source={localizedFont.Source} dpi={dpi:0.##} " +
                 $"renderScale={metrics.RenderScale:0.###} " +
                 $"fontScale={localizedFont.Scale:0.###} fontSize={metrics.FontSize} " +
@@ -530,7 +571,7 @@ public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettin
         try
         {
             _diagnosticLastOperation = "ApplyMobileSkin";
-            ApplyMobileSkin(metrics, localizedFont.Font);
+            ApplyMobileSkin(metrics, localizedFont.Font, measurementStyleFingerprint);
             _diagnosticLastOperation = "GUI.Box";
             _guiBox.Invoke(null, [panel, string.Empty]);
             _diagnosticLastOperation = "GUILayout.BeginArea";
@@ -553,9 +594,9 @@ public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettin
                     null,
                     [headerTitleWidth, _touchHeight, labelStyle, GetEmptyOptions(_getRect)])
                     ?? throw new InvalidOperationException("GUILayoutUtility.GetRect returned null");
-                _guiLabelRect.Invoke(
+                _guiLabelRectContentStyled.Invoke(
                     null,
-                    [InsetHeaderTitleRect(titleRect, _touchHeight), title]);
+                    [InsetHeaderTitleRect(titleRect, _touchHeight), GetGuiContent(title), labelStyle]);
                 CaptureRect("header-title", title, titleRect);
 
                 _space.Invoke(null, [8f]);
@@ -585,13 +626,17 @@ public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettin
             _scrollOpen = true;
             PcCompatLegacyInputBridge.BeginSettingsGuiFrame();
             _legacyInputFrameOpen = true;
+            PcCompatManagedImGuiBridge.BeginSettingsInteractionFrame(
+                _interactionFence,
+                GetCurrentEventKind());
+            _interactionFenceFrameOpen = true;
             _frameOpen = true;
             _diagnosticLastOperation = "content";
         }
         catch (Exception exception)
         {
             TraceFrameDiagnostic("begin-fault", 0, exception);
-            CloseFrameBestEffort();
+            CloseFrameBestEffort(completed: false);
             throw;
         }
     }
@@ -612,9 +657,9 @@ public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettin
             try
             {
                 _flexibleSpace.Invoke(null, null);
-                if (Button(IsChinese() ? "保存" : "Save"))
+                if (FooterButton(IsChinese() ? "保存" : "Save"))
                     action |= 1;
-                if (Button(IsChinese() ? "关闭" : "Close"))
+                if (FooterButton(IsChinese() ? "关闭" : "Close"))
                     action |= 2;
             }
             finally
@@ -628,13 +673,13 @@ public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettin
         catch (Exception exception)
         {
             TraceFrameDiagnostic("end-fault", action, exception);
-            CloseFrameBestEffort();
+            CloseFrameBestEffort(completed: false);
             throw;
         }
         finally
         {
             if (_frameOpen)
-                CloseFrame();
+                CloseFrame(completed: true);
         }
     }
 
@@ -650,22 +695,42 @@ public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettin
         finally
         {
             if (_frameOpen)
-                CloseFrame();
+                CloseFrame(completed: false);
         }
     }
 
     public bool CanApplyStructureChanges()
+        => GetCurrentEventKind() == PcCompatManagedImGuiEventKind.Layout;
+
+    public bool ShouldDispatchCurrentEvent()
+        => _interactionFence.ShouldDispatch(GetCurrentEventKind());
+
+    public bool IsStable => _interactionFence.State == PcCompatManagedImGuiTransactionState.Stable;
+
+    public void MarkRecoverableLayoutFailure()
+        => _interactionFence.MarkRecoverableLayoutFailure();
+
+    private bool CanObserveFinalLayoutRects()
+        => GetCurrentEventKind() == PcCompatManagedImGuiEventKind.Repaint;
+
+    private PcCompatManagedImGuiEventKind GetCurrentEventKind()
     {
         try
         {
             var current = _eventCurrent.Invoke(null, null);
             var eventType = current == null ? null : _eventType.Invoke(current, null)?.ToString();
-            return string.Equals(eventType, "Layout", StringComparison.OrdinalIgnoreCase);
+            if (string.Equals(eventType, "Layout", StringComparison.OrdinalIgnoreCase))
+                return PcCompatManagedImGuiEventKind.Layout;
+            if (string.Equals(eventType, "Repaint", StringComparison.OrdinalIgnoreCase))
+                return PcCompatManagedImGuiEventKind.Repaint;
         }
         catch
         {
-            return false;
+            // Input is deliberately conservative: it never allows a pending
+            // transaction to re-enter a MOD before the next confirmed Layout.
         }
+
+        return PcCompatManagedImGuiEventKind.Input;
     }
 
     public void ReleaseInputFocus()
@@ -679,16 +744,26 @@ public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettin
         _diagnosticLastOperation = "GUILayout.Toggle";
         _diagnosticToggles++;
         AddDiagnosticSample(label);
-        var result = _toggle.Invoke(null, [value, label, GetEmptyOptions(_toggle)]) is bool next
+        var skin = _guiSkin.Invoke(null, null)
+            ?? throw new InvalidOperationException("Unity GUI.skin is unavailable");
+        var style = _skinToggle.Invoke(skin, null)
+            ?? throw new InvalidOperationException("Unity GUI.skin.toggle is unavailable");
+        var result = _toggleStyled.Invoke(
+                null,
+                [value, label, style, GetEmptyOptions(_toggleStyled)]) is bool next
             ? next
             : value;
         CaptureLastRect("toggle", label);
-        return result;
+        return _interactionFence.ResolveHostValue(
+            value,
+            result,
+            HostControlToken("toggle", label));
     }
 
     public string Text(string value, string label)
     {
         _diagnosticLastOperation = "Text";
+        var token = HostControlToken("text", label);
         if (_stackControlRows)
         {
             _beginVertical.Invoke(null, [GetEmptyOptions(_beginVertical)]);
@@ -696,7 +771,8 @@ public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettin
             {
                 if (!string.IsNullOrWhiteSpace(label))
                     Label(label);
-                return DrawInlineTextField(value, Math.Max(180f, _contentWidth - 12f));
+                var observed = DrawInlineTextField(value, Math.Max(180f, _contentWidth - 12f));
+                return _interactionFence.ResolveHostValue(value, observed, token);
             }
             finally
             {
@@ -715,7 +791,7 @@ public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettin
                 value,
                 Math.Clamp(_contentWidth * 0.62f, 180f, 360f));
             _flexibleSpace.Invoke(null, null);
-            return result;
+            return _interactionFence.ResolveHostValue(value, result, token);
         }
         finally
         {
@@ -732,7 +808,11 @@ public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettin
         bool integral)
     {
         _ = step;
-        return DrawNumber(value, label, min, max, integral, slider: false);
+        var observed = DrawNumber(value, label, min, max, integral, slider: false);
+        return _interactionFence.ResolveHostValue(
+            value,
+            observed,
+            HostControlToken("number", label));
     }
 
     public string SliderNumber(
@@ -741,7 +821,13 @@ public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettin
         double min,
         double max,
         bool integral)
-        => DrawNumber(value, label, min, max, integral, slider: true);
+    {
+        var observed = DrawNumber(value, label, min, max, integral, slider: true);
+        return _interactionFence.ResolveHostValue(
+            value,
+            observed,
+            HostControlToken("slider-number", label));
+    }
 
     public string Enum(string value, string label, string[] values)
     {
@@ -759,10 +845,10 @@ public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettin
         var buttonStyle = _skinButton.Invoke(skin, null)
             ?? throw new InvalidOperationException("Unity GUI.skin.button is unavailable");
         var supportsRichText = _styleGetRichText.Invoke(buttonStyle, null) is true;
-        return DrawEnumRows(values, index, supportsRichText);
+        return DrawEnumRows(label, values, index, supportsRichText);
     }
 
-    private string DrawEnumRows(string[] values, int selectedIndex, bool supportsRichText)
+    private string DrawEnumRows(string label, string[] values, int selectedIndex, bool supportsRichText)
     {
         var choicesPerRow = _contentWidth >= 650f ? 4 : _contentWidth >= 480f ? 3 : 2;
         for (var rowStart = 0; rowStart < values.Length; rowStart += choicesPerRow)
@@ -778,7 +864,7 @@ public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettin
                     var buttonLabel = selected
                         ? supportsRichText ? $"<b>{candidate}</b>" : $"[{candidate}]"
                         : candidate;
-                    if (Button(buttonLabel))
+                    if (ButtonCore(buttonLabel, HostControlToken("enum", label, candidate)))
                         selectedIndex = candidateIndex;
                 }
                 _flexibleSpace.Invoke(null, null);
@@ -819,11 +905,15 @@ public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettin
                  labelStyle,
                  GetEmptyOptions(_getRect)])
                 ?? throw new InvalidOperationException("GUILayoutUtility.GetRect returned null");
-            expanded = _guiToggleContent.Invoke(
+            var observedExpanded = _guiToggleContent.Invoke(
                 null,
                 [expandRect, expanded, GetGuiContent(expandLabel), labelStyle]) is bool nextExpanded
                 ? nextExpanded
                 : expanded;
+            expanded = _interactionFence.ResolveHostValue(
+                expanded,
+                observedExpanded,
+                HostControlToken("section-expand", label));
             CaptureRect("section-arrow", expandLabel, expandRect);
             if (canEnable)
                 enabled = Toggle(enabled, label);
@@ -1016,13 +1106,80 @@ public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettin
     }
 
     public bool Button(string label)
+        => ButtonCore(label, HostControlToken("button", label));
+
+    private bool ButtonCore(string label, int callsiteToken)
     {
         _diagnosticLastOperation = "GUILayout.Button";
         _diagnosticButtons++;
         AddDiagnosticSample(label);
-        var result = _button.Invoke(null, [label, GetEmptyOptions(_button)]) is true;
+        var skin = _guiSkin.Invoke(null, null)
+            ?? throw new InvalidOperationException("Unity GUI.skin is unavailable");
+        var style = _skinButton.Invoke(skin, null)
+            ?? throw new InvalidOperationException("Unity GUI.skin.button is unavailable");
+        var result = _buttonContentStyled.Invoke(
+            null,
+            [GetGuiContent(label), style, GetEmptyOptions(_buttonContentStyled)]) is true;
         CaptureLastRect("button", label);
-        return result;
+        return _interactionFence.ResolveHostButton(result, callsiteToken);
+    }
+
+    private bool FooterButton(string label)
+    {
+        _diagnosticLastOperation = "GUI.Button(footer)";
+        _diagnosticButtons++;
+        AddDiagnosticSample(label);
+        var skin = _guiSkin.Invoke(null, null)
+            ?? throw new InvalidOperationException("Unity GUI.skin is unavailable");
+        var style = _skinButton.Invoke(skin, null)
+            ?? throw new InvalidOperationException("Unity GUI.skin.button is unavailable");
+        var rect = _getRect.Invoke(
+            null,
+            [ComputeFooterButtonWidth(_contentWidth, _touchHeight),
+             _touchHeight,
+             style,
+             GetEmptyOptions(_getRect)])
+            ?? throw new InvalidOperationException("GUILayoutUtility.GetRect returned null");
+        var result = _guiButtonRect.Invoke(null, [rect, label]) is true;
+        CaptureRect("footer-button", label, rect);
+        return _interactionFence.ResolveHostButton(result, HostControlToken("footer", label));
+    }
+
+    private static int HostControlToken(string kind, string? label, string? detail = null)
+    {
+        // A deterministic in-process identity is enough: pending values never
+        // cross a MOD generation or a settings-surface teardown. Do not use
+        // HashCode, whose randomized seed would make the same callsite move
+        // between the input and commit events in different runtimes.
+        uint hash = 2166136261;
+        AppendHash(ref hash, kind);
+        AppendHash(ref hash, "\u001f");
+        AppendHash(ref hash, label);
+        AppendHash(ref hash, "\u001f");
+        AppendHash(ref hash, detail);
+        return unchecked((int)hash);
+    }
+
+    private static void AppendHash(ref uint hash, string? value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return;
+        foreach (var character in value)
+        {
+            hash ^= character;
+            hash *= 16777619;
+        }
+    }
+
+    internal static float ComputeFooterButtonWidth(float contentWidth, float touchHeight)
+    {
+        var normalizedTouch = float.IsFinite(touchHeight) && touchHeight > 0f
+            ? touchHeight
+            : 48f;
+        var proportionalWidth = float.IsFinite(contentWidth) && contentWidth > 0f
+            ? contentWidth * 0.14f
+            : 0f;
+        return Math.Clamp(Math.Max(normalizedTouch * 1.75f, proportionalWidth), 84f, 128f);
     }
 
     public void Label(string label)
@@ -1030,7 +1187,11 @@ public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettin
         _diagnosticLastOperation = "GUILayout.Label";
         _diagnosticLabels++;
         AddDiagnosticSample(label);
-        _label.Invoke(null, [label, GetEmptyOptions(_label)]);
+        var skin = _guiSkin.Invoke(null, null)
+            ?? throw new InvalidOperationException("Unity GUI.skin is unavailable");
+        var style = _skinLabel.Invoke(skin, null)
+            ?? throw new InvalidOperationException("Unity GUI.skin.label is unavailable");
+        _labelStyled.Invoke(null, [label, style, GetEmptyOptions(_labelStyled)]);
         CaptureLastRect("label", label);
     }
 
@@ -1040,8 +1201,11 @@ public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettin
     {
         _diagnosticFrame++;
         _diagnosticTitle = SanitizeDiagnosticText(title);
-        _diagnosticEventAtBegin = CaptureImGuiContext();
-        var isRepaint = _diagnosticEventAtBegin.Contains(
+        var diagnosticsEnabled = _diagnosticBudget > 0;
+        _diagnosticEventAtBegin = diagnosticsEnabled
+            ? CaptureImGuiContext()
+            : "event=diagnostics-disabled";
+        var isRepaint = diagnosticsEnabled && _diagnosticEventAtBegin.Contains(
             "repaint",
             StringComparison.OrdinalIgnoreCase);
         _captureDiagnosticRects = isRepaint &&
@@ -1062,6 +1226,11 @@ public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettin
 
     private void TraceFrameDiagnostic(string outcome, int action, Exception? exception)
     {
+        // The production path must not build diagnostic strings or query GUI state on every
+        // Layout/Repaint pair. A rendering fault remains actionable even with normal telemetry off.
+        if (exception == null && _diagnosticBudget <= 0)
+            return;
+
         var eventAtEnd = CaptureImGuiContext();
         var structure =
             $"{_diagnosticSections}:{_diagnosticLabels}:{_diagnosticButtons}:" +
@@ -1092,6 +1261,8 @@ public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettin
               SanitizeDiagnosticText(exception.GetBaseException().Message);
         _diagnostics +=
             $" eventBegin=[{_diagnosticEventAtBegin}] eventEnd=[{eventAtEnd}] " +
+            $"transaction={_interactionFence.State} transactionEpoch={_interactionFence.LayoutEpoch} " +
+            $"transactionPending={_interactionFence.PendingCount} " +
             $"controls=section:{_diagnosticSections},label:{_diagnosticLabels}," +
             $"button:{_diagnosticButtons},toggle:{_diagnosticToggles}," +
             $"text:{_diagnosticTextFields},number:{_diagnosticNumbers},enum:{_diagnosticEnums} " +
@@ -1101,12 +1272,14 @@ public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettin
             $"frame session={_diagnosticSession} sequence={_diagnosticFrame} " +
             $"outcome={outcome} title={_diagnosticTitle} action={action} " +
             $"begin=[{_diagnosticEventAtBegin}] end=[{eventAtEnd}] " +
+            $"transaction={_interactionFence.State} transactionEpoch={_interactionFence.LayoutEpoch} " +
+            $"transactionPending={_interactionFence.PendingCount} " +
             $"controls=section:{_diagnosticSections},label:{_diagnosticLabels}," +
             $"button:{_diagnosticButtons},toggle:{_diagnosticToggles}," +
             $"text:{_diagnosticTextFields},number:{_diagnosticNumbers},enum:{_diagnosticEnums} " +
             $"samples={samples} rects={rects} {_diagnosticMetrics} {_diagnosticStyles} " +
             $"last={_diagnosticLastOperation} failure={failure}",
-            consumeBudget: true);
+            consumeBudget: exception == null);
     }
 
     private string CaptureImGuiContext()
@@ -1261,7 +1434,7 @@ public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettin
         return content;
     }
 
-    private void CloseFrame()
+    private void CloseFrame(bool completed)
     {
         Exception? failure = null;
         try
@@ -1274,10 +1447,32 @@ public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettin
         finally
         {
             _frameOpen = false;
-            if (_legacyInputFrameOpen)
+            try
             {
-                _legacyInputFrameOpen = false;
-                PcCompatLegacyInputBridge.EndSettingsGuiFrame();
+                if (_interactionFenceFrameOpen)
+                {
+                    _interactionFenceFrameOpen = false;
+                    PcCompatManagedImGuiBridge.EndSettingsInteractionFrame(_interactionFence, completed);
+                }
+            }
+            finally
+            {
+                try
+                {
+                    if (_legacyInputFrameOpen)
+                    {
+                        _legacyInputFrameOpen = false;
+                        PcCompatLegacyInputBridge.EndSettingsGuiFrame();
+                    }
+                }
+                finally
+                {
+                    if (_resetInteractionFenceAfterFrame)
+                    {
+                        _resetInteractionFenceAfterFrame = false;
+                        _interactionFence.Reset();
+                    }
+                }
             }
         }
         if (failure != null)
@@ -1288,11 +1483,11 @@ public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettin
         }
     }
 
-    private void CloseFrameBestEffort()
+    private void CloseFrameBestEffort(bool completed)
     {
         try
         {
-            CloseFrame();
+            CloseFrame(completed);
         }
         catch
         {
@@ -1342,12 +1537,15 @@ public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettin
         return constructor.Invoke([argument]);
     }
 
-    private void ApplyMobileSkin(MobileMetrics metrics, object? localizedFont)
+    private void ApplyMobileSkin(
+        MobileMetrics metrics,
+        object? localizedFont,
+        int measurementStyleFingerprint)
     {
         ApplyMobileMatrix(metrics.RenderScale);
         try
         {
-            ApplyMobileSkinCore(metrics, localizedFont);
+            ApplyMobileSkinCore(metrics, localizedFont, measurementStyleFingerprint);
         }
         catch
         {
@@ -1357,15 +1555,25 @@ public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettin
         }
     }
 
-    private void ApplyMobileSkinCore(MobileMetrics metrics, object? localizedFont)
+    private void ApplyMobileSkinCore(
+        MobileMetrics metrics,
+        object? localizedFont,
+        int measurementStyleFingerprint)
     {
         var skin = _guiSkin.Invoke(null, null)
             ?? throw new InvalidOperationException("Unity GUI.skin is unavailable");
         var skinFont = _skinGetFont.Invoke(skin, null);
+        var interactiveVisualHeight = Math.Clamp(
+            metrics.FontSize + metrics.VerticalPadding * 2f + 2f,
+            28f,
+            36f);
         _previousImGuiScale = PcCompatManagedImGuiBridge.EnterMobileSettingsScale(
             metrics.CustomDimensionScale,
             metrics.CustomFontScale,
-            metrics.TouchHeight);
+            metrics.TouchHeight,
+            interactiveVisualHeight,
+            metrics.ContentWidth,
+            measurementStyleFingerprint);
         _mobileImGuiScaleActive = true;
         _mobileSkin = skin;
         _mobileSkinFont = skinFont;
@@ -1373,11 +1581,14 @@ public sealed class PcCompatManagedSettingsUnityBackend : IPcCompatManagedSettin
             _skinSetFont.Invoke(skin, [localizedFont]);
         var styles = new[]
         {
-            new StylePolicy(_skinLabel.Invoke(skin, null), WordWrap: true, FixedHeight: 0f),
+            // Third-party IMGUI layouts use wordWrap while computing minimum width. Enabling it
+            // globally turns labels and label-styled buttons into narrow multi-line controls.
+            // The responsive bridge enables wrapping only for a verified row plan.
+            new StylePolicy(_skinLabel.Invoke(skin, null), WordWrap: false, FixedHeight: 0f),
             new StylePolicy(_skinTextField.Invoke(skin, null), WordWrap: false, FixedHeight: metrics.TouchHeight),
             new StylePolicy(_skinTextArea.Invoke(skin, null), WordWrap: true, FixedHeight: 0f),
-            new StylePolicy(_skinButton.Invoke(skin, null), WordWrap: false, FixedHeight: metrics.TouchHeight),
-            new StylePolicy(_skinToggle.Invoke(skin, null), WordWrap: false, FixedHeight: metrics.TouchHeight)
+            new StylePolicy(_skinButton.Invoke(skin, null), WordWrap: false, FixedHeight: interactiveVisualHeight),
+            new StylePolicy(_skinToggle.Invoke(skin, null), WordWrap: false, FixedHeight: interactiveVisualHeight)
         };
         foreach (var policy in styles)
         {

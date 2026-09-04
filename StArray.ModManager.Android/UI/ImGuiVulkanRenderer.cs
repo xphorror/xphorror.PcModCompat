@@ -437,10 +437,14 @@ public sealed unsafe class ImGuiVulkanRenderer : IImGuiRenderer
             self.UpdateDisplaySize(pPresentInfo);
 
             // === 渲染帧 ===
+            AndroidImGuiFontLoader.EnsureLoaded(
+                ImGui.GetIO(),
+                ImGuiImplVulkan.RecreateFontsTexture);
             ImGuiImplVulkan.NewFrame();
             self.UpdatePlatformFrame(self._fbWidth, self._fbHeight);
 
             ImGui.NewFrame();
+            ImGuiInputHandler.BeginImeFrame();
             self.BuildUI();
             ImGuiInputHandler.UpdateIme();
             ImGui.Render();

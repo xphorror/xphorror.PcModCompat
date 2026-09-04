@@ -147,6 +147,10 @@ public static class ResourceIrUnityExtractor
                     {
                         continue;
                     }
+                    else if (asset.ExpectedType == "UnityEngine.Font")
+                    {
+                        MaterializeFont(manager, files, asset, assets, payloads, outputDirectory);
+                    }
                     else if (asset.ExpectedType == "UnityEngine.Texture2D")
                     {
                         MaterializeTexture(manager, bundle, files, asset, assets, payloads, outputDirectory);
@@ -233,6 +237,53 @@ public static class ResourceIrUnityExtractor
             return true;
         }
         return false;
+    }
+
+    private static void MaterializeFont(
+        AssetsManager manager,
+        IReadOnlyDictionary<string, AssetsFileInstance> files,
+        ResourceIrAsset asset,
+        IDictionary<string, ResourceIrAsset> assets,
+        IDictionary<string, ResourceIrPayload> payloads,
+        string outputDirectory)
+    {
+        var (_, field) = ReadAsset(manager, files, asset);
+        var fontDataField = Required(field, "m_FontData");
+        var fontData = fontDataField.Value?.ValueType == AssetValueType.ByteArray
+            ? fontDataField.AsByteArray
+            : null;
+        if (fontData is not { Length: > 0 })
+        {
+            var elements = EnumerateArray(fontDataField);
+            if (elements.Count != 0)
+            {
+                fontData = new byte[elements.Count];
+                for (var index = 0; index < elements.Count; index++)
+                    fontData[index] = unchecked((byte)elements[index].AsInt);
+            }
+        }
+        if (fontData is not { Length: > 0 })
+            throw new InvalidDataException("Unity Font has no embedded m_FontData payload.");
+
+        var extension = fontData.AsSpan().StartsWith("OTTO"u8) ? ".otf" : ".ttf";
+        var payloadId = "payload." + asset.Id[4..] + ".font";
+        var fileName = asset.Id + extension;
+        File.WriteAllBytes(Path.Combine(outputDirectory, fileName), fontData);
+        payloads[payloadId] = new ResourceIrPayload
+        {
+            Id = payloadId,
+            Kind = "font-file",
+            RelativePath = "resource_ir_blobs/" + fileName,
+            Sha256Hex = Convert.ToHexString(SHA256.HashData(fontData)).ToLowerInvariant(),
+            Length = fontData.LongLength
+        };
+        assets[asset.Id] = asset with
+        {
+            MaterializationKind = ResourceIrMaterializationKind.FontFromFile,
+            Compatibility = ResourceIrCompatibility.Compatible,
+            PayloadId = payloadId,
+            Tags = asset.Tags.Concat(["font-file-v1"]).Distinct(StringComparer.Ordinal).ToArray()
+        };
     }
 
     private static string SelectFontCapability(string characterSequence, string style)

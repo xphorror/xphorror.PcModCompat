@@ -12,8 +12,8 @@ public static class AndroidInput
     public enum MotionAction
     {
         Down = 0, Up = 1, Move = 2, Cancel = 3, Outside = 4,
-        PointerDown = 5, PointerUp = 6, HoverEnter = 7, HoverMove = 8,
-        HoverExit = 9, ButtonPress = 10, ButtonRelease = 11
+        PointerDown = 5, PointerUp = 6, HoverMove = 7, Scroll = 8,
+        HoverEnter = 9, HoverExit = 10, ButtonPress = 11, ButtonRelease = 12
     }
     [Flags]
     public enum MetaState
@@ -27,6 +27,10 @@ public static class AndroidInput
         public const int PointerIndex = 0xff00;
         public const int PointerIndexShift = 8;
     }
+
+    public const int ActionMask = MotionMask.Action;
+    public const int ActionPointerIndexMask = MotionMask.PointerIndex;
+    public const int ActionPointerIndexShift = MotionMask.PointerIndexShift;
 
     [StructLayout(LayoutKind.Sequential)] public struct AInputEvent { }
     [StructLayout(LayoutKind.Sequential)] public struct AInputQueue { }
@@ -68,14 +72,25 @@ public static class AndroidInput
     public static extern int AMotionEvent_getPointerCount(IntPtr ev);
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     public static extern int AMotionEvent_getPointerId(IntPtr ev, int pointerIndex);
+    /// <summary>事件时间，单位纳秒，时钟源为 CLOCK_MONOTONIC。</summary>
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    public static extern long AMotionEvent_getEventTime(IntPtr ev);
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    public static extern long AMotionEvent_getDownTime(IntPtr ev);
+
+    public static MotionAction GetMainAction(int rawAction) =>
+        (MotionAction)(rawAction & ActionMask);
+
+    public static int GetPointerIndex(int rawAction) =>
+        (rawAction & ActionPointerIndexMask) >> ActionPointerIndexShift;
 
     public static MotionAction GetMainAction(this IntPtr ev)
     {
         if (AInputEvent_getType(ev) != EventType.Motion)
             throw new InvalidOperationException("Event is not a motion event.");
-        return (MotionAction)(AMotionEvent_getAction(ev) & MotionMask.Action);
+        return GetMainAction(AMotionEvent_getAction(ev));
     }
 
     public static int GetPointerIndex(this IntPtr ev) =>
-        (AMotionEvent_getAction(ev) & MotionMask.PointerIndex) >> MotionMask.PointerIndexShift;
+        GetPointerIndex(AMotionEvent_getAction(ev));
 }

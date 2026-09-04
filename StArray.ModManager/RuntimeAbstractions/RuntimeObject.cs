@@ -1,8 +1,9 @@
 using StArray.ModManager.Il2Cpp;
+using StArray.ModManager.Mono;
 
 namespace StArray.ModManager.RuntimeAbstractions;
 
-/// <summary>IL2CPP managed object 的统一 Android 包装。</summary>
+/// <summary>managed object 的统一包装。</summary>
 public readonly unsafe struct RuntimeObject
 {
     public nint Ptr { get; }
@@ -11,17 +12,37 @@ public readonly unsafe struct RuntimeObject
     public RuntimeObject(nint ptr) => Ptr = ptr;
 
     private nint GetClassPtr()
-        => RuntimeManager.IsIl2Cpp && Ptr != 0
-            ? Il2CppFunctions.il2cpp_object_get_class(Ptr)
-            : 0;
+    {
+        if (Ptr == 0) return 0;
+        return RuntimeManager.Backend switch
+        {
+            RuntimeBackend.Il2Cpp => Il2CppFunctions.il2cpp_object_get_class(Ptr),
+            RuntimeBackend.Mono => MonoFunctions.MonoObjectGetClass(Ptr),
+            _ => 0
+        };
+    }
 
     public nint Invoke(string methodName, int paramCount, nint[]? args = null)
     {
         var klass = GetClassPtr();
         if (klass == 0)
             return 0;
-        var method = Il2CppFunctions.il2cpp_class_get_method_from_name(klass, methodName, paramCount);
-        return method != 0 ? new Il2CppMethod(method).Invoke(Ptr, args) : 0;
+
+        if (RuntimeManager.IsIl2Cpp)
+        {
+            var method = Il2CppFunctions.il2cpp_class_get_method_from_name(klass, methodName, paramCount);
+            return method != 0 ? new Il2CppMethod(method).Invoke(Ptr, args) : 0;
+        }
+
+        if (RuntimeManager.IsMono)
+        {
+            var method = MonoFunctions.MonoClassGetMethodFromName(klass, methodName, paramCount);
+            return method != 0
+                ? MonoFunctions.MonoRuntimeInvoke(method, Ptr, args, out _)
+                : 0;
+        }
+
+        return 0;
     }
 
     public nint Invoke(string methodName, nint[]? args = null)
@@ -38,7 +59,12 @@ public readonly unsafe struct RuntimeObject
         var result = Invoke(methodName, paramCount, args);
         if (result == 0)
             return default;
-        var unboxed = Il2CppRuntimeApi.Current.ObjectUnbox(result);
+        var unboxed = RuntimeManager.Backend switch
+        {
+            RuntimeBackend.Il2Cpp => Il2CppRuntimeApi.Current.ObjectUnbox(result),
+            RuntimeBackend.Mono => MonoFunctions.MonoObjectUnbox(result),
+            _ => 0
+        };
         return unboxed != 0 ? *(T*)unboxed : default;
     }
 
@@ -56,8 +82,20 @@ public readonly unsafe struct RuntimeObject
         var klass = GetClassPtr();
         if (klass == 0)
             return default;
-        var field = Il2CppFunctions.il2cpp_class_get_field_from_name(klass, fieldName);
-        return field != 0 ? new Il2CppField(field).GetValue<T>(Ptr) : default;
+
+        if (RuntimeManager.IsIl2Cpp)
+        {
+            var field = Il2CppFunctions.il2cpp_class_get_field_from_name(klass, fieldName);
+            return field != 0 ? new Il2CppField(field).GetValue<T>(Ptr) : default;
+        }
+
+        if (RuntimeManager.IsMono)
+        {
+            var field = MonoFunctions.MonoClassGetFieldFromName(klass, fieldName);
+            return field != 0 ? new MonoField(field, klass).GetValue<T>(Ptr) : default;
+        }
+
+        return default;
     }
 
     public void SetField<T>(string fieldName, T value) where T : unmanaged
@@ -65,9 +103,21 @@ public readonly unsafe struct RuntimeObject
         var klass = GetClassPtr();
         if (klass == 0)
             return;
-        var field = Il2CppFunctions.il2cpp_class_get_field_from_name(klass, fieldName);
-        if (field != 0)
-            new Il2CppField(field).SetValue(Ptr, value);
+
+        if (RuntimeManager.IsIl2Cpp)
+        {
+            var field = Il2CppFunctions.il2cpp_class_get_field_from_name(klass, fieldName);
+            if (field != 0)
+                new Il2CppField(field).SetValue(Ptr, value);
+            return;
+        }
+
+        if (RuntimeManager.IsMono)
+        {
+            var field = MonoFunctions.MonoClassGetFieldFromName(klass, fieldName);
+            if (field != 0)
+                new MonoField(field, klass).SetValue(Ptr, value);
+        }
     }
 
     public T GetField<T>(IRuntimeField field) where T : unmanaged
@@ -138,16 +188,27 @@ public readonly unsafe struct RuntimeObject<T> where T : UnmanagedObject
         var klass = GetClassPtr();
         if (klass == 0)
             return false;
-        const int abstractFlag = 0x80;
-        const int sealedFlag = 0x100;
-        var flags = Il2CppFunctions.il2cpp_class_get_flags(klass);
+        const uint abstractFlag = 0x80;
+        const uint sealedFlag = 0x100;
+        var flags = RuntimeManager.Backend switch
+        {
+            RuntimeBackend.Il2Cpp => unchecked((uint)Il2CppFunctions.il2cpp_class_get_flags(klass)),
+            RuntimeBackend.Mono => MonoFunctions.MonoClassGetFlags(klass),
+            _ => 0u
+        };
         return (flags & (abstractFlag | sealedFlag)) == (abstractFlag | sealedFlag);
     }
 
     private nint GetClassPtr()
-        => RuntimeManager.IsIl2Cpp && Ptr != 0
-            ? Il2CppFunctions.il2cpp_object_get_class(Ptr)
-            : 0;
+    {
+        if (Ptr == 0) return 0;
+        return RuntimeManager.Backend switch
+        {
+            RuntimeBackend.Il2Cpp => Il2CppFunctions.il2cpp_object_get_class(Ptr),
+            RuntimeBackend.Mono => MonoFunctions.MonoObjectGetClass(Ptr),
+            _ => 0
+        };
+    }
 
     public RuntimeObject AsRuntimeObject() => new(Ptr);
     public nint Invoke(string methodName, int paramCount, nint[]? args = null)

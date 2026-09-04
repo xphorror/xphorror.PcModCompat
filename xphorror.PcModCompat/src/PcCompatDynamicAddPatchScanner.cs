@@ -821,6 +821,22 @@ internal static class PcCompatMetadataNames
         }
     }
 
+    public static string GetMethodReturnType(
+        MetadataReader reader,
+        MethodDefinitionHandle handle)
+    {
+        try
+        {
+            return reader.GetMethodDefinition(handle)
+                .DecodeSignature(SignatureProvider, genericContext: null)
+                .ReturnType;
+        }
+        catch (BadImageFormatException)
+        {
+            return string.Empty;
+        }
+    }
+
     public static bool? GetMethodIsInstance(MetadataReader reader, int metadataToken)
     {
         if (!TryGetEntityHandle(metadataToken, out var handle))

@@ -7,6 +7,8 @@ import android.content.Intent;
 import android.database.Cursor;
 import android.net.Uri;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.SystemClock;
 import android.provider.OpenableColumns;
 import android.view.KeyEvent;
@@ -38,6 +40,7 @@ import java.util.zip.ZipInputStream;
 @SuppressWarnings("deprecation")
 public final class StArrayModManagerBootstrap {
     private static final String TAG = "StArrayBootstrap";
+    private static final long CAP_MODMANAGER_RUNTIME = 1L << 2;
     private static Activity sActivity;
     private static volatile boolean sLaunched;
     private static volatile boolean sCoreClrAttempted;
@@ -46,6 +49,7 @@ public final class StArrayModManagerBootstrap {
     private static volatile boolean sEnableInputHooks = false;
     private static volatile boolean sModalInputCapture;
     private static final Object sLaunchLock = new Object();
+    private static final Handler MAIN_HANDLER = new Handler(Looper.getMainLooper());
     private static KeyboardView sKeyboardView;
     private static volatile boolean sKeyboardShown;
     private static volatile boolean sKeyboardActuallyVisible;
@@ -93,6 +97,10 @@ public final class StArrayModManagerBootstrap {
 
     private StArrayModManagerBootstrap() {}
 
+    public static long getNativeHookBrokerApiV1() {
+        return nativeGetHookBrokerApiV1();
+    }
+
     public static void setUiEnabled(boolean enabled) {
         sEnableUi = enabled;
     }
@@ -119,6 +127,10 @@ public final class StArrayModManagerBootstrap {
 
     public static int isModalInputCaptureActive() {
         return sLaunchSucceeded && sModalInputCapture ? 1 : 0;
+    }
+
+    public static void setApplicationFocusState(boolean resumed, boolean windowFocused) {
+        nativeSetApplicationFocusState(resumed, windowFocused);
     }
 
     public static void requestModalClose() {
@@ -151,6 +163,10 @@ public final class StArrayModManagerBootstrap {
         String appFilesPath = filesDir.getAbsolutePath();
         if (!nativeConfigureAppFilesDir(appFilesPath)) {
             android.util.Log.e(TAG, "launch rejected: app files directory unavailable");
+            return;
+        }
+        if (!nativeHasCapability(CAP_MODMANAGER_RUNTIME)) {
+            android.util.Log.i(TAG, "launch rejected: modmanager_runtime capability unavailable");
             return;
         }
         installInputDeviceMonitor(activity);
@@ -208,7 +224,7 @@ public final class StArrayModManagerBootstrap {
                     InputManager manager = (InputManager) activity.getSystemService(
                             Context.INPUT_SERVICE);
                     if (manager != null) {
-                        manager.registerInputDeviceListener(INPUT_DEVICE_LISTENER, null);
+                        manager.registerInputDeviceListener(INPUT_DEVICE_LISTENER, MAIN_HANDLER);
                         sInputDeviceMonitorInstalled = true;
                     }
                 }
@@ -249,6 +265,9 @@ public final class StArrayModManagerBootstrap {
     }
 
     private static void launchOnWorker() throws IOException {
+        if (!nativeHasCapability(CAP_MODMANAGER_RUNTIME)) {
+            throw new IllegalStateException("modmanager_runtime capability unavailable");
+        }
         Activity activity = Objects.requireNonNull(sActivity);
         File internalRoot = new File(activity.getFilesDir(), "ModManager");
         File externalRoot = new File(activity.getExternalFilesDir(null), "ModManager");
@@ -899,6 +918,15 @@ public final class StArrayModManagerBootstrap {
         });
     }
 
+    /**
+     * Returns the last WindowInsets-derived IME visibility state. The managed
+     * renderer uses this only to retry a request after a user taps an already
+     * focused ImGui text field whose keyboard was dismissed externally.
+     */
+    public static boolean isKeyboardActuallyVisible() {
+        return sKeyboardActuallyVisible;
+    }
+
     private static void installImeVisibilityObserver(Activity activity) {
         activity.runOnUiThread(new Runnable() {
             @Override
@@ -1014,7 +1042,10 @@ public final class StArrayModManagerBootstrap {
 
     public static native int nativeSetEnv(String key, String value);
     public static native boolean nativeConfigureAppFilesDir(String path);
+    public static native boolean nativeHasCapability(long capability);
     public static native int nativeInitRuntime(String runtimeDir, String entryPointDll, int localDateTimeOffset);
+
+    private static native long nativeGetHookBrokerApiV1();
     public static native int nativeExecEntryPointWithArgs(
             String entryPointDll,
             String assemblyName,
@@ -1026,6 +1057,8 @@ public final class StArrayModManagerBootstrap {
     public static native void nativeSendKey(int keyCode);
     public static native void nativeSetOverlayVisible(boolean visible);
     public static native void nativeSetModalInputCapture(boolean active);
+    public static native void nativeSetApplicationFocusState(
+            boolean resumed, boolean windowFocused);
     public static native void nativeRequestModalClose();
     public static native int nativeTakeModalCloseRequest();
     public static native boolean nativeForwardMotionEvent(

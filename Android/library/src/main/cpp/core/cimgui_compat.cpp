@@ -5,6 +5,8 @@
 #include <android/input.h>
 #include <android/log.h>
 #include <atomic>
+#include <stdint.h>
+#include <string.h>
 #include <jni.h>
 #include <math.h>
 #include <pthread.h>
@@ -57,6 +59,13 @@ static bool g_modal_input_active = false;
 static bool g_modal_unity_event_system_blocked = false;
 static bool g_modal_close_requested = false;
 static std::atomic<bool> g_overlay_focus_release_requested{false};
+static std::atomic<uint64_t> g_forwarded_touch_down_sequence{0};
+static std::atomic<uint64_t> g_observed_text_glyphs[1024]{};
+
+static constexpr int kImeStateContextReady = 1 << 0;
+static constexpr int kImeStateWantTextInput = 1 << 1;
+static constexpr int kImeStateTextInputActive = 1 << 2;
+static constexpr int kImeStateWantTextInputNextFrame = 1 << 3;
 
 extern "C" void modmanager_pccompat_observe_touch_input(
     int action,
@@ -83,6 +92,9 @@ extern "C" void modmanager_pccompat_observe_key_input(
     int android_flags);
 
 extern "C" void modmanager_pccompat_set_external_input_devices(uint32_t flags);
+extern "C" void modmanager_pccompat_set_application_focus_state(
+    int resumed,
+    int window_focused);
 
 extern "C" int modmanager_modal_input_is_active(void);
 
@@ -91,6 +103,90 @@ extern "C" int modmanager_overlay_ui_is_visible(void) {
     const bool visible = g_overlay_ui_visible;
     pthread_mutex_unlock(&g_overlay_touch_lock);
     return visible ? 1 : 0;
+}
+
+extern "C" int modmanager_imgui_get_ime_state(
+    uint32_t* active_id,
+    uint32_t* input_text_id,
+    uint64_t* touch_down_sequence) {
+    if (active_id != nullptr)
+        *active_id = 0;
+    if (input_text_id != nullptr)
+        *input_text_id = 0;
+    if (touch_down_sequence != nullptr) {
+        *touch_down_sequence = g_forwarded_touch_down_sequence.load(
+            std::memory_order_acquire);
+    }
+    if (GImGui == nullptr)
+        return 0;
+
+    const uint32_t current_active_id = GImGui->ActiveId;
+    const uint32_t current_input_text_id = GImGui->InputTextState.ID;
+    if (active_id != nullptr)
+        *active_id = current_active_id;
+    if (input_text_id != nullptr)
+        *input_text_id = current_input_text_id;
+
+    int state = kImeStateContextReady;
+    if (GImGui->IO.WantTextInput)
+        state |= kImeStateWantTextInput;
+    if (current_active_id != 0 && current_active_id == current_input_text_id)
+        state |= kImeStateTextInputActive;
+    if (GImGui->WantTextInputNextFrame == 1)
+        state |= kImeStateWantTextInputNextFrame;
+    return state;
+}
+
+extern "C" void modmanager_imgui_observe_text(
+    const char* text_begin,
+    const char* text_end) {
+    if (text_begin == nullptr || text_begin == text_end)
+        return;
+
+    const char* cursor = text_begin;
+    const char* end = text_end != nullptr ? text_end : text_begin + strlen(text_begin);
+    while (cursor < end) {
+        unsigned int codepoint = 0;
+        const int length = ImTextCharFromUtf8(&codepoint, cursor, end);
+        if (length <= 0)
+            break;
+        cursor += length;
+        if (codepoint < 0x20 || codepoint > 0xFFFF)
+            continue;
+
+        g_observed_text_glyphs[codepoint >> 6].fetch_or(
+            uint64_t{1} << (codepoint & 63),
+            std::memory_order_relaxed);
+    }
+}
+
+extern "C" int modmanager_imgui_drain_observed_text_glyphs(
+    uint16_t* output,
+    uint32_t capacity) {
+    if (output == nullptr || capacity == 0)
+        return 0;
+
+    uint32_t count = 0;
+    for (uint32_t word_index = 0; word_index < 1024; ++word_index) {
+        uint64_t pending = g_observed_text_glyphs[word_index].exchange(
+            0,
+            std::memory_order_acq_rel);
+        while (pending != 0) {
+            if (count >= capacity) {
+                // Preserve the unreturned suffix for the next frame. New bits
+                // added concurrently are merged instead of being discarded.
+                g_observed_text_glyphs[word_index].fetch_or(
+                    pending,
+                    std::memory_order_release);
+                return static_cast<int>(count);
+            }
+
+            const uint32_t bit = static_cast<uint32_t>(__builtin_ctzll(pending));
+            output[count++] = static_cast<uint16_t>((word_index << 6) + bit);
+            pending &= pending - 1;
+        }
+    }
+    return static_cast<int>(count);
 }
 
 extern "C" void modmanager_overlay_ui_set_visible(int visible) {
@@ -210,6 +306,19 @@ Java_com_fizzd_connectedworlds_editorport_StArrayModManagerBootstrap_nativeSetMo
     (void)env;
     (void)clazz;
     modmanager_modal_input_set_active(active == JNI_TRUE ? 1 : 0);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_fizzd_connectedworlds_editorport_StArrayModManagerBootstrap_nativeSetApplicationFocusState(
+    JNIEnv* env,
+    jclass clazz,
+    jboolean resumed,
+    jboolean window_focused) {
+    (void)env;
+    (void)clazz;
+    modmanager_pccompat_set_application_focus_state(
+        resumed == JNI_TRUE ? 1 : 0,
+        window_focused == JNI_TRUE ? 1 : 0);
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -502,6 +611,10 @@ Java_com_fizzd_connectedworlds_editorport_StArrayModManagerBootstrap_nativeForwa
         (int)button_state
     };
     g_forwarded_motion_count++;
+    if (action == AMOTION_EVENT_ACTION_DOWN ||
+        action == AMOTION_EVENT_ACTION_POINTER_DOWN) {
+        g_forwarded_touch_down_sequence.fetch_add(1, std::memory_order_release);
+    }
     pthread_mutex_unlock(&g_forwarded_motion_lock);
     return manager_visible || consume ? JNI_TRUE : JNI_FALSE;
 }

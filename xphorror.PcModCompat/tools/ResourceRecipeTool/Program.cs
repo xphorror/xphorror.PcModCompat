@@ -90,9 +90,10 @@ static int RunCompile(string[] args)
         throw new InvalidDataException("resource_ir.bin failed validation: " + irError);
     if (!ResourceIrBinary.TryVerifyPayloadFiles(resourceIrPath, resourceIr, out var payloadError))
         throw new InvalidDataException("resource_ir.bin payload validation failed: " + payloadError);
+    var inputFingerprint = ResourceCompileInputFingerprint.Compute(modId, modFolder);
     File.WriteAllText(
         compilerMarkerPath,
-        ResourceIrCompiler.CompilerRevision + "\n",
+        ResourceCompileInputFingerprint.BuildCompilerMarker(inputFingerprint),
         new System.Text.UTF8Encoding(false));
 
     // Also publish beside the MOD so PcCompatRecipeBundleCache can atomically
@@ -122,6 +123,7 @@ static int RunCompile(string[] args)
     Console.WriteLine($"resourceIr={resourceIrPath}");
     Console.WriteLine($"modCompatResourceIr={modResourceIrPath}");
     Console.WriteLine($"resourceIrCompiler={ResourceIrCompiler.CompilerRevision}");
+    Console.WriteLine($"resourceInputFingerprint={inputFingerprint}");
     Console.WriteLine($"irBundles={resourceIr.Bundles.Count}");
     Console.WriteLine($"irAssets={resourceIr.Assets.Count}");
     Console.WriteLine($"irRequired={resourceIr.Assets.Count(asset => asset.RequiredByMod)}");

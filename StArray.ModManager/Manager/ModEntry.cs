@@ -7,6 +7,8 @@ namespace StArray.ModManager.Manager;
 /// </summary>
 public class ModEntry
 {
+    internal const string NativeLoaderKind = "StArray.Android.Native";
+
     /// <summary>唯一标识</summary>
     public string Id { get; set; } = string.Empty;
 
@@ -51,6 +53,26 @@ public class ModEntry
 
     /// <summary>加载器类型，例如 StArray 或 xphorror.PcModCompat</summary>
     public string LoaderKind { get; set; } = "StArray";
+
+    internal ModRuntimeSession RuntimeSession { get; set; } = new();
+
+    internal ModRuntimeKey RuntimeKey => RuntimeSession.CurrentKey;
+
+    internal long LoadGeneration => RuntimeSession.Generation;
+
+    internal string RuntimeOwnerId => ModRuntimeKey.ToOwnerId(LoaderKind, Id);
+
+    internal ModRuntimeKey EnsureRuntimeActive()
+        => RuntimeSession.EnsureActive(LoaderKind, Id);
+
+    internal ModRuntimeKey EnsureRuntimeLoading()
+        => RuntimeSession.EnsureLoading(LoaderKind, Id);
+
+    internal bool TryEnterRuntimeCallback(out IDisposable? lease)
+    {
+        var key = EnsureRuntimeActive();
+        return RuntimeSession.TryEnterCallback(key, out lease);
+    }
 
     /// <summary>加载器私有数据。核心 UI 不直接解释此字段。</summary>
     public object? LoaderData { get; set; }

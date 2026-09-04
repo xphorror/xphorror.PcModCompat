@@ -22,6 +22,38 @@ public sealed class ModManagerAndroidUpstreamSyncTests
         ?? throw new InvalidOperationException("ModLoader.ResolvePluginType was not found");
 
     [Test]
+    public void AndroidGlesBindingsUseLoaderSafeNativeResolver()
+    {
+        var root = FindRepoRoot();
+        var bindings = File.ReadAllText(Path.Combine(
+            root,
+            "StArray.ModManager.Android",
+            "Native",
+            "GLESBindingsContext.cs"));
+        var native = File.ReadAllText(Path.Combine(
+            root,
+            "Android",
+            "library",
+            "src",
+            "main",
+            "cpp",
+            "core",
+            "dobby_hook.cpp"));
+        var build = File.ReadAllText(Path.Combine(root, "build_android_single.ps1"));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(bindings, Does.Not.Contain("DL.dlopen("));
+            Assert.That(bindings, Does.Not.Contain("Dobby.SymbolResolver"));
+            Assert.That(bindings, Does.Contain("modmanager_gl_get_proc_address"));
+            Assert.That(native, Does.Contain("modmanager_gl_get_proc_address"));
+            Assert.That(native, Does.Contain("dlsym(RTLD_DEFAULT, symbol_name)"));
+            Assert.That(native, Does.Contain("eglGetProcAddress"));
+            Assert.That(build, Does.Contain("'modmanager_gl_get_proc_address'"));
+        });
+    }
+
+    [Test]
     public void RuntimeAbstractionsRequiredByAndroidModsArePresent()
     {
         var assembly = typeof(ModLoader).Assembly;
@@ -54,6 +86,8 @@ public sealed class ModManagerAndroidUpstreamSyncTests
             Assert.That(assembly.GetType(typeName, throwOnError: false), Is.Not.Null, typeName);
 
         var appDomain = assembly.GetType(requiredTypes[0], throwOnError: true)!;
+        var runtimeManager = assembly.GetType(requiredTypes[5], throwOnError: true)!;
+        var runtimeClass = assembly.GetType(requiredTypes[2], throwOnError: true)!;
         Assert.Multiple(() =>
         {
             Assert.That(appDomain.GetProperty("Ptr")?.PropertyType, Is.EqualTo(typeof(nint)));
@@ -63,6 +97,9 @@ public sealed class ModManagerAndroidUpstreamSyncTests
             Assert.That(appDomain.GetMethod("NewString", [typeof(string)])?.ReturnType, Is.EqualTo(typeof(nint)));
             Assert.That(appDomain.GetMethod("NewArray", [typeof(nint), typeof(int)])?.ReturnType,
                 Is.EqualTo(typeof(nint)));
+            Assert.That(
+                runtimeManager.GetMethod("GetObjectClass", [typeof(nint)])?.ReturnType,
+                Is.EqualTo(runtimeClass));
         });
     }
 
@@ -125,32 +162,88 @@ public sealed class ModManagerAndroidUpstreamSyncTests
     }
 
     [Test]
+    public void AndroidNativeModsUseCallbackOnlyShadowRewrite()
+    {
+        var root = FindRepoRoot();
+        var managed = File.ReadAllText(Path.Combine(
+            root, "StArray.ModManager.Android", "Managed.cs"));
+        var shadowBootstrap = File.ReadAllText(Path.Combine(
+            root, "StArray.ModManager.Android", "NativeModAndroidShadowRewrite.cs"));
+        var loader = File.ReadAllText(Path.Combine(
+            root, "StArray.ModManager", "Runtime", "ModLoader.cs"));
+        var loadContext = File.ReadAllText(Path.Combine(
+            root, "StArray.ModManager", "Runtime", "NativeModAssemblyLoadContext.cs"));
+
+        var installCall = managed.IndexOf(
+            "NativeModAndroidShadowRewrite.Install();",
+            StringComparison.Ordinal);
+        var loaderCreation = managed.IndexOf(
+            "var loader = new ModLoader(",
+            StringComparison.Ordinal);
+        var prepareGuard = loader.IndexOf(
+            "if (NativeModShadowRewriteRuntime.IsEnabled)",
+            StringComparison.Ordinal);
+        var prepareCall = loader.IndexOf(
+            "shadowPackage = NativeModShadowPackage.Prepare(",
+            prepareGuard,
+            StringComparison.Ordinal);
+        var directAssemblyPath = loader.IndexOf(
+            "var metadataAssemblyPath = entryDll;",
+            StringComparison.Ordinal);
+        var ensureShadowGuard = loader.IndexOf(
+            "!NativeModShadowRewriteRuntime.IsEnabled",
+            loader.IndexOf("private void EnsureNativeShadowState", StringComparison.Ordinal),
+            StringComparison.Ordinal);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(shadowBootstrap, Does.Contain("NativeModShadowRewriteRuntime.RegisterProvider"));
+            Assert.That(shadowBootstrap, Does.Contain("NativeModIsolationRewriteMode.CallbackOnly"));
+            Assert.That(shadowBootstrap, Does.Contain(
+                "callback-only-v3-logical-assembly-location"));
+            Assert.That(shadowBootstrap, Does.Contain(
+                "PcCompatManagedAssemblyRewrite.ResolveRuntimeAssemblyPath"));
+            Assert.That(shadowBootstrap, Does.Not.Contain(
+                "typeof(NativeModPathBridge).Assembly.Location,"));
+            Assert.That(managed, Does.Contain("NativeModAndroidShadowRewrite.Install();"));
+            Assert.That(installCall, Is.GreaterThanOrEqualTo(0));
+            Assert.That(loaderCreation, Is.GreaterThan(installCall),
+                "Native MOD rewrite policy must be established before ModLoader scans any directory.");
+            Assert.That(prepareGuard, Is.GreaterThanOrEqualTo(0));
+            Assert.That(prepareCall, Is.GreaterThan(prepareGuard));
+            Assert.That(directAssemblyPath, Is.GreaterThanOrEqualTo(0));
+            Assert.That(directAssemblyPath, Is.LessThan(prepareGuard),
+                "The direct path must be established before the optional shadow branch.");
+            Assert.That(ensureShadowGuard, Is.GreaterThanOrEqualTo(0));
+            Assert.That(loadContext, Does.Contain(
+                "var executionPath = _shadowPackage?.EntryAssemblyPath ?? _entryAssemblyPath;"));
+        });
+    }
+
+    [Test]
     public void AndroidIl2CppHandleBridgeWaitsForValidatedAsyncInputProvider()
     {
         var stArrayRoot = FindRepoRoot();
+        var hooksRoot = Directory.GetParent(stArrayRoot)?.FullName
+            ?? throw new DirectoryNotFoundException("Could not locate hooks repo root");
         var asyncInput = File.ReadAllText(Path.Combine(
-            stArrayRoot, "external", "AsyncInput", "async_input.c"));
-        var runtimeBridge = File.ReadAllText(Path.Combine(
-            stArrayRoot,
-            "Android",
-            "library",
-            "src",
-            "main",
-            "cpp",
-            "core",
-            "runtime_il2cpp_bridge.c"));
-
+            hooksRoot, "async_input", "async_input.c"));
+        var extraMenu = File.ReadAllText(Path.Combine(
+            hooksRoot, "adofai_extra_menu", "adofai_extra_menu.c"));
         Assert.Multiple(() =>
         {
             Assert.That(asyncInput, Does.Contain(
                 "ADOFAIAsyncInputGetIl2CppHandleV1"));
-            Assert.That(asyncInput, Does.Contain("handle_domain_get != mapped_domain_get"));
-            Assert.That(runtimeBridge, Does.Contain(
-                "adofai_async_il2cpp_handle_provider.ptr"));
-            Assert.That(runtimeBridge, Does.Contain(
+            Assert.That(asyncInput, Does.Contain(
+                "handle_domain_get == mapped_domain_get"));
+            Assert.That(extraMenu, Does.Contain(
                 "ADOASYNCIL2CPPHANDLE1"));
-            Assert.That(runtimeBridge, Does.Contain(
-                "ADOFAIAsyncInputGetIl2CppHandleV1"));
+            Assert.That(extraMenu, Does.Contain(
+                "strcmp(ado_sec_basename(provider_info.dli_fname), \"libAsyncInput.so\")"));
+            Assert.That(extraMenu, Does.Contain(
+                "void *handle = ado_try_async_il2cpp_handle_provider(domain_get);"));
+            Assert.That(extraMenu, Does.Contain(
+                "handle_domain_get == NULL || handle_domain_get != mapped_domain_get"));
             Assert.That(asyncInput, Does.Contain(
                 "libstarray_modmanager.so"));
         });
@@ -160,18 +253,29 @@ public sealed class ModManagerAndroidUpstreamSyncTests
     public void EditorAsyncDriverOwnsOriginalUpdateWithoutDoubleProcessingOfficialInput()
     {
         var stArrayRoot = FindRepoRoot();
+        var hooksRoot = Directory.GetParent(stArrayRoot)?.FullName
+            ?? throw new DirectoryNotFoundException("Could not locate hooks repo root");
         var source = File.ReadAllText(Path.Combine(
-            stArrayRoot,
-            "external",
-            "AsyncInput",
+            hooksRoot,
+            "async_input",
             "async_input.c"));
         var editorHook = SliceSource(
             source,
             "static void hooked_editor_update(void *self, void *method)",
             "static void hooked_playercontrol_update(void *self, void *method)");
 
+        var replayBeforeOriginal = editorHook.IndexOf(
+            "hooked_update_input_internal(controller, NULL, 0);",
+            StringComparison.Ordinal);
+        var enterOwnership = editorHook.IndexOf(
+            "enter_forced_async_original();",
+            StringComparison.Ordinal);
         var originalUpdate = editorHook.IndexOf(
             "g_original_editor_update(self, method);",
+            enterOwnership,
+            StringComparison.Ordinal);
+        var leaveOwnership = editorHook.IndexOf(
+            "leave_forced_async_original();",
             StringComparison.Ordinal);
         var replayAfterOriginal = editorHook.LastIndexOf(
             "drive_editor_async_update(\"scnEditor.Update.after\");",
@@ -179,16 +283,89 @@ public sealed class ModManagerAndroidUpstreamSyncTests
 
         Assert.Multiple(() =>
         {
-            Assert.That(originalUpdate, Is.GreaterThanOrEqualTo(0));
-            Assert.That(replayAfterOriginal, Is.GreaterThan(originalUpdate));
-            Assert.That(
-                editorHook.Split("g_original_editor_update(self, method);").Length - 1,
-                Is.EqualTo(2),
-                "disabled and enabled paths must each call the original exactly once");
-            Assert.That(
-                editorHook.Split("drive_editor_async_update(\"scnEditor.Update.after\");").Length - 1,
-                Is.EqualTo(1));
-            Assert.That(editorHook, Does.Not.Contain("hooked_update_input(controller, NULL);"));
+            Assert.That(replayBeforeOriginal, Is.GreaterThanOrEqualTo(0));
+            Assert.That(enterOwnership, Is.GreaterThan(replayBeforeOriginal));
+            Assert.That(originalUpdate, Is.GreaterThan(enterOwnership));
+            Assert.That(leaveOwnership, Is.GreaterThan(originalUpdate));
+            Assert.That(replayAfterOriginal, Is.GreaterThan(leaveOwnership));
+            Assert.That(source, Does.Contain(
+                "__atomic_add_fetch(&g_force_async_active_for_original, 1"));
+            Assert.That(source, Does.Match(
+                @"__atomic_sub_fetch\(\s*&g_force_async_active_for_original,\s*1"));
+        });
+    }
+
+    [Test]
+    public void TestMacroCommitsSynchronouslyBeforeTheReplayDeadlineIsSampled()
+    {
+        var stArrayRoot = FindRepoRoot();
+        var hooksRoot = Directory.GetParent(stArrayRoot)?.FullName
+            ?? throw new DirectoryNotFoundException("Could not locate hooks repo root");
+        var source = File.ReadAllText(Path.Combine(
+            hooksRoot,
+            "async_input",
+            "async_input.c"));
+        var macro = SliceSource(
+            source,
+            "static int post_test_macro_input_for_controller(void *controller_self) {",
+            "static void restore_async_angle_to_tick(void *controller_self, uint64_t tick)");
+        // Bounded by the next function definition. This used to anchor on
+        // disable_async_for_dlc_if_needed, which was removed with the DLC fuse; the ordering
+        // assertions below are about test-macro publish vs replay deadline sampling and never
+        // depended on DLC.
+        var replay = SliceSource(
+            source,
+            "static int replay_pending_events_via_process_key_inputs(void *controller_self, uint64_t target_tick, int replay_mode) {",
+            "static void close_async_capture(void)");
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(macro, Does.Contain("enqueue_event("));
+            Assert.That(macro, Does.Not.Contain("ingress_post_event("));
+
+            var publish = replay.IndexOf(
+                "post_test_macro_input_for_controller(controller_self)",
+                StringComparison.Ordinal);
+            var deadline = replay.IndexOf(
+                "uint64_t now_raw_ns = monotonic_ns_now();",
+                StringComparison.Ordinal);
+            var pop = replay.IndexOf("pop_events_for_tick(now_raw_ns", StringComparison.Ordinal);
+            Assert.That(publish, Is.GreaterThanOrEqualTo(0));
+            Assert.That(deadline, Is.GreaterThan(publish));
+            Assert.That(pop, Is.GreaterThan(deadline));
+        });
+    }
+
+    [Test]
+    public void PhysicalInputIsSealedWithoutTreatingAStalledUnityFrameAsCaptureRetirement()
+    {
+        var stArrayRoot = FindRepoRoot();
+        var hooksRoot = Directory.GetParent(stArrayRoot)?.FullName
+            ?? throw new DirectoryNotFoundException("Could not locate hooks repo root");
+        var source = File.ReadAllText(Path.Combine(
+            hooksRoot,
+            "async_input",
+            "async_input.c"));
+        var ingress = SliceSource(
+            source,
+            "static int ingress_post_event(int event_type, int source_id, uint64_t raw_ns) {",
+            "static int ingress_post_command(int kind, int wait_for_ack) {");
+        var captureGate = SliceSource(
+            source,
+            "static int capture_gate_open(void) {",
+            "static int __attribute__((unused)) capture_gate_active(void) {");
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(ingress, Does.Contain(
+                "ingress_wait_processed(record.seq, INGRESS_EVENT_SEAL_TIMEOUT_MS)"));
+            Assert.That(ingress, Does.Contain("input event seal wait timed out"));
+            Assert.That(ingress, Does.Contain("g_input_thread_started"));
+            Assert.That(captureGate, Does.Contain(
+                "g_capture_ready && g_last_playercontrol_wall_tick != 0"));
+            Assert.That(captureGate, Does.Not.Contain("clear_runtime_state_locked()"));
+            Assert.That(captureGate, Does.Not.Contain("CAPTURE_STALE_TICKS"));
+            Assert.That(source, Does.Not.Contain("capture gate stale closed"));
         });
     }
 
@@ -309,16 +486,26 @@ public sealed class ModManagerAndroidUpstreamSyncTests
     }
 
     [Test]
-    public void AndroidFontAtlasIncludesLocalizedAndDynamicChineseGlyphs()
+    public void FontAtlasIncludesLocalizedDynamicChineseAndKoreanGlyphs()
     {
-        const string dynamicText = "罕见汉字测试";
+        const string dynamicText = "罕见汉字测试 타일 체감";
         L10n.RegisterDynamicGlyphText(dynamicText);
         var glyphs = L10n.GetRequiredFontGlyphCodepoints();
-        var loader = File.ReadAllText(Path.Combine(
+        var androidLoader = File.ReadAllText(Path.Combine(
             FindRepoRoot(),
             "StArray.ModManager.Android",
             "UI",
             "AndroidImGuiFontLoader.cs"));
+        var rangeBuilder = File.ReadAllText(Path.Combine(
+            FindRepoRoot(),
+            "StArray.ModManager",
+            "UI",
+            "ImGuiTextGlyphRanges.cs"));
+        var renderer = File.ReadAllText(Path.Combine(
+            FindRepoRoot(),
+            "StArray.ModManager",
+            "UI",
+            "IImGuiRenderer.cs"));
 
         Assert.Multiple(() =>
         {
@@ -328,8 +515,202 @@ public sealed class ModManagerAndroidUpstreamSyncTests
             Assert.That(glyphs, Does.Contain((int)'需'));
             Assert.That(glyphs, Does.Contain((int)'要'));
             Assert.That(glyphs, Does.Contain((int)'罕'));
-            Assert.That(loader, Does.Contain("L10n.GetRequiredFontGlyphCodepoints"));
-            Assert.That(loader, Does.Contain("GetGlyphRangesChineseSimplifiedCommon"));
+            Assert.That(glyphs, Does.Contain((int)'타'));
+            Assert.That(glyphs, Does.Contain((int)'일'));
+            Assert.That(glyphs, Does.Contain((int)'체'));
+            Assert.That(glyphs, Does.Contain((int)'감'));
+            Assert.That(rangeBuilder, Does.Contain("L10n.GetRequiredFontGlyphCodepoints"));
+            Assert.That(rangeBuilder, Does.Contain("GetGlyphRangesChineseSimplifiedCommon"));
+            Assert.That(rangeBuilder, Does.Contain("GetGlyphRangesKorean"));
+            Assert.That(androidLoader, Does.Contain("ImGuiTextGlyphRanges.Create"));
+            Assert.That(renderer, Does.Contain("ImGuiTextGlyphRanges.Create"));
+        });
+    }
+
+    [Test]
+    public void DynamicGlyphRegistrationSchedulesSafeAtlasRebuild()
+    {
+        var root = FindRepoRoot();
+        var l10n = File.ReadAllText(Path.Combine(
+            root,
+            "StArray.ModManager",
+            "Resources",
+            "L10n.cs"));
+        var loader = File.ReadAllText(Path.Combine(
+            root,
+            "StArray.ModManager.Android",
+            "UI",
+            "AndroidImGuiFontLoader.cs"));
+        var backends = File.ReadAllText(Path.Combine(
+            root,
+            "StArray.ModManager.Android",
+            "Native",
+            "ImGuiBackends.cs"));
+        var egl = File.ReadAllText(Path.Combine(
+            root,
+            "StArray.ModManager.Android",
+            "UI",
+            "ImGuiEGLRender.cs"));
+        var vulkan = File.ReadAllText(Path.Combine(
+            root,
+            "StArray.ModManager.Android",
+            "UI",
+            "ImGuiVulkanRenderer.cs"));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(l10n, Does.Contain("DynamicGlyphRevision"));
+            Assert.That(l10n, Does.Contain("Interlocked.Increment"));
+            Assert.That(loader, Does.Contain("_loadedGlyphRevision"));
+            Assert.That(loader, Does.Contain("recreateFontTexture"));
+            Assert.That(loader, Does.Contain("io.Fonts.Clear();"));
+            Assert.That(loader, Does.Not.Contain("io.Fonts.ClearFonts();"),
+                "dynamic rebuilds must clear ImFontAtlas.ConfigData as well as Fonts");
+            Assert.That(backends, Does.Contain("RecreateFontsTexture"));
+            Assert.That(egl, Does.Contain("RecreateFontsTexture"));
+            Assert.That(vulkan, Does.Contain("RecreateFontsTexture"));
+        });
+    }
+
+    [Test]
+    public void DynamicGlyphRevisionChangesOnlyForNewBmpCodepoints()
+    {
+        const string uniqueText = "\uE100\uE101";
+        var before = L10n.DynamicGlyphRevision;
+
+        L10n.RegisterDynamicGlyphText(uniqueText);
+        var afterFirstRegistration = L10n.DynamicGlyphRevision;
+
+        L10n.RegisterDynamicGlyphText(uniqueText);
+        var afterDuplicateRegistration = L10n.DynamicGlyphRevision;
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(afterFirstRegistration, Is.GreaterThan(before));
+            Assert.That(afterDuplicateRegistration, Is.EqualTo(afterFirstRegistration));
+        });
+    }
+
+    [Test]
+    public void UnformattedLocalizationAndNativeObservedGlyphsJoinDynamicGlyphSet()
+    {
+        const string uniqueKey = "\uE340";
+        var before = L10n.DynamicGlyphRevision;
+
+        Assert.That(L10n.Get(uniqueKey), Is.EqualTo(uniqueKey));
+        var afterUnformattedLocalization = L10n.DynamicGlyphRevision;
+        var added = L10n.RegisterDynamicGlyphCodepoints([0xE341, 0xE342]);
+        var afterNativeObservation = L10n.DynamicGlyphRevision;
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(afterUnformattedLocalization, Is.GreaterThan(before));
+            Assert.That(added, Is.EqualTo(2));
+            Assert.That(afterNativeObservation, Is.GreaterThan(afterUnformattedLocalization));
+        });
+    }
+
+    [Test]
+    public void NativeTextObserverFeedsEveryImGuiTextSubmissionIntoTheNextAtlasRevision()
+    {
+        var root = FindRepoRoot();
+        var compat = File.ReadAllText(Path.Combine(
+            root,
+            "Android",
+            "library",
+            "src",
+            "main",
+            "cpp",
+            "core",
+            "cimgui_compat.cpp"));
+        var draw = File.ReadAllText(Path.Combine(
+            root,
+            "cimgui-1.91.6",
+            "imgui",
+            "imgui_draw.cpp"));
+        var backends = File.ReadAllText(Path.Combine(
+            root,
+            "StArray.ModManager.Android",
+            "Native",
+            "ImGuiBackends.cs"));
+        var loader = File.ReadAllText(Path.Combine(
+            root,
+            "StArray.ModManager.Android",
+            "UI",
+            "AndroidImGuiFontLoader.cs"));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(compat, Does.Contain("modmanager_imgui_observe_text"));
+            Assert.That(compat, Does.Contain("modmanager_imgui_drain_observed_text_glyphs"));
+            Assert.That(draw, Does.Contain("modmanager_imgui_observe_text(text_begin, text_end)"));
+            Assert.That(backends, Does.Contain("DrainObservedTextGlyphsNative"));
+            Assert.That(loader, Does.Contain("DrainObservedTextGlyphs"));
+            Assert.That(loader, Does.Contain("RegisterDynamicGlyphCodepoints"));
+        });
+    }
+
+    [Test]
+    public void FormattedLocalizationAndInspectorDisplayValuesJoinDynamicGlyphSet()
+    {
+        const string unique = "\uE120动态";
+        var before = L10n.DynamicGlyphRevision;
+
+        _ = L10n.Get("Mod.WindowTitle", unique);
+        var afterLocalization = L10n.DynamicGlyphRevision;
+
+        L10n.RegisterDynamicGlyphText(unique);
+        var afterDuplicate = L10n.DynamicGlyphRevision;
+
+        var root = FindRepoRoot();
+        var build = File.ReadAllText(Path.Combine(
+            root, "StArray.ModManager", "Inspector", "ModInspector.Build.cs"));
+        var draw = File.ReadAllText(Path.Combine(
+            root, "StArray.ModManager", "Inspector", "ModInspector.Draw.cs"));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(afterLocalization, Is.GreaterThan(before));
+            Assert.That(afterDuplicate, Is.EqualTo(afterLocalization));
+            Assert.That(build, Does.Contain("L10n.RegisterDynamicGlyphText(name, label"));
+            Assert.That(draw, Does.Contain("L10n.RegisterDynamicGlyphText(names)"));
+            Assert.That(draw, Does.Contain("L10n.RegisterDynamicGlyphText(editText)"));
+        });
+    }
+
+    [Test]
+    public void AndroidUnityObjectCallSafetyIsWiredIntoNativeAndManagedHosts()
+    {
+        var root = FindRepoRoot();
+        var cmake = File.ReadAllText(Path.Combine(
+            root,
+            "Android",
+            "library",
+            "src",
+            "main",
+            "cpp",
+            "CMakeLists.txt"));
+        var nativeReader = File.ReadAllText(Path.Combine(
+            root,
+            "Android",
+            "library",
+            "src",
+            "main",
+            "cpp",
+            "core",
+            "safe_memory_reader.c"));
+        var reflection = File.ReadAllText(Path.Combine(
+            root,
+            "StArray.ModManager",
+            "Il2Cpp",
+            "Reflection.cs"));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(cmake, Does.Contain("core/safe_memory_reader.c"));
+            Assert.That(nativeReader, Does.Contain("modmanager_try_read_process_memory"));
+            Assert.That(nativeReader, Does.Contain("__NR_process_vm_readv"));
+            Assert.That(reflection, Does.Contain("UnityObjectCallSafety.GetFunctionPointer"));
         });
     }
 
@@ -417,6 +798,67 @@ public sealed class ModManagerAndroidUpstreamSyncTests
                 Assert.That(settings.Broken, Is.EqualTo(7));
                 Assert.That(settings.Valid, Is.EqualTo(29));
                 Assert.That(warnings, Has.Some.Contains("member=Broken"));
+            });
+        }
+        finally
+        {
+            Logger.OnLog -= OnLog;
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Test]
+    public void DynamicModEnumSettingsRoundTripWithoutGeneratedMetadata()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), $"starray-enum-settings-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(directory);
+        var warnings = new List<string>();
+        void OnLog(Logger.Level level, string _, string message)
+        {
+            if (level == Logger.Level.Warn)
+                warnings.Add(message);
+        }
+
+        Logger.OnLog += OnLog;
+        try
+        {
+            var loader = new ModLoader(Path.Combine(directory, "mods"));
+            var ui = new ModManagerUI(loader, Path.Combine(directory, "config"));
+            var entry = new ModEntry
+            {
+                Id = "showbpm-settings-test",
+                Name = "ShowBPM Settings Test",
+                FolderPath = directory,
+            };
+            var settings = new EnumSettingsFixture
+            {
+                SpeedTextBasis = SpeedTextModeFixture.Real,
+                OptionalBasis = SpeedTextModeFixture.Tile,
+                DecimalPlaces = 3,
+            };
+
+            ui.SaveSettings(entry, settings);
+
+            var json = File.ReadAllText(Path.Combine(directory, "settings.json"), Encoding.UTF8);
+            Assert.Multiple(() =>
+            {
+                Assert.That(json, Does.Contain("\"SpeedTextBasis\""));
+                Assert.That(json, Does.Contain("\"OptionalBasis\""));
+                Assert.That(json, Does.Contain("\"DecimalPlaces\": 3"));
+                Assert.That(json, Does.Not.Contain("Unsupported"));
+                Assert.That(warnings, Has.Some.Contains("member=Unsupported"));
+            });
+
+            settings.SpeedTextBasis = SpeedTextModeFixture.Tile;
+            settings.OptionalBasis = null;
+            settings.DecimalPlaces = 0;
+            ModManagerUI.LoadSettings(entry, settings);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(settings.SpeedTextBasis, Is.EqualTo(SpeedTextModeFixture.Real));
+                Assert.That(settings.OptionalBasis, Is.EqualTo(SpeedTextModeFixture.Tile));
+                Assert.That(settings.DecimalPlaces, Is.EqualTo(3));
             });
         }
         finally
@@ -569,8 +1011,22 @@ public sealed class ModManagerAndroidUpstreamSyncTests
             root, "StArray.ModManager.Android", "Native", "AndroidInput.cs"));
         var inputHandler = File.ReadAllText(Path.Combine(
             root, "StArray.ModManager.Android", "UI", "ImGuiInputHandler.cs"));
+        var inputEvents = File.ReadAllText(Path.Combine(
+            root, "StArray.ModManager.Android", "Native", "InputEvents.cs"));
         var dobby = File.ReadAllText(Path.Combine(
             root, "StArray.ModManager.Android", "Native", "Dobby.cs"));
+        var runtimeManager = File.ReadAllText(Path.Combine(
+            root, "StArray.ModManager", "RuntimeAbstractions", "RuntimeManager.cs"));
+        var touchHook = SliceSource(
+            inputHandler,
+            "public static int OnTouchEvent(IntPtr self, IntPtr motionEvent, IntPtr message)",
+            "private static JavaClass? s_utilsClass");
+        var originalCall = touchHook.IndexOf(
+            "result = original(self, motionEvent, message);",
+            StringComparison.Ordinal);
+        var broadcastCall = touchHook.IndexOf(
+            "InputEvents.RaiseFrom(motionEvent);",
+            StringComparison.Ordinal);
 
         Assert.Multiple(() =>
         {
@@ -579,10 +1035,28 @@ public sealed class ModManagerAndroidUpstreamSyncTests
             Assert.That(jniFacade, Does.Not.Contain("[DllImport"));
             Assert.That(androidInput, Does.Contain("public static class AndroidInput"));
             Assert.That(androidInput, Does.Contain("AMotionEvent_getPointerCount"));
+            Assert.That(androidInput, Does.Contain("AMotionEvent_getEventTime"));
+            Assert.That(androidInput, Does.Contain("AMotionEvent_getDownTime"));
+            Assert.That(androidInput, Does.Contain("Scroll = 8"));
             Assert.That(inputHandler, Does.Contain("public static void InstallInputHooks() => RegisterImeCallbacks()"));
             Assert.That(inputHandler, Does.Contain("public static void UninstallHooks() { }"));
+            Assert.That(originalCall, Is.GreaterThanOrEqualTo(0));
+            Assert.That(broadcastCall, Is.GreaterThan(originalCall));
+            Assert.That(inputEvents, Does.Contain("public static class InputEvents"));
+            Assert.That(inputEvents, Does.Contain("public static event Action<TouchEventInfo>? OnTouch"));
+            Assert.That(inputEvents, Does.Contain("public static event Action<TouchTimestampInfo>? OnTouchTimestamp"));
+            Assert.That(inputEvents, Does.Contain("TryEnterCallbackFast"));
+            Assert.That(inputEvents, Does.Contain("TryRegisterTerminalCleanup"));
+            Assert.That(inputEvents, Does.Contain("ModOwnedResourceKind.InputSubscription"));
+            Assert.That(inputEvents, Does.Not.Contain("consumeSamples"));
             Assert.That(dobby, Does.Contain("public static nint _SymbolResolver"));
             Assert.That(dobby, Does.Contain("SymbolResolver(imageName, symbolName)"));
+            Assert.That(dobby, Does.Contain("modmanager_hook_broker_get_layer_count"));
+            Assert.That(dobby, Does.Contain("public static int GetLayerCount(nint address)"));
+            Assert.That(dobby, Does.Not.Contain("private sealed class HookChain"));
+            Assert.That(runtimeManager, Does.Contain("public static IRuntimeClass? GetObjectClass"));
+            Assert.That(runtimeManager, Does.Contain("Il2CppFunctions.il2cpp_object_get_class"));
+            Assert.That(runtimeManager, Does.Contain("MonoFunctions.MonoObjectGetClass"));
         });
     }
 
@@ -798,6 +1272,24 @@ public sealed class ModManagerAndroidUpstreamSyncTests
     {
         public int Broken = 7;
         public int Valid = 3;
+
+        public void OnGui()
+        {
+        }
+    }
+
+    private enum SpeedTextModeFixture
+    {
+        Tile,
+        Real,
+    }
+
+    private sealed class EnumSettingsFixture : IModSettings
+    {
+        public SpeedTextModeFixture SpeedTextBasis;
+        public SpeedTextModeFixture? OptionalBasis;
+        public int DecimalPlaces;
+        public Action Unsupported = static () => { };
 
         public void OnGui()
         {

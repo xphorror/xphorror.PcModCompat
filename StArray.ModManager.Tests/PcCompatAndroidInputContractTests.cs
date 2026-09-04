@@ -3,23 +3,139 @@ namespace StArray.ModManager.Tests;
 public sealed class PcCompatAndroidInputContractTests
 {
     [Test]
-    public void SettingsImeDiagnosticsIdentifyDearImGuiStateAndAssemblyInstance()
+    public void ApplicationFocusFlowsFromActivityLifecycleToManagedPcModBridge()
+    {
+        var root = FindHooksRoot();
+        var activity = File.ReadAllText(Path.Combine(
+            root, "extra_menu_activity", "src", "com", "fizzd", "connectedworlds",
+            "editorport", "ExtraMenuUnityPlayerActivity.java"));
+        var bootstrap = File.ReadAllText(Path.Combine(
+            root, "StArray.ModManager", "Android", "library", "src", "main", "java",
+            "com", "fizzd", "connectedworlds", "editorport",
+            "StArrayModManagerBootstrap.java"));
+        var jni = File.ReadAllText(Path.Combine(
+            root, "StArray.ModManager", "Android", "library", "src", "main", "cpp",
+            "core", "cimgui_compat.cpp"));
+        var native = File.ReadAllText(Path.Combine(
+            root, "StArray.ModManager", "Android", "library", "src", "main", "cpp",
+            "core", "pccompat_hook_rules.cpp"));
+        var managed = File.ReadAllText(Path.Combine(
+            root, "StArray.ModManager", "xphorror.PcModCompat", "src",
+            "PcCompatManagedApplicationBridge.cs"));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(activity, Does.Contain("publishStArrayApplicationFocusState()"));
+            Assert.That(activity, Does.Contain("protected void onResume()"));
+            Assert.That(activity, Does.Contain("protected void onPause()"));
+            Assert.That(activity, Does.Contain("public void onWindowFocusChanged(boolean hasFocus)"));
+            Assert.That(bootstrap, Does.Contain("setApplicationFocusState("));
+            Assert.That(bootstrap, Does.Contain("nativeSetApplicationFocusState("));
+            Assert.That(jni, Does.Contain("nativeSetApplicationFocusState("));
+            Assert.That(native, Does.Contain("modmanager_pccompat_set_application_focus_state"));
+            Assert.That(native, Does.Contain("modmanager_pccompat_application_is_focused"));
+            Assert.That(managed, Does.Contain(
+                "EntryPoint = \"modmanager_pccompat_application_is_focused\""));
+        });
+    }
+
+    [Test]
+    public void InputQueryHotPathDoesNotExposeDiagnosticBudgetOrTraceEntryPoints()
+    {
+        var bridge = typeof(Xphorror.PcModCompat.PcCompatLegacyInputBridge);
+        var reset = bridge.GetMethod(
+            "ResetInputDiagnosticAuditsForTests",
+            System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+        var reserve = bridge.GetMethod(
+            "TryReserveInputDiagnosticForTests",
+            System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+        var trace = bridge.GetNestedType(
+                "ThreadState",
+                System.Reflection.BindingFlags.NonPublic)?
+            .GetMethod(
+                "TraceInputQuery",
+                System.Reflection.BindingFlags.Instance |
+                System.Reflection.BindingFlags.Public |
+                System.Reflection.BindingFlags.NonPublic);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(reset, Is.Null);
+            Assert.That(reserve, Is.Null);
+            Assert.That(trace, Is.Null);
+        });
+    }
+
+    [Test]
+    public void AndroidRuntimeBuildChainRebuildsManagedGraphAndAuditsEveryCopyBoundary()
+    {
+        var root = FindHooksRoot();
+        var modManagerRoot = Path.Combine(root, "StArray.ModManager");
+        var singleBuild = File.ReadAllText(
+            Path.Combine(modManagerRoot, "build_android_single.ps1"),
+            System.Text.Encoding.UTF8);
+        var overlayInstall = File.ReadAllText(
+            Path.Combine(modManagerRoot, "install_android_overlay.ps1"),
+            System.Text.Encoding.UTF8);
+        var managedRewrite = File.ReadAllText(Path.Combine(
+            modManagerRoot,
+            "StArray.ModManager.Android",
+            "PcCompat",
+            "PcCompatAndroidManagedAssemblyRewrite.cs"),
+            System.Text.Encoding.UTF8);
+        var dragWindowBridge = File.ReadAllText(Path.Combine(
+            modManagerRoot,
+            "StArray.ModManager.Android",
+            "PcCompat",
+            "PcCompatAndroidImGuiDragWindowBridge.cs"),
+            System.Text.Encoding.UTF8);
+        var assemblyRewriter = File.ReadAllText(Path.Combine(
+            modManagerRoot,
+            "xphorror.PcModCompat",
+            "tools",
+            "ModAssemblyRewriter",
+            "Program.cs"),
+            System.Text.Encoding.UTF8);
+        Assert.Multiple(() =>
+        {
+            Assert.That(singleBuild, Does.Contain("[switch]$IncrementalManagedBuild"));
+            Assert.That(singleBuild, Does.Contain("'-t:Rebuild'"));
+            Assert.That(singleBuild, Does.Contain("assert_runtime_bundle.ps1"));
+            Assert.That(singleBuild, Does.Contain("ModAssemblyRewriter.dll"));
+            Assert.That(managedRewrite, Does.Contain("v86-keyviewer-lane-origin-prefix"));
+            Assert.That(managedRewrite, Does.Contain("v4-null-source-initialization"));
+            Assert.That(dragWindowBridge, Does.Contain("UnityEngine.GUI::DragWindow_Injected"));
+            Assert.That(dragWindowBridge, Does.Contain("m_XMin"));
+            Assert.That(dragWindowBridge, Does.Contain("m_Height"));
+            Assert.That(assemblyRewriter, Does.Contain("v22-proxy-component-query-filter"));
+            Assert.That(overlayInstall, Does.Contain("assert_runtime_bundle.ps1"));
+            Assert.That(overlayInstall, Does.Contain("-ReferenceRuntimeDir $RuntimeAssets"));
+        });
+    }
+
+    [Test]
+    public void SettingsImeDiagnosticsIdentifyNativeFocusStateAndAssemblyInstance()
     {
         var root = FindHooksRoot();
         var input = File.ReadAllText(Path.Combine(
             root,
-                        "StArray.ModManager.Android",
+            "StArray.ModManager",
+            "StArray.ModManager.Android",
             "UI",
             "ImGuiInputHandler.cs"));
 
         Assert.Multiple(() =>
         {
-            Assert.That(input, Does.Contain("[DEBUG-settings-surface-v1] ime source=DearImGui"));
+            Assert.That(input, Does.Contain("[DEBUG-ime-native-v1]"));
+            Assert.That(input, Does.Contain("textActive="));
+            Assert.That(input, Does.Contain("touchSeq="));
             Assert.That(input, Does.Contain("s_pendingWantTextInput"));
             Assert.That(input, Does.Contain("AssemblyLoadContext.GetLoadContext"));
             Assert.That(input, Does.Contain("ManifestModule.ModuleVersionId"));
             Assert.That(input, Does.Contain("lock (ImeGate)"));
-            Assert.That(input, Does.Contain("overlayVisible && dearImGuiWant"));
+            Assert.That(input, Does.Contain("ImGuiImplAndroid.GetImeState()"));
+            Assert.That(input, Does.Contain("overlayVisible || textInputActive"));
+            Assert.That(input, Does.Contain("if (!nativeImeRequested)"));
         });
     }
 
@@ -29,17 +145,20 @@ public sealed class PcCompatAndroidInputContractTests
         var root = FindHooksRoot();
         var input = File.ReadAllText(Path.Combine(
             root,
-                        "StArray.ModManager.Android",
+            "StArray.ModManager",
+            "StArray.ModManager.Android",
             "UI",
             "ImGuiInputHandler.cs"));
         var platform = File.ReadAllText(Path.Combine(
             root,
-                        "StArray.ModManager.Android",
+            "StArray.ModManager",
+            "StArray.ModManager.Android",
             "UI",
             "AndroidModManagerPlatformServices.cs"));
         var native = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -48,7 +167,8 @@ public sealed class PcCompatAndroidInputContractTests
             "cimgui_compat.cpp"));
         var bootstrap = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -60,9 +180,22 @@ public sealed class PcCompatAndroidInputContractTests
             "StArrayModManagerBootstrap.java"));
         var settings = File.ReadAllText(Path.Combine(
             root,
-                        "xphorror.PcModCompat",
+            "StArray.ModManager",
+            "xphorror.PcModCompat",
             "src",
             "PcCompatManagedSettingsUnityBackend.cs"));
+        var jni = File.ReadAllText(Path.Combine(
+            root,
+            "StArray.ModManager",
+            "StArray.ModManager.Android",
+            "Native",
+            "JNI.cs"));
+        var jniHelper = File.ReadAllText(Path.Combine(
+            root,
+            "StArray.ModManager",
+            "StArray.ModManager.Android",
+            "Native",
+            "JniHelperNative.cs"));
 
         Assert.Multiple(() =>
         {
@@ -74,6 +207,13 @@ public sealed class PcCompatAndroidInputContractTests
             Assert.That(native, Does.Contain("ImGui::ClearActiveID()"));
             Assert.That(bootstrap, Does.Contain("WindowInsets.Type.ime()"));
             Assert.That(bootstrap, Does.Contain("sKeyboardActuallyVisible"));
+            Assert.That(bootstrap, Does.Contain("isKeyboardActuallyVisible"));
+            Assert.That(input, Does.Contain("TryReadKeyboardActuallyVisibleLocked"));
+            Assert.That(input, Does.Contain("ShouldRetryKeyboardShow"));
+            Assert.That(input, Does.Contain("CallStaticBooleanMethod0"));
+            Assert.That(input, Does.Not.Contain("CallStaticIntMethod0(\n                s_keyboardVisibilityMethod"));
+            Assert.That(jni, Does.Contain("CallStaticBooleanMethod0"));
+            Assert.That(jniHelper, Does.Contain("jnihelper_call_static_boolean_method_a"));
             Assert.That(settings, Does.Contain("ReleaseInputFocus"));
             Assert.That(settings, Does.Contain("_guiSetKeyboardControl"));
             Assert.That(settings, Does.Contain("_guiSetHotControl"));
@@ -81,13 +221,299 @@ public sealed class PcCompatAndroidInputContractTests
     }
 
     [Test]
+    public void InitialVisibleOverlayAdoptsManagerImeOwnerBeforeFirstTextFocus()
+    {
+        Assert.Multiple(() =>
+        {
+            Assert.That(
+                StArray.ModManager.Android.UI.ImGuiInputHandler.ResolveImeOwner(
+                    overlayVisible: true,
+                    modalInputCapture: false),
+                Is.EqualTo(StArray.ModManager.Android.UI.AndroidImeOwner.ModManager));
+            Assert.That(
+                StArray.ModManager.Android.UI.ImGuiInputHandler.ResolveImeOwner(
+                    overlayVisible: false,
+                    modalInputCapture: false),
+                Is.EqualTo(StArray.ModManager.Android.UI.AndroidImeOwner.None));
+            Assert.That(
+                StArray.ModManager.Android.UI.ImGuiInputHandler.ResolveImeOwner(
+                    overlayVisible: false,
+                    modalInputCapture: false,
+                    textInputActive: true),
+                Is.EqualTo(StArray.ModManager.Android.UI.AndroidImeOwner.ModManager));
+            Assert.That(
+                StArray.ModManager.Android.UI.ImGuiInputHandler.ResolveImeOwner(
+                    overlayVisible: true,
+                    modalInputCapture: true),
+                Is.EqualTo(StArray.ModManager.Android.UI.AndroidImeOwner.UnitySettings));
+            Assert.That(
+                StArray.ModManager.Android.UI.ImGuiInputHandler.ShouldShowKeyboard(
+                    StArray.ModManager.Android.UI.AndroidImeOwner.ModManager,
+                    overlayVisible: true,
+                    nativeImeRequested: true,
+                    focusBaselineReady: true),
+                Is.True);
+            Assert.That(
+                StArray.ModManager.Android.UI.ImGuiInputHandler.ShouldShowKeyboard(
+                    StArray.ModManager.Android.UI.AndroidImeOwner.UnitySettings,
+                    overlayVisible: true,
+                    nativeImeRequested: true,
+                    focusBaselineReady: true),
+                Is.False);
+            Assert.That(
+                StArray.ModManager.Android.UI.ImGuiInputHandler.ShouldShowKeyboard(
+                    StArray.ModManager.Android.UI.AndroidImeOwner.None,
+                    overlayVisible: false,
+                    nativeImeRequested: true,
+                    focusBaselineReady: true),
+                Is.False);
+            Assert.That(
+                StArray.ModManager.Android.UI.ImGuiInputHandler.ShouldShowKeyboard(
+                    StArray.ModManager.Android.UI.AndroidImeOwner.ModManager,
+                    overlayVisible: false,
+                    nativeImeRequested: true,
+                    focusBaselineReady: true),
+                Is.True,
+                "an active hidden ImGui text widget still owns the IME");
+        });
+    }
+
+    [Test]
+    public void HiddenTextInputRequiresCurrentTouchEvidenceBeforeOpeningKeyboard()
+    {
+        var baseline = StArray.ModManager.Android.UI.ImGuiInputHandler
+            .ResolveFocusBaseline(
+                ownershipFrame: true,
+                imeRequested: true,
+                textInputActive: true,
+                freshTouchActivatedTextInput: false,
+                currentBaselineReady: false);
+
+        Assert.That(
+            StArray.ModManager.Android.UI.ImGuiInputHandler.ShouldShowKeyboard(
+                StArray.ModManager.Android.UI.AndroidImeOwner.ModManager,
+                overlayVisible: false,
+                nativeImeRequested: true,
+                focusBaselineReady: baseline),
+            Is.False,
+            "retained hidden focus must not open the keyboard by itself");
+
+        baseline = StArray.ModManager.Android.UI.ImGuiInputHandler
+            .ResolveFocusBaseline(
+                ownershipFrame: true,
+                imeRequested: true,
+                textInputActive: true,
+                freshTouchActivatedTextInput: true,
+                currentBaselineReady: false);
+
+        Assert.That(
+            StArray.ModManager.Android.UI.ImGuiInputHandler.ShouldShowKeyboard(
+                StArray.ModManager.Android.UI.AndroidImeOwner.ModManager,
+                overlayVisible: false,
+                nativeImeRequested: true,
+                focusBaselineReady: baseline),
+            Is.True);
+    }
+
+    [Test]
+    public void ImeFrameBaselineQuarantinesOwnerFrameAndRequiresFreshTextTouch()
+    {
+        var baseline = StArray.ModManager.Android.UI.ImGuiInputHandler
+            .ResolveFocusBaseline(
+                ownershipFrame: true,
+                imeRequested: false,
+                textInputActive: false,
+                freshTouchActivatedTextInput: false,
+                currentBaselineReady: false);
+
+        Assert.That(baseline, Is.False,
+            "the owner transition frame may still contain the touch that opened the overlay");
+        Assert.That(
+            StArray.ModManager.Android.UI.ImGuiInputHandler.ShouldShowKeyboard(
+                StArray.ModManager.Android.UI.AndroidImeOwner.ModManager,
+                overlayVisible: true,
+                nativeImeRequested: true,
+                focusBaselineReady: baseline),
+            Is.False);
+
+        baseline = StArray.ModManager.Android.UI.ImGuiInputHandler
+            .ResolveFocusBaseline(
+                ownershipFrame: false,
+                imeRequested: true,
+                textInputActive: true,
+                freshTouchActivatedTextInput: false,
+                currentBaselineReady: baseline);
+        Assert.That(baseline, Is.False,
+            "retained text focus without a new touch must remain quarantined");
+
+        baseline = StArray.ModManager.Android.UI.ImGuiInputHandler
+            .ResolveFocusBaseline(
+                ownershipFrame: false,
+                imeRequested: true,
+                textInputActive: true,
+                freshTouchActivatedTextInput: true,
+                currentBaselineReady: baseline);
+        Assert.That(
+            StArray.ModManager.Android.UI.ImGuiInputHandler.ShouldShowKeyboard(
+                StArray.ModManager.Android.UI.AndroidImeOwner.ModManager,
+                overlayVisible: true,
+                nativeImeRequested: true,
+                focusBaselineReady: baseline),
+            Is.True,
+            "a new touch that leaves a text widget active is genuine IME intent");
+    }
+
+    [Test]
+    public void ImeGateRequiresEveryNormalizedNativeCondition()
+    {
+        Assert.That(
+            StArray.ModManager.Android.UI.ImGuiInputHandler.ShouldShowKeyboard(
+                StArray.ModManager.Android.UI.AndroidImeOwner.ModManager,
+                overlayVisible: true,
+                nativeImeRequested: true,
+                focusBaselineReady: true),
+            Is.True);
+        Assert.That(
+            StArray.ModManager.Android.UI.ImGuiInputHandler.ShouldShowKeyboard(
+                StArray.ModManager.Android.UI.AndroidImeOwner.ModManager,
+                overlayVisible: true,
+                nativeImeRequested: false,
+                focusBaselineReady: true),
+            Is.False);
+    }
+
+    [Test]
+    public void KeyboardRetryRequiresFreshTouchOnAnActiveTextInput()
+    {
+        var shouldRetry = StArray.ModManager.Android.UI.ImGuiInputHandler
+            .ShouldRetryKeyboardShow(
+                want: true,
+                keyboardWasRequested: true,
+                keyboardActuallyVisible: false,
+                freshTouch: true,
+                textInputActive: true);
+        Assert.That(shouldRetry, Is.True);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(
+                StArray.ModManager.Android.UI.ImGuiInputHandler.ShouldRetryKeyboardShow(
+                    want: true,
+                    keyboardWasRequested: true,
+                    keyboardActuallyVisible: false,
+                    freshTouch: false,
+                    textInputActive: true),
+                Is.False,
+                "a missing keyboard alone must not cause an unsolicited popup");
+            Assert.That(
+                StArray.ModManager.Android.UI.ImGuiInputHandler.ShouldRetryKeyboardShow(
+                    want: true,
+                    keyboardWasRequested: true,
+                    keyboardActuallyVisible: false,
+                    freshTouch: true,
+                    textInputActive: false),
+                Is.False,
+                "a touch on a non-text control must not retry the IME");
+            Assert.That(
+                StArray.ModManager.Android.UI.ImGuiInputHandler.ShouldRetryKeyboardShow(
+                    want: true,
+                    keyboardWasRequested: true,
+                    keyboardActuallyVisible: true,
+                    freshTouch: true,
+                    textInputActive: true),
+                Is.False);
+        });
+    }
+
+    [Test]
+    public void AndroidImeStateComesFromNativeTextFocusAndFreshTouchEvidence()
+    {
+        var root = FindHooksRoot();
+        var input = File.ReadAllText(Path.Combine(
+            root,
+            "StArray.ModManager",
+            "StArray.ModManager.Android",
+            "UI",
+            "ImGuiInputHandler.cs"));
+        var backends = File.ReadAllText(Path.Combine(
+            root,
+            "StArray.ModManager",
+            "StArray.ModManager.Android",
+            "Native",
+            "ImGuiBackends.cs"));
+        var native = File.ReadAllText(Path.Combine(
+            root,
+            "StArray.ModManager",
+            "Android",
+            "library",
+            "src",
+            "main",
+            "cpp",
+            "core",
+            "cimgui_compat.cpp"));
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(backends, Does.Contain(
+                "EntryPoint = \"modmanager_imgui_get_ime_state\""));
+            Assert.That(native, Does.Contain(
+                "extern \"C\" int modmanager_imgui_get_ime_state("));
+            Assert.That(native, Does.Contain("GImGui->IO.WantTextInput"));
+            Assert.That(native, Does.Contain("GImGui->ActiveId"));
+            Assert.That(native, Does.Contain("GImGui->InputTextState.ID"));
+            Assert.That(native, Does.Contain("g_forwarded_touch_down_sequence"));
+            Assert.That(input, Does.Contain("ImGuiImplAndroid.GetImeState()"));
+            Assert.That(input, Does.Contain("TextInputActive"));
+            Assert.That(input, Does.Contain("TouchDownSequence"));
+            Assert.That(input, Does.Not.Contain("ref io.WantTextInput"),
+                "IME ownership must not depend on a managed ImGuiIO field offset");
+        });
+    }
+
+    [Test]
+    public void AllImGuiRenderersCaptureImeBaselineBeforeBuildingUi()
+    {
+        var root = FindHooksRoot();
+        var rendererPaths = new[]
+        {
+            Path.Combine(root, "StArray.ModManager", "StArray.ModManager.Android", "UI", "ImGuiEGLRender.cs"),
+            Path.Combine(root, "StArray.ModManager", "StArray.ModManager.Android", "UI", "ImGuiRender.cs"),
+            Path.Combine(root, "StArray.ModManager", "StArray.ModManager.Android", "UI", "ImGuiVulkanRenderer.cs")
+        };
+
+        foreach (var path in rendererPaths)
+        {
+            var source = File.ReadAllText(path);
+            var newFrame = source.IndexOf("ImGui.NewFrame();", StringComparison.Ordinal);
+            var beginIme = source.IndexOf("ImGuiInputHandler.BeginImeFrame();", StringComparison.Ordinal);
+            var buildUi = source.IndexOf("BuildUI();", StringComparison.Ordinal);
+
+            Assert.Multiple(() =>
+            {
+                Assert.That(newFrame, Is.GreaterThanOrEqualTo(0), path);
+                Assert.That(beginIme, Is.GreaterThan(newFrame), path);
+                Assert.That(buildUi, Is.GreaterThan(beginIme), path);
+            });
+        }
+    }
+
+    [Test]
     public void OriginalSettingsModalOwnsAndroidTouchKeyboardAndBackBeforeGameplay()
     {
         var root = FindHooksRoot();
-        var activity = File.ReadAllText(RequirePrivateActivitySource(root));
+        var activity = File.ReadAllText(Path.Combine(
+            root,
+            "extra_menu_activity",
+            "src",
+            "com",
+            "fizzd",
+            "connectedworlds",
+            "editorport",
+            "ExtraMenuUnityPlayerActivity.java"));
         var bootstrap = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -99,7 +525,8 @@ public sealed class PcCompatAndroidInputContractTests
             "StArrayModManagerBootstrap.java"));
         var native = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -108,7 +535,8 @@ public sealed class PcCompatAndroidInputContractTests
             "cimgui_compat.cpp"));
         var presentationSink = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -117,13 +545,13 @@ public sealed class PcCompatAndroidInputContractTests
             "unity_presentation_sink.cpp"));
         var managerUi = File.ReadAllText(Path.Combine(
             root,
-                        "StArray.ModManager",
+            "StArray.ModManager",
+            "StArray.ModManager",
             "Manager",
             "ModManagerUI.cs"));
         var asyncInput = File.ReadAllText(Path.Combine(
             root,
-            "external",
-            "AsyncInput",
+            "async_input",
             "async_input.c"));
 
         var touchStart = activity.IndexOf(
@@ -223,7 +651,8 @@ public sealed class PcCompatAndroidInputContractTests
         var root = FindHooksRoot();
         var platform = File.ReadAllText(Path.Combine(
             root,
-                        "StArray.ModManager.Android",
+            "StArray.ModManager",
+            "StArray.ModManager.Android",
             "UI",
             "AndroidModManagerPlatformServices.cs"));
 
@@ -262,7 +691,15 @@ public sealed class PcCompatAndroidInputContractTests
     public void GameplayObserverRunsOnlyAfterModManagerDeclinesTouch()
     {
         var root = FindHooksRoot();
-        var source = File.ReadAllText(RequirePrivateActivitySource(root));
+        var source = File.ReadAllText(Path.Combine(
+            root,
+            "extra_menu_activity",
+            "src",
+            "com",
+            "fizzd",
+            "connectedworlds",
+            "editorport",
+            "ExtraMenuUnityPlayerActivity.java"));
         var dispatchStart = source.IndexOf("public boolean dispatchTouchEvent", StringComparison.Ordinal);
         var dispatchEnd = source.IndexOf(
             "private static void observeStArrayMotionEvent",
@@ -281,7 +718,15 @@ public sealed class PcCompatAndroidInputContractTests
     public void AndroidTouchOwnerIsFrozenFromDownUntilUpOrCancel()
     {
         var root = FindHooksRoot();
-        var source = File.ReadAllText(RequirePrivateActivitySource(root));
+        var source = File.ReadAllText(Path.Combine(
+            root,
+            "extra_menu_activity",
+            "src",
+            "com",
+            "fizzd",
+            "connectedworlds",
+            "editorport",
+            "ExtraMenuUnityPlayerActivity.java"));
         var dispatchStart = source.IndexOf(
             "public boolean dispatchTouchEvent",
             StringComparison.Ordinal);
@@ -333,14 +778,25 @@ public sealed class PcCompatAndroidInputContractTests
     public void PersistentImGuiOverlaysPublishWindowScopedTouchRegionsWhileManagerHidden()
     {
         var root = FindHooksRoot();
+        var activity = File.ReadAllText(Path.Combine(
+            root,
+            "extra_menu_activity",
+            "src",
+            "com",
+            "fizzd",
+            "connectedworlds",
+            "editorport",
+            "ExtraMenuUnityPlayerActivity.java"));
         var managerUi = File.ReadAllText(Path.Combine(
             root,
-                        "StArray.ModManager",
+            "StArray.ModManager",
+            "StArray.ModManager",
             "Manager",
             "ModManagerUI.cs"));
         var native = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -349,7 +805,8 @@ public sealed class PcCompatAndroidInputContractTests
             "cimgui_compat.cpp"));
         var renderer = File.ReadAllText(Path.Combine(
             root,
-                        "StArray.ModManager.Android",
+            "StArray.ModManager",
+            "StArray.ModManager.Android",
             "UI",
             "ImGuiEGLRender.cs"));
 
@@ -370,9 +827,19 @@ public sealed class PcCompatAndroidInputContractTests
         Assert.That(forwardStart, Is.GreaterThanOrEqualTo(0));
         Assert.That(forwardEnd, Is.GreaterThan(forwardStart));
         var forward = native[forwardStart..forwardEnd];
+        var launchStart = activity.IndexOf(
+            "private static boolean requestStArrayModManager(",
+            StringComparison.Ordinal);
+        var launchEnd = activity.Length;
+        Assert.That(launchStart, Is.GreaterThanOrEqualTo(0));
+        Assert.That(launchEnd, Is.GreaterThan(launchStart));
+        var launch = activity[launchStart..launchEnd];
 
         Assert.Multiple(() =>
         {
+            Assert.That(launch, Does.Contain("stArrayModManagerInputForwarding = true;"));
+            Assert.That(launch, Does.Not.Contain(
+                "stArrayModManagerInputForwarding = showOverlay;"));
             Assert.That(render, Does.Contain(
                 "var inputSurfaceActive = managerVisible || RequiresRenderingWhenHidden;"));
             Assert.That(render, Does.Contain("if (inputSurfaceActive)"));
@@ -383,9 +850,67 @@ public sealed class PcCompatAndroidInputContractTests
             Assert.That(native, Does.Contain("modmanager_overlay_touch_clear"));
             Assert.That(renderer, Does.Contain("_hiddenInputSurfaceActive"));
             Assert.That(renderer, Does.Contain("ClearOverlayTouchState();"));
+            Assert.That(renderer, Does.Contain("if (!EglHooks.InstallHooks())"));
+            Assert.That(renderer, Does.Contain("EGL hook install returned false"));
             Assert.That(forward, Does.Not.Contain(
                 "modmanager_overlay_ui_is_visible() == 0"));
             Assert.That(forward, Does.Contain("if (!manager_visible && !consume)"));
+        });
+    }
+
+    [Test]
+    public void EditorDeathRetryRestoresOfficialInputBeforeFail2()
+    {
+        var root = FindHooksRoot();
+        var asyncInput = File.ReadAllText(Path.Combine(
+            root,
+            "async_input",
+            "async_input.c"));
+
+        var fail2Start = asyncInput.IndexOf(
+            "static void hooked_fail2_action",
+            StringComparison.Ordinal);
+        // Bound the body with the next function definition. This used to anchor on
+        // disable_async_for_dlc_if_needed, which was removed with the DLC fuse; the assertion
+        // below is about restoring official input before Fail2 and never depended on DLC.
+        var fail2End = asyncInput.IndexOf(
+            "static void hooked_update_input_internal",
+            fail2Start,
+            StringComparison.Ordinal);
+        Assert.That(fail2Start, Is.GreaterThanOrEqualTo(0));
+        Assert.That(fail2End, Is.GreaterThan(fail2Start));
+        var fail2 = asyncInput[fail2Start..fail2End];
+
+        var validStart = asyncInput.IndexOf(
+            "static int __attribute__((unused)) hooked_valid_triggered",
+            StringComparison.Ordinal);
+        var validEnd = asyncInput.IndexOf(
+            "static int __attribute__((unused)) hooked_valid_released",
+            validStart,
+            StringComparison.Ordinal);
+        Assert.That(validStart, Is.GreaterThanOrEqualTo(0));
+        Assert.That(validEnd, Is.GreaterThan(validStart));
+        var valid = asyncInput[validStart..validEnd];
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(asyncInput, Does.Contain(
+                "{\"\", \"scrController\", \"Fail2Action\", 0"));
+            Assert.That(fail2, Does.Contain("close_async_capture();"));
+            Assert.That(fail2, Does.Contain(
+                "g_original_fail2_action(self, method);"));
+            Assert.That(fail2.IndexOf(
+                    "close_async_capture();",
+                    StringComparison.Ordinal),
+                Is.LessThan(fail2.IndexOf(
+                    "g_original_fail2_action(self, method);",
+                    StringComparison.Ordinal)));
+            Assert.That(valid, Does.Contain(
+                "return g_original_valid_triggered(self, method);"));
+            Assert.That(asyncInput, Does.Not.Contain(
+                "g_editor_retry_input_pending"));
+            Assert.That(asyncInput, Does.Not.Contain(
+                "consume_editor_retry_input"));
         });
     }
 
@@ -395,7 +920,8 @@ public sealed class PcCompatAndroidInputContractTests
         var root = FindHooksRoot();
         var bootstrap = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -407,7 +933,8 @@ public sealed class PcCompatAndroidInputContractTests
             "StArrayModManagerBootstrap.java"));
         var native = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -416,7 +943,8 @@ public sealed class PcCompatAndroidInputContractTests
             "pccompat_hook_rules.cpp"));
         var realtime = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -440,10 +968,19 @@ public sealed class PcCompatAndroidInputContractTests
     public void PhysicalKeyboardObserverPreservesGameplayDispatchAndFullMetadata()
     {
         var root = FindHooksRoot();
-        var activity = File.ReadAllText(RequirePrivateActivitySource(root));
+        var activity = File.ReadAllText(Path.Combine(
+            root,
+            "extra_menu_activity",
+            "src",
+            "com",
+            "fizzd",
+            "connectedworlds",
+            "editorport",
+            "ExtraMenuUnityPlayerActivity.java"));
         var bootstrap = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -455,7 +992,8 @@ public sealed class PcCompatAndroidInputContractTests
             "StArrayModManagerBootstrap.java"));
         var realtimeHeader = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -464,7 +1002,8 @@ public sealed class PcCompatAndroidInputContractTests
             "realtime_event_core.h"));
         var realtimeSource = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -507,20 +1046,15 @@ public sealed class PcCompatAndroidInputContractTests
     public void AsyncInputAndActivityUseMutuallyExclusiveVersionedProducers()
     {
         var root = FindHooksRoot();
-        var asyncSource = File.ReadAllText(Path.Combine(
-            root,
-            "external",
-            "AsyncInput",
-            "async_input.c"));
+        var asyncSource = File.ReadAllText(Path.Combine(root, "async_input", "async_input.c"));
         var observerAbi = File.ReadAllText(Path.Combine(
             root,
-            "external",
-            "AsyncInput",
-            "include",
+            "common",
             "async_input_observer_abi.h"));
         var bridge = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -529,7 +1063,8 @@ public sealed class PcCompatAndroidInputContractTests
             "async_input_observer_bridge.cpp"));
         var realtimeHeader = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -538,7 +1073,8 @@ public sealed class PcCompatAndroidInputContractTests
             "realtime_event_core.h"));
         var realtimeSource = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -569,7 +1105,8 @@ public sealed class PcCompatAndroidInputContractTests
         var root = FindHooksRoot();
         var header = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -578,7 +1115,8 @@ public sealed class PcCompatAndroidInputContractTests
             "realtime_event_core.h"));
         var realtime = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -587,7 +1125,8 @@ public sealed class PcCompatAndroidInputContractTests
             "realtime_event_core.cpp"));
         var hooks = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -596,7 +1135,8 @@ public sealed class PcCompatAndroidInputContractTests
             "pccompat_hook_rules.cpp"));
         var asyncBridge = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -640,7 +1180,8 @@ public sealed class PcCompatAndroidInputContractTests
         var root = FindHooksRoot();
         var realtime = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -649,7 +1190,8 @@ public sealed class PcCompatAndroidInputContractTests
             "realtime_event_core.cpp"));
         var worker = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -658,7 +1200,8 @@ public sealed class PcCompatAndroidInputContractTests
             "hud_logic_worker.cpp"));
         var hooks = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -685,7 +1228,8 @@ public sealed class PcCompatAndroidInputContractTests
         var root = FindHooksRoot();
         var worker = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -694,7 +1238,8 @@ public sealed class PcCompatAndroidInputContractTests
             "hud_logic_worker.cpp"));
         var realtime = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -703,7 +1248,8 @@ public sealed class PcCompatAndroidInputContractTests
             "realtime_event_core.cpp"));
         var native = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -712,12 +1258,14 @@ public sealed class PcCompatAndroidInputContractTests
             "pccompat_hook_rules.cpp"));
         var managed = File.ReadAllText(Path.Combine(
             root,
-                        "StArray.ModManager.Android",
+            "StArray.ModManager",
+            "StArray.ModManager.Android",
             "PcCompat",
             "PcCompatNativeHookRules.cs"));
         var bridge = File.ReadAllText(Path.Combine(
             root,
-                        "StArray.ModManager.Android",
+            "StArray.ModManager",
+            "StArray.ModManager.Android",
             "PcCompat",
             "PcCompatDobbyBridge.cs"));
 
@@ -762,7 +1310,8 @@ public sealed class PcCompatAndroidInputContractTests
         var root = FindHooksRoot();
         var worker = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -771,7 +1320,8 @@ public sealed class PcCompatAndroidInputContractTests
             "hud_logic_worker.cpp"));
         var native = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -780,12 +1330,14 @@ public sealed class PcCompatAndroidInputContractTests
             "pccompat_hook_rules.cpp"));
         var managed = File.ReadAllText(Path.Combine(
             root,
-                        "StArray.ModManager.Android",
+            "StArray.ModManager",
+            "StArray.ModManager.Android",
             "PcCompat",
             "PcCompatNativeHookRules.cs"));
         var bridge = File.ReadAllText(Path.Combine(
             root,
-                        "StArray.ModManager.Android",
+            "StArray.ModManager",
+            "StArray.ModManager.Android",
             "PcCompat",
             "PcCompatDobbyBridge.cs"));
 
@@ -813,7 +1365,8 @@ public sealed class PcCompatAndroidInputContractTests
         var root = FindHooksRoot();
         var source = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -822,7 +1375,8 @@ public sealed class PcCompatAndroidInputContractTests
             "realtime_event_core.cpp"));
         var header = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -831,7 +1385,8 @@ public sealed class PcCompatAndroidInputContractTests
             "realtime_event_core.h"));
         var cmake = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -862,7 +1417,8 @@ public sealed class PcCompatAndroidInputContractTests
         var root = FindHooksRoot();
         var native = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -871,25 +1427,41 @@ public sealed class PcCompatAndroidInputContractTests
             "pccompat_hook_rules.cpp"));
         var bridge = File.ReadAllText(Path.Combine(
             root,
-                        "xphorror.PcModCompat",
+            "StArray.ModManager",
+            "xphorror.PcModCompat",
             "src",
             "PcCompatLegacyInputBridge.cs"));
         var rewriter = File.ReadAllText(Path.Combine(
             root,
-                        "xphorror.PcModCompat",
+            "StArray.ModManager",
+            "xphorror.PcModCompat",
             "tools",
             "ModAssemblyRewriter",
             "Program.cs"));
         var androidCatalog = File.ReadAllText(Path.Combine(
             root,
-                        "StArray.ModManager.Android",
+            "StArray.ModManager",
+            "StArray.ModManager.Android",
             "PcCompat",
             "PcCompatAndroidManagedAssemblyRewrite.cs"));
         var androidBridge = File.ReadAllText(Path.Combine(
             root,
-                        "StArray.ModManager.Android",
+            "StArray.ModManager",
+            "StArray.ModManager.Android",
             "PcCompat",
             "PcCompatNativeHookRules.cs"));
+        var abiBridge = File.ReadAllText(Path.Combine(
+            root,
+            "StArray.ModManager",
+            "StArray.ModManager.Android",
+            "PcCompat",
+            "PcCompatAbiBridge.cs"));
+        var delegateSupport = File.ReadAllText(Path.Combine(
+            root,
+            "StArray.ModManager",
+            "Il2CppInterop",
+            "Il2CppInterop.Runtime",
+            "DelegateSupport.cs"));
 
         Assert.Multiple(() =>
         {
@@ -901,17 +1473,70 @@ public sealed class PcCompatAndroidInputContractTests
             Assert.That(rewriter, Does.Contain("AppendCallsiteToken"));
             Assert.That(rewriter, Does.Contain("InsertBeforeWithRetargeting"));
             Assert.That(androidCatalog, Does.Contain(
-                "xphorror.pcmod-managed-cache.v30-ddol-owner-teardown"));
-            Assert.That(androidCatalog, Does.Contain("PcCompatManagedImGuiBridge.v4"));
+                "xphorror.pcmod-managed-cache.v86-keyviewer-lane-origin-prefix"));
+            Assert.That(androidCatalog, Does.Contain("PcCompatManagedImGuiBridge.v20-selection-grid-transition"));
+            Assert.That(androidCatalog, Does.Contain("PcCompatManagedSettingsTransaction.v1"));
             Assert.That(androidCatalog, Does.Contain("PcCompatManagedSettingsDelegateBridge.v1"));
             Assert.That(
                 androidCatalog,
                 Does.Contain("builder.AppendLine(ModAssemblyRewriteApi.FormatVersion)"),
                 "managed rewrite cache key must include the rewriter schema");
+            Assert.That(androidCatalog, Does.Contain("spec.BoxLastValueTypeArgument"));
+            Assert.That(androidCatalog, Does.Contain("spec.AllowValueTypeReturnUnbox"));
             Assert.That(
                 ModAssemblyRewriteApi.FormatVersion,
-                Is.EqualTo("xphorror.pcmod-proxy-rewrite.v18-external-valuetype-kind"));
-            Assert.That(androidCatalog, Does.Contain("PcCompatManagedComponentBridge.v6"));
+                Is.EqualTo(ModAssemblyRewriteApi.FormatVersion));
+            Assert.That(androidCatalog, Does.Contain("PcCompatManagedComponentBridge.v13-native-component-result-rewrap"));
+            // The registry has to be part of the cache key: registering a type lifts the base-chain
+            // rule for it and blanks its base constructor call, so a list change without a key change
+            // would leave a stale rewritten assembly in place.
+            Assert.That(
+                androidCatalog,
+                Does.Contain("managed-render-component|"),
+                "the render component registry must participate in the managed cache key");
+            Assert.That(
+                androidCatalog,
+                Does.Contain("BuildManagedRenderComponents(staticScan)"),
+                "the production rewrite call must pass the render component registry");
+            Assert.That(
+                androidCatalog,
+                Does.Contain("nameof(PcCompatManagedComponentBridge.SetAnchoredPosition)"),
+                "shared RectTransform.anchoredPosition must stay routed through the arbitration " +
+                "registry; an unrouted setter lets one MOD's offset become another's baseline");
+            Assert.That(androidCatalog, Does.Contain(
+                "PcCompatManagedPathBridge.v5-directory-file-enumeration"));
+            Assert.That(androidCatalog, Does.Contain("PcCompatManagedLogBridge.v2-object-messages"));
+            Assert.That(androidCatalog, Does.Contain("PcCompatCollectionBridge.v4-null-source-initialization"));
+            Assert.That(androidCatalog, Does.Contain("PcCompatJsonBridge.v1"));
+            Assert.That(
+                androidCatalog,
+                Does.Contain("nameof(PcCompatJsonBridge.FromJson)"),
+                "JsonUtility.FromJson<T> must stay bridged even though the proxy signature matches; " +
+                "the MOD's T has no IL2CPP class-table entry, so forwarding fails at runtime with " +
+                "nothing in the audit to show it");
+            Assert.That(
+                androidCatalog,
+                Does.Contain("nameof(PcCompatCollectionBridge.AddToBoundList)"),
+                "fallbackFontAssetTable must stay a registered writable collection; on the plain " +
+                "copying converter a MOD's .Add reaches nothing and the CJK fallback font is " +
+                "silently dropped");
+            Assert.That(
+                androidCatalog,
+                Does.Contain("managed-writable-collection|"),
+                "the writable-collection registry must be part of the managed cache key");
+            Assert.That(
+                androidCatalog,
+                Does.Contain("nameof(PcCompatManagedLogBridge.Log)"),
+                "Debug.Log(object) must stay routed to the host logger; forwarding it to the proxy " +
+                "would hand an arbitrary CoreCLR object to the IL2CPP domain");
+            Assert.That(androidCatalog, Does.Contain("PcCompatManagedNetworkBridge.v1"));
+            Assert.That(androidCatalog, Does.Contain("PcCompatManagedEventSubscriptionBridge.v4-proxy-source-delegate"));
+            Assert.That(
+                abiBridge,
+                Does.Contain("RegisterSourceDelegateResolver"),
+                "generated UnityAction proxies must be resolved back to their rooted CoreCLR delegate");
+            Assert.That(abiBridge, Does.Contain("DelegateSupport.TryResolveManagedDelegate"));
+            Assert.That(delegateSupport, Does.Contain("AndroidRootedDelegates.TryGetValue"));
             Assert.That(androidCatalog, Does.Contain("nameof(PcCompatManagedComponentBridge.SetEnabled)"));
             Assert.That(androidCatalog, Does.Contain("PcCompatManagedIoBridge.v2"));
             Assert.That(androidCatalog, Does.Contain("PcCompatManagedPollingBridge.v1"));
@@ -920,7 +1545,8 @@ public sealed class PcCompatAndroidInputContractTests
             Assert.That(native, Does.Contain("dropped_before_cursor = read.dropped_before_cursor"));
             Assert.That(androidBridge, Does.Contain("ReadRawInputEventsNative"));
             Assert.That(androidBridge, Does.Contain("DroppedBeforeCursor = header.DroppedBeforeCursor"));
-            Assert.That(androidCatalog, Does.Contain("PcCompatLegacyInputBridge.v1"));
+            Assert.That(androidCatalog, Does.Contain(
+                "PcCompatLegacyInputBridge.v3-hotpath-diagnostics-removed"));
             Assert.That(androidCatalog, Does.Contain("PcCompatKeyViewerBehaviorScanner.Scan"));
             Assert.That(androidCatalog, Does.Contain("keyviewer_adapter.json"));
             Assert.That(androidCatalog, Does.Contain("keyviewer_adapter_manifest.txt"));
@@ -941,7 +1567,8 @@ public sealed class PcCompatAndroidInputContractTests
         var root = FindHooksRoot();
         var nativeRoot = Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -955,12 +1582,14 @@ public sealed class PcCompatAndroidInputContractTests
         var realtimeHeader = File.ReadAllText(Path.Combine(nativeRoot, "realtime_event_core.h"));
         var platform = File.ReadAllText(Path.Combine(
             root,
-                        "StArray.ModManager.Android",
+            "StArray.ModManager",
+            "StArray.ModManager.Android",
             "UI",
             "AndroidModManagerPlatformServices.cs"));
         var bridge = File.ReadAllText(Path.Combine(
             root,
-                        "xphorror.PcModCompat",
+            "StArray.ModManager",
+            "xphorror.PcModCompat",
             "src",
             "PcCompatLegacyInputBridge.cs"));
 
@@ -1019,7 +1648,8 @@ public sealed class PcCompatAndroidInputContractTests
         var root = FindHooksRoot();
         var nativeRoot = Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -1075,7 +1705,8 @@ public sealed class PcCompatAndroidInputContractTests
         var root = FindHooksRoot();
         var cimgui = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -1107,12 +1738,13 @@ public sealed class PcCompatAndroidInputContractTests
     }
 
     [Test]
-    public void UnityHudSourceRemovalSchedulesAHideAndNoFrameRefreshDeactivatesCanvas()
+    public void UnityHudSourceRemovalSchedulesOwnerScopedHideAndDestroy()
     {
         var root = FindHooksRoot();
         var bridge = File.ReadAllText(Path.Combine(
             root,
-                        "StArray.ModManager.Android",
+            "StArray.ModManager",
+            "StArray.ModManager.Android",
             "PcCompat",
             "PcCompatUnityHudBridge.cs"));
         var installStart = bridge.IndexOf("public static void Install()", StringComparison.Ordinal);
@@ -1120,30 +1752,22 @@ public sealed class PcCompatAndroidInputContractTests
             "[UnmanagedCallersOnly",
             installStart,
             StringComparison.Ordinal);
-        var refreshStart = bridge.IndexOf(
-            "internal static void RefreshResourcesOnUnityMain()",
+        var applyStart = bridge.IndexOf(
+            "private static void ApplySourceSnapshot(bool forceResourceRefresh)",
             StringComparison.Ordinal);
-        var refreshEnd = bridge.IndexOf(
-            "internal static void ReleaseResourcesOnUnityMain",
-            refreshStart,
+        var applyEnd = bridge.IndexOf(
+            "private static void FailSource",
+            applyStart,
             StringComparison.Ordinal);
 
         Assert.That(installStart, Is.GreaterThanOrEqualTo(0));
         Assert.That(installEnd, Is.GreaterThan(installStart));
-        Assert.That(refreshStart, Is.GreaterThanOrEqualTo(0));
-        Assert.That(refreshEnd, Is.GreaterThan(refreshStart));
+        Assert.That(applyStart, Is.GreaterThanOrEqualTo(0));
+        Assert.That(applyEnd, Is.GreaterThan(applyStart));
         var install = bridge[installStart..installEnd];
-        var refresh = bridge[refreshStart..refreshEnd];
-        var noFrameStart = refresh.IndexOf(
-            "if (!PcCompatUnityHudRuntime.TryGetFrame",
-            StringComparison.Ordinal);
-        var noFrameEnd = refresh.IndexOf(
-            "EnsureCreated();",
-            noFrameStart,
-            StringComparison.Ordinal);
-        Assert.That(noFrameStart, Is.GreaterThanOrEqualTo(0));
-        Assert.That(noFrameEnd, Is.GreaterThan(noFrameStart));
-        var noFrame = refresh[noFrameStart..noFrameEnd];
+        var apply = bridge[applyStart..applyEnd];
+        var destroy = apply.IndexOf("Surfaces[owner].Destroy()", StringComparison.Ordinal);
+        var remove = apply.IndexOf("Surfaces.Remove(owner)", StringComparison.Ordinal);
 
         Assert.Multiple(() =>
         {
@@ -1152,9 +1776,12 @@ public sealed class PcCompatAndroidInputContractTests
             Assert.That(bridge, Does.Contain("OnSourcesChanged"));
             Assert.That(bridge, Does.Contain(
                 "PcCompatResourceBundleLoader.TryScheduleUnityMainWork"));
-            Assert.That(noFrame, Does.Contain("SetVisible(false)"));
-            Assert.That(noFrame.IndexOf("SetVisible(false)", StringComparison.Ordinal),
-                Is.LessThan(noFrame.IndexOf("return;", StringComparison.Ordinal)));
+            Assert.That(apply, Does.Contain("PcCompatUnityHudRuntime.SnapshotSources()"));
+            Assert.That(apply, Does.Contain("hidden.SetVisible(false)"));
+            Assert.That(apply, Does.Contain("!registeredOwners.Contains(owner)"));
+            Assert.That(destroy, Is.GreaterThanOrEqualTo(0));
+            Assert.That(remove, Is.GreaterThan(destroy),
+                "The owner surface must be destroyed before it leaves the registry.");
         });
     }
 
@@ -1164,7 +1791,8 @@ public sealed class PcCompatAndroidInputContractTests
         var root = FindHooksRoot();
         var bootstrap = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -1176,7 +1804,8 @@ public sealed class PcCompatAndroidInputContractTests
             "StArrayModManagerBootstrap.java"));
         var diagnostics = File.ReadAllText(Path.Combine(
             root,
-                        "xphorror.PcModCompat",
+            "StArray.ModManager",
+            "xphorror.PcModCompat",
             "src",
             "PcCompatModPlugin.cs"));
 
@@ -1200,7 +1829,8 @@ public sealed class PcCompatAndroidInputContractTests
         var root = FindHooksRoot();
         var source = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -1225,15 +1855,18 @@ public sealed class PcCompatAndroidInputContractTests
         var root = FindHooksRoot();
         var managedProject = File.ReadAllText(Path.Combine(
             root,
-                        "StArray.ModManager",
+            "StArray.ModManager",
+            "StArray.ModManager",
             "StArray.ModManager.csproj"));
         var androidProject = File.ReadAllText(Path.Combine(
             root,
-                        "StArray.ModManager.Android",
+            "StArray.ModManager",
+            "StArray.ModManager.Android",
             "StArray.ModManager.Android.csproj"));
         var buildScript = File.ReadAllText(Path.Combine(
             root,
-                        "build.ps1"));
+            "StArray.ModManager",
+            "build_android_single.ps1"));
 
         Assert.That(
             managedProject,
@@ -1252,16 +1885,19 @@ public sealed class PcCompatAndroidInputContractTests
         var root = FindHooksRoot();
         var bridge = File.ReadAllText(Path.Combine(
             root,
-                        "StArray.ModManager.Android",
+            "StArray.ModManager",
+            "StArray.ModManager.Android",
             "PcCompat",
             "PcCompatDobbyBridge.cs"));
         var project = File.ReadAllText(Path.Combine(
             root,
-                        "StArray.ModManager.Android",
+            "StArray.ModManager",
+            "StArray.ModManager.Android",
             "StArray.ModManager.Android.csproj"));
         var cmake = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -1269,7 +1905,8 @@ public sealed class PcCompatAndroidInputContractTests
             "CMakeLists.txt"));
         var nativeRules = File.ReadAllText(Path.Combine(
             root,
-                        "Android",
+            "StArray.ModManager",
+            "Android",
             "library",
             "src",
             "main",
@@ -1286,14 +1923,16 @@ public sealed class PcCompatAndroidInputContractTests
             Assert.That(
                 File.Exists(Path.Combine(
                     root,
-                                        "StArray.ModManager.Android",
+                    "StArray.ModManager",
+                    "StArray.ModManager.Android",
                     "Native",
                     "UnityResolve.cs")),
                 Is.False);
             Assert.That(
                 File.Exists(Path.Combine(
                     root,
-                                        "Android",
+                    "StArray.ModManager",
+                    "Android",
                     "library",
                     "src",
                     "main",
@@ -1314,17 +1953,20 @@ public sealed class PcCompatAndroidInputContractTests
         var root = FindHooksRoot();
         var runtime = File.ReadAllText(Path.Combine(
             root,
-                        "xphorror.PcModCompat",
+            "StArray.ModManager",
+            "xphorror.PcModCompat",
             "src",
             "PcCompatKeyViewerPreviewRuntime.cs"));
         var pcCompatRuntime = File.ReadAllText(Path.Combine(
             root,
-                        "xphorror.PcModCompat",
+            "StArray.ModManager",
+            "xphorror.PcModCompat",
             "src",
             "PcCompatRuntime.cs"));
         var androidReader = File.ReadAllText(Path.Combine(
             root,
-                        "StArray.ModManager.Android",
+            "StArray.ModManager",
+            "StArray.ModManager.Android",
             "PcCompat",
             "PcCompatNativeHookRules.cs"));
 
@@ -1352,30 +1994,13 @@ public sealed class PcCompatAndroidInputContractTests
         var directory = new DirectoryInfo(TestContext.CurrentContext.TestDirectory);
         while (directory != null)
         {
-            if (File.Exists(Path.Combine(directory.FullName, "StArray.ModManager.slnx")) &&
-                Directory.Exists(Path.Combine(directory.FullName, "Android")) &&
-                Directory.Exists(Path.Combine(directory.FullName, "xphorror.PcModCompat")))
+            if (Directory.Exists(Path.Combine(directory.FullName, "extra_menu_activity")) &&
+                Directory.Exists(Path.Combine(directory.FullName, "StArray.ModManager")))
                 return directory.FullName;
             directory = directory.Parent;
         }
 
-        Assert.Fail("Could not find the public repository root from test directory");
+        Assert.Fail("Could not find ADOFAI_312_HOOKS root from test directory");
         return string.Empty;
-    }
-
-    private static string RequirePrivateActivitySource(string root)
-    {
-        var path = Path.Combine(
-            root,
-            "extra_menu_activity",
-            "src",
-            "com",
-            "fizzd",
-            "connectedworlds",
-            "editorport",
-            "ExtraMenuUnityPlayerActivity.java");
-        if (!File.Exists(path))
-            Assert.Ignore("Private Android host activity source is not part of this repository.");
-        return path;
     }
 }

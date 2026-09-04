@@ -1,6 +1,7 @@
 using System.Reflection;
 using HarmonyLib;
 using JALib.Core.Patch;
+using Xphorror.PcModCompat;
 
 namespace StArray.ModManager.Tests;
 
@@ -115,6 +116,84 @@ public class PcCompatHarmonyRegistryTests
             Assert.That(record.Priority, Is.EqualTo(Priority.High));
             Assert.That(record.Before, Is.EqualTo(new[] { "owner.after-us" }));
             Assert.That(record.After, Is.EqualTo(new[] { "owner.before-us" }));
+        });
+    }
+
+    [Test]
+    public void RevisionChangesOnPatchUnpatchAndRepatchEvenWhenRecordCountDoesNot()
+    {
+        var harmony = new Harmony("owner.dynamic-lifecycle");
+        var original = typeof(DiagnosticTarget).GetMethod(nameof(DiagnosticTarget.Run))!;
+        var callback = typeof(DiagnosticPatch).GetMethod(nameof(DiagnosticPatch.Prefix))!;
+        var initialRevision = HarmonyRegistry.Revision;
+
+        harmony.Patch(original, prefix: new HarmonyMethod(callback));
+        var patchedRevision = HarmonyRegistry.Revision;
+        Assert.That(patchedRevision, Is.GreaterThan(initialRevision));
+        Assert.That(HarmonyRegistry.RegisteredPatchCount, Is.EqualTo(1));
+
+        harmony.Unpatch(original, HarmonyPatchType.Prefix, harmony.Id);
+        var unpatchedRevision = HarmonyRegistry.Revision;
+        Assert.Multiple(() =>
+        {
+            Assert.That(unpatchedRevision, Is.GreaterThan(patchedRevision));
+            Assert.That(HarmonyRegistry.RegisteredPatchCount, Is.EqualTo(1));
+            Assert.That(HarmonyRegistry.SnapshotRegisteredPatches().Single().Active, Is.False);
+        });
+
+        harmony.Patch(original, prefix: new HarmonyMethod(callback));
+        Assert.Multiple(() =>
+        {
+            Assert.That(HarmonyRegistry.Revision, Is.GreaterThan(unpatchedRevision));
+            Assert.That(HarmonyRegistry.RegisteredPatchCount, Is.EqualTo(2));
+            Assert.That(HarmonyRegistry.SnapshotRegisteredPatches().Count(record => record.Active), Is.EqualTo(1));
+        });
+    }
+
+    [Test]
+    public void HostRegistryVersionReaderPrefersRevisionAndFallsBackToJalibChangeCounter()
+    {
+        var harmonyReader = PcCompatShimPatchRegistries.ChangeVersionReader(typeof(HarmonyRegistry));
+        var jalibReader = PcCompatShimPatchRegistries.ChangeVersionReader(typeof(JAPatcher));
+        Assert.That(harmonyReader, Is.Not.Null);
+        Assert.That(jalibReader, Is.Not.Null);
+
+        var harmony = new Harmony("owner.version-reader");
+        var original = typeof(DiagnosticTarget).GetMethod(nameof(DiagnosticTarget.Run))!;
+        var callback = typeof(DiagnosticPatch).GetMethod(nameof(DiagnosticPatch.Prefix))!;
+        var harmonyBefore = harmonyReader!();
+        harmony.Patch(original, prefix: new HarmonyMethod(callback));
+        var harmonyPatched = harmonyReader();
+        harmony.Unpatch(original, HarmonyPatchType.Prefix, harmony.Id);
+        var harmonyUnpatched = harmonyReader();
+
+        var jalibBefore = jalibReader!();
+        JAPatcher.ClearRegisteredPatches();
+        var jalibAfter = jalibReader();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(harmonyPatched, Is.GreaterThan(harmonyBefore));
+            Assert.That(harmonyUnpatched, Is.GreaterThan(harmonyPatched));
+            Assert.That(jalibAfter, Is.GreaterThan(jalibBefore));
+        });
+    }
+
+    [Test]
+    public void ManagedSessionChecksCompiledRegistryVersionReadersWithoutFrameThrottle()
+    {
+        var session = typeof(PcCompatManagedModSession);
+        Assert.Multiple(() =>
+        {
+            Assert.That(
+                session.GetField("_shimRegistryVersionReaders", BindingFlags.Instance | BindingFlags.NonPublic)?.FieldType,
+                Is.EqualTo(typeof(Func<int>[])));
+            Assert.That(
+                session.GetField("_shimRecheckCountdown", BindingFlags.Instance | BindingFlags.NonPublic),
+                Is.Null);
+            Assert.That(
+                session.GetMethod("ShimRegistryChanged", BindingFlags.Instance | BindingFlags.NonPublic),
+                Is.Not.Null);
         });
     }
 

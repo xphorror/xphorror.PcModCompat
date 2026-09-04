@@ -1,3 +1,5 @@
+using StArray.ModManager.Interop;
+
 namespace Xphorror.PcModCompat;
 
 public readonly record struct PcCompatKeyViewerPreviewTransition(
@@ -104,6 +106,7 @@ public sealed class PcCompatKeyViewerPreviewSnapshot
 /// </summary>
 public static class PcCompatKeyViewerPreviewRuntime
 {
+    private const string InputDiagnosticPrefix = "[DEBUG-kv-input-v3]";
     private const int ReadCapacity = 256;
     private static readonly object RegistrationLock = new();
     private static readonly object WakeLock = new();
@@ -120,6 +123,20 @@ public static class PcCompatKeyViewerPreviewRuntime
     private static long s_dispatchToken;
     private static Thread? s_wakeThread;
     private static int s_wakeStop = 1;
+
+    private static void WriteInputDiagnostic(string message)
+    {
+        try
+        {
+            StArray.ModManager.Manager.Logger.Info(
+                nameof(PcCompatKeyViewerPreviewRuntime),
+                $"{InputDiagnosticPrefix} {message}");
+        }
+        catch
+        {
+            // Diagnostics must never affect the input projection actor.
+        }
+    }
 
     public static bool HasRegistrations
         => Volatile.Read(ref s_dispatchRegistrations).Length != 0;
@@ -167,6 +184,7 @@ public static class PcCompatKeyViewerPreviewRuntime
         ArgumentException.ThrowIfNullOrWhiteSpace(modId);
         ArgumentNullException.ThrowIfNull(adapter);
         ArgumentNullException.ThrowIfNull(overrides);
+        PcCompatVirtualInputAdapterHub.EnsureRegistered();
 
         var adapterValidation = PcCompatKeyViewerAdapterValidator.Validate(adapter);
         if (!adapterValidation.IsValid)
@@ -209,7 +227,17 @@ public static class PcCompatKeyViewerPreviewRuntime
         }
         previous?.Dispose();
         registration.Activate();
+        SyncVirtualInputRegistration(registration);
         NotifyDemandChanged();
+        var snapshot = registration.Snapshot();
+        PcCompatDeepDebug.Write(
+            "touch-registration",
+            $"action=register mod={modId} features={snapshot.Features.Count} " +
+            $"cursorInitialized={snapshot.CursorInitialized} cursor={snapshot.Cursor} faulted={snapshot.Faulted} " +
+            $"featureState=[{string.Join(" | ", snapshot.Features.Select(feature =>
+                $"id={feature.FeatureId}/requested={feature.RequestedInputMode}/mode={feature.InputMode}/" +
+                $"consumer={feature.ConsumerQualification}/identities={feature.ConsumerMappedIdentityCount}/" +
+                $"lanes={feature.LaneCount}/held=0x{feature.HeldMask:X}/reason={PcCompatDeepDebug.Sanitize(feature.ConsumerReason)}"))}]");
         error = null;
         return true;
     }
@@ -226,8 +254,15 @@ public static class PcCompatKeyViewerPreviewRuntime
         }
         if (removed != null)
         {
+            var snapshot = removed.Snapshot();
             removed.Dispose();
             NotifyDemandChanged();
+            PcCompatDeepDebug.Write(
+                "touch-registration",
+                $"action=unregister mod={modId} cursor={snapshot.Cursor} events={snapshot.EventCount} " +
+                $"touchDown={snapshot.TouchDownEventCount} touchUp={snapshot.TouchUpEventCount} " +
+                $"touchCancel={snapshot.TouchCancelEventCount} faulted={snapshot.Faulted} " +
+                $"fault={PcCompatDeepDebug.Sanitize(snapshot.Fault)}");
         }
     }
 
@@ -276,6 +311,16 @@ public static class PcCompatKeyViewerPreviewRuntime
         if (!PcCompatModActorRuntime.TryPost(PumpActor, PumpOnce))
             Interlocked.Exchange(ref s_pumpQueued, 0);
     }
+
+    internal static void DispatchVirtualInput(VirtualInputBatch batch)
+    {
+        ArgumentNullException.ThrowIfNull(batch);
+        foreach (var registration in Volatile.Read(ref s_dispatchRegistrations))
+            registration.PostVirtualInput(batch);
+    }
+
+    private static void SyncVirtualInputRegistration(Registration registration)
+        => PcCompatVirtualInputAdapterHub.Synchronize(registration.PostVirtualInput);
 
     public static bool WaitForIdle(TimeSpan timeout)
     {
@@ -449,7 +494,7 @@ public static class PcCompatKeyViewerPreviewRuntime
         private readonly string _modId;
         private readonly FeatureState[] _features;
         private readonly PcCompatModActorRuntime.PcCompatModActorHandle _actor;
-        private readonly long _consumerGeneration;
+        private long _consumerGeneration;
         private readonly bool _hasConsumer;
         private bool _cursorInitialized;
         private bool _batchInFlight;
@@ -478,6 +523,12 @@ public static class PcCompatKeyViewerPreviewRuntime
         private PcCompatKeyViewerInputOrigin _origin;
         private ulong _anyUnityDownOrdinal;
         private int _pumpActive = 1;
+        private bool _virtualInputActive;
+        private long _virtualSessionGeneration;
+        private ulong _virtualSequence;
+        private PcCompatKeyViewerStatisticsTransaction? _statisticsTransaction;
+        private int _openUnavailableDiagnosticLogsRemaining = 1;
+        private int _openSuccessDiagnosticLogsRemaining = 1;
 
         public Registration(string modId, FeatureState[] features)
         {
@@ -542,21 +593,42 @@ public static class PcCompatKeyViewerPreviewRuntime
 
         public void TryOpen(PcCompatKeyViewerEventBatch opened)
         {
+            string? diagnostic = null;
             lock (_lock)
             {
-                if (_disposed || _faulted || _cursorInitialized || !opened.ProviderAvailable)
+                if (_disposed || _faulted || _cursorInitialized)
                     return;
-                if (opened.DroppedBeforeCursor != 0 || opened.Events.Count != 0)
+                if (!opened.ProviderAvailable)
                 {
-                    Fault(
-                        "raw event provider violated OpenAtTail contract " +
-                        $"events={opened.Events.Count} dropped={opened.DroppedBeforeCursor}");
-                    return;
+                    if (_openUnavailableDiagnosticLogsRemaining-- > 0)
+                    {
+                        diagnostic = $"boundary=open mod={_modId} result=provider-unavailable " +
+                                     $"consumer={(_hasConsumer ? 1 : 0)} " +
+                                     $"registration={_consumerGeneration}";
+                    }
                 }
-                _cursor = opened.Cursor;
-                _startCursor = opened.Cursor;
-                _cursorInitialized = true;
+                else
+                {
+                    if (opened.DroppedBeforeCursor != 0 || opened.Events.Count != 0)
+                    {
+                        Fault(
+                            "raw event provider violated OpenAtTail contract " +
+                            $"events={opened.Events.Count} dropped={opened.DroppedBeforeCursor}");
+                        return;
+                    }
+                    _cursor = opened.Cursor;
+                    _startCursor = opened.Cursor;
+                    _cursorInitialized = true;
+                    if (_openSuccessDiagnosticLogsRemaining-- > 0)
+                    {
+                        diagnostic = $"boundary=open mod={_modId} result=ready " +
+                                     $"cursor={opened.Cursor} consumer={(_hasConsumer ? 1 : 0)} " +
+                                     $"registration={_consumerGeneration}";
+                    }
+                }
             }
+            if (diagnostic != null)
+                WriteInputDiagnostic(diagnostic);
         }
 
         public bool TryReserveCursor(long dispatchToken, out ulong cursor)
@@ -625,11 +697,24 @@ public static class PcCompatKeyViewerPreviewRuntime
             Fault("ModActor rejected raw input batch");
         }
 
+        public void PostVirtualInput(VirtualInputBatch batch)
+        {
+            lock (_lock)
+            {
+                if (_disposed || _faulted)
+                    return;
+            }
+            if (PcCompatModActorRuntime.TryPost(_actor, () => ApplyVirtualInput(batch)))
+                return;
+            Fault("ModActor rejected virtual input batch");
+        }
+
         public bool WaitForIdle(TimeSpan timeout)
             => PcCompatModActorRuntime.WaitForIdle(_actor, timeout);
 
         public void Dispose()
         {
+            PcCompatKeyViewerStatisticsTransaction? statisticsTransaction;
             lock (_lock)
             {
                 if (_disposed)
@@ -639,7 +724,10 @@ public static class PcCompatKeyViewerPreviewRuntime
                 Volatile.Write(ref _pumpActive, 0);
                 foreach (var feature in _features)
                     feature.ResetHeld();
+                statisticsTransaction = _statisticsTransaction;
+                _statisticsTransaction = null;
             }
+            RestoreStatisticsTransaction(statisticsTransaction, "adapter disposal");
             PumpProgress.Set();
             PcCompatKeyViewerConsumerRuntime.Remove(_modId, _consumerGeneration);
             PcCompatModActorRuntime.Unregister(_actor);
@@ -649,7 +737,7 @@ public static class PcCompatKeyViewerPreviewRuntime
         {
             lock (_lock)
             {
-                if (_disposed || _faulted || !_cursorInitialized)
+                if (_disposed || _faulted || !_cursorInitialized || _virtualInputActive)
                 {
                     _batchInFlight = false;
                     PumpProgress.Set();
@@ -699,6 +787,134 @@ public static class PcCompatKeyViewerPreviewRuntime
                 _batchInFlight = false;
                 PumpProgress.Set();
             }
+        }
+
+        private void ApplyVirtualInput(VirtualInputBatch batch)
+        {
+            var demandChanged = false;
+            lock (_lock)
+            {
+                if (_disposed || _faulted)
+                    return;
+                if (batch.Kind == VirtualInputBatchKind.Started)
+                {
+                    if (_virtualInputActive &&
+                        _virtualSessionGeneration == batch.SessionGeneration)
+                        return;
+                    if (_virtualInputActive && !EndVirtualInput())
+                        return;
+                    if (BeginVirtualInput(batch.SessionGeneration))
+                        demandChanged = true;
+                }
+                else if (!_virtualInputActive ||
+                         batch.SessionGeneration != _virtualSessionGeneration)
+                {
+                    return;
+                }
+                else if (batch.Kind is VirtualInputBatchKind.Events or
+                         VirtualInputBatchKind.Snapshot or
+                         VirtualInputBatchKind.Cancelled)
+                {
+                    var anyUnityDown = false;
+                    foreach (var input in batch.Events)
+                    {
+                        if (input.Sequence <= _virtualSequence &&
+                            batch.Kind != VirtualInputBatchKind.Snapshot)
+                        {
+                            Fault(
+                                $"virtual input sequence regressed previous={_virtualSequence} " +
+                                $"actual={input.Sequence}");
+                            return;
+                        }
+                        foreach (var feature in _features)
+                            anyUnityDown |= feature.ObserveVirtual(
+                                input,
+                                batch.Kind == VirtualInputBatchKind.Snapshot,
+                                batch.SessionGeneration);
+                        _virtualSequence = Math.Max(_virtualSequence, input.Sequence);
+                        ++_eventCount;
+                    }
+                    if (anyUnityDown)
+                        ++_anyUnityDownOrdinal;
+                    if (_hasConsumer)
+                        PublishConsumerState();
+                }
+                else if (batch.Kind == VirtualInputBatchKind.Ended)
+                {
+                    if (EndVirtualInput())
+                        demandChanged = true;
+                }
+            }
+            if (demandChanged)
+                NotifyDemandChanged();
+        }
+
+        private bool BeginVirtualInput(long sessionGeneration)
+        {
+            if (!PcCompatRuntime.TryBeginKeyViewerStatisticsTransaction(
+                    _modId,
+                    _features.Select(feature => feature.StatisticsFeature).ToArray(),
+                    out var statisticsTransaction,
+                    out var statisticsError))
+            {
+                try
+                {
+                    StArray.ModManager.Manager.Logger.Warn(
+                        nameof(PcCompatKeyViewerPreviewRuntime),
+                        $"mod={_modId} virtual input session={sessionGeneration} rejected " +
+                        $"without faulting adapter: {statisticsError}");
+                }
+                catch
+                {
+                }
+                return false;
+            }
+            PcCompatKeyViewerConsumerRuntime.Remove(_modId, _consumerGeneration);
+            _statisticsTransaction = statisticsTransaction;
+            foreach (var feature in _features)
+                feature.BeginVirtualSession();
+            _virtualInputActive = true;
+            _virtualSessionGeneration = sessionGeneration;
+            _virtualSequence = 0;
+            _cursorInitialized = false;
+            _batchInFlight = false;
+            _cursor = 0;
+            _startCursor = 0;
+            _sessionGeneration = unchecked((uint)Math.Clamp(sessionGeneration, 1, uint.MaxValue));
+            _producerEpoch = 0;
+            _stateGeneration = 0;
+            _origin = PcCompatKeyViewerInputOrigin.ReplayVirtual;
+            _anyUnityDownOrdinal = 0;
+            _consumerGeneration = Interlocked.Increment(ref s_consumerGeneration);
+            Volatile.Write(ref _pumpActive, 0);
+            if (_hasConsumer)
+                PublishConsumerState();
+            return true;
+        }
+
+        private bool EndVirtualInput()
+        {
+            PcCompatKeyViewerConsumerRuntime.Remove(_modId, _consumerGeneration);
+            var statisticsTransaction = _statisticsTransaction;
+            _statisticsTransaction = null;
+            if (!RestoreStatisticsTransaction(statisticsTransaction, "virtual input end"))
+            {
+                Fault("virtual input statistics restore failed");
+                return false;
+            }
+            foreach (var feature in _features)
+                feature.EndVirtualSession();
+            _virtualInputActive = false;
+            _virtualSessionGeneration = 0;
+            _virtualSequence = 0;
+            _cursorInitialized = false;
+            _batchInFlight = false;
+            _consumerGeneration = Interlocked.Increment(ref s_consumerGeneration);
+            _anyUnityDownOrdinal = 0;
+            Volatile.Write(ref _pumpActive, 1);
+            if (_hasConsumer)
+                PublishConsumerState();
+            return true;
         }
 
         private void ApplyTouchLaneMappingMode(
@@ -943,18 +1159,22 @@ public static class PcCompatKeyViewerPreviewRuntime
         }
 
         private void PublishConsumerState()
-            => PcCompatKeyViewerConsumerRuntime.Publish(
+        {
+            var features = _features.Select(feature => feature.Publish(
+                _cursor,
+                _sessionGeneration,
+                _producerEpoch,
+                _consumerGeneration)).ToArray();
+            PcCompatKeyViewerConsumerRuntime.Publish(
                 _modId,
-                _features.Select(feature => feature.Publish(
-                    _cursor,
-                    _sessionGeneration,
-                    _producerEpoch,
-                    _consumerGeneration)).ToArray(),
+                features,
                 _cursor,
                 _anyUnityDownOrdinal);
+        }
 
         private void Fault(string reason)
         {
+            PcCompatKeyViewerStatisticsTransaction? statisticsTransaction;
             lock (_lock)
             {
                 if (_disposed || _faulted)
@@ -965,10 +1185,36 @@ public static class PcCompatKeyViewerPreviewRuntime
                 _fault = $"mod={_modId}: {reason}";
                 foreach (var feature in _features)
                     feature.ResetHeld();
+                statisticsTransaction = _statisticsTransaction;
+                _statisticsTransaction = null;
             }
+            RestoreStatisticsTransaction(statisticsTransaction, "adapter fault");
             PumpProgress.Set();
             PcCompatKeyViewerConsumerRuntime.Remove(_modId, _consumerGeneration);
             NotifyDemandChanged();
+        }
+
+        private bool RestoreStatisticsTransaction(
+            PcCompatKeyViewerStatisticsTransaction? transaction,
+            string reason)
+        {
+            if (transaction == null || transaction.TryRestore(out var error))
+                return true;
+            lock (_lock)
+            {
+                if (!_disposed && _statisticsTransaction == null)
+                    _statisticsTransaction = transaction;
+            }
+            try
+            {
+                StArray.ModManager.Manager.Logger.Warn(
+                    nameof(PcCompatKeyViewerPreviewRuntime),
+                    $"mod={_modId} {reason} statistics restore failed: {error}");
+            }
+            catch
+            {
+            }
+            return false;
         }
     }
 
@@ -976,7 +1222,10 @@ public static class PcCompatKeyViewerPreviewRuntime
     {
         private const int MaxTouchSlots = 32;
         private const int MaxRainPulses = 2048;
+        private readonly string _modId;
         private readonly string _featureId;
+        private readonly PcCompatKeyViewerFeatureAdapter _adapter;
+        private readonly PcCompatKeyViewerFeatureOverride _override;
         private readonly PcCompatKeyViewerInputMode _requestedInputMode;
         private readonly int _laneCount;
         private readonly int[] _touchSlotLanes = Enumerable.Repeat(-1, MaxTouchSlots).ToArray();
@@ -984,6 +1233,11 @@ public static class PcCompatKeyViewerPreviewRuntime
         private readonly long[] _touchLaneLastUpRawNs;
         private readonly int[] _externalLaneHeldCounts;
         private readonly Dictionary<ExternalContact, uint> _externalContacts = [];
+        private readonly Dictionary<string, uint> _virtualKeyboardContacts =
+            new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<int, int> _virtualPointerSlots = [];
+        private readonly HashSet<string> _loggedUnmappedVirtualKeys =
+            new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<PcCompatCanonicalInputIdentity, uint> _consumerLaneMasks = [];
         private readonly PcCompatKeyViewerConsumerQualification _consumerQualification;
         private readonly string? _consumerReason;
@@ -1004,6 +1258,11 @@ public static class PcCompatKeyViewerPreviewRuntime
         private uint _frozenSessionGeneration;
         private PcCompatExternalInputDeviceFlags _sessionDeviceFlags;
         private string? _sessionModeReason;
+        private PcCompatKeyViewerInputMode _preVirtualInputMode;
+        private bool _preVirtualSessionModeFrozen;
+        private uint _preVirtualFrozenSessionGeneration;
+        private PcCompatExternalInputDeviceFlags _preVirtualSessionDeviceFlags;
+        private string? _preVirtualSessionModeReason;
         private readonly List<PcCompatKeyViewerRainPulse> _rainPulses = [];
         private long _latestRainRawNs;
 
@@ -1012,6 +1271,9 @@ public static class PcCompatKeyViewerPreviewRuntime
             PcCompatKeyViewerFeatureAdapter feature,
             PcCompatKeyViewerFeatureOverride featureOverride)
         {
+            _modId = modId;
+            _adapter = feature;
+            _override = featureOverride;
             _featureId = feature.Id;
             _requestedInputMode = featureOverride.InputMode;
             _inputMode = featureOverride.InputMode;
@@ -1058,25 +1320,247 @@ public static class PcCompatKeyViewerPreviewRuntime
 
         public string FeatureId => _featureId;
         public PcCompatKeyViewerInputMode InputMode => _inputMode;
+        public uint HeldMask => _heldMask;
+        public PcCompatKeyViewerStatisticsFeature StatisticsFeature
+            => new(_adapter, _override);
 
         public bool Observe(PcCompatKeyViewerRawEvent inputEvent)
         {
             FreezeInputMode(inputEvent);
+            bool consumed;
             if (inputEvent.Phase is PcCompatKeyViewerRawPhase.Reset or
                 PcCompatKeyViewerRawPhase.ProducerChanged)
             {
                 ResetHeld(publishRelease: true, inputEvent.RawNs);
-                return false;
+                consumed = false;
             }
-            if (inputEvent.Source == PcCompatKeyViewerRawSource.Touch)
+            else if (inputEvent.Source == PcCompatKeyViewerRawSource.Touch)
             {
                 if (_inputMode is PcCompatKeyViewerInputMode.External)
-                    return false;
-                return ObserveTouch(inputEvent);
+                    consumed = false;
+                else
+                    consumed = ObserveTouch(inputEvent);
             }
-            if (_inputMode is PcCompatKeyViewerInputMode.Touch)
+            else if (_inputMode is PcCompatKeyViewerInputMode.Touch)
+            {
+                consumed = false;
+            }
+            else
+            {
+                consumed = ObserveExternal(inputEvent);
+            }
+
+            PcCompatDeepDebug.WriteState(
+                "touch-event",
+                _modId + "\0" + _featureId,
+                inputEvent.Sequence + ":" + inputEvent.SessionGeneration + ":" +
+                inputEvent.ProducerEpoch + ":" + _heldMask + ":" +
+                string.Join(',', _downOrdinals) + ":" + string.Join(',', _upOrdinals),
+                $"mod={_modId} feature={_featureId} sequence={inputEvent.Sequence} " +
+                $"rawNs={inputEvent.RawNs} stateGeneration={inputEvent.StateGeneration} " +
+                $"sessionGeneration={inputEvent.SessionGeneration} producerEpoch={inputEvent.ProducerEpoch} " +
+                $"origin={inputEvent.Origin} source={inputEvent.Source} phase={inputEvent.Phase} " +
+                $"code={inputEvent.Code} sourceCode={inputEvent.SourceCode} scanCode={inputEvent.ScanCode} " +
+                $"slot={inputEvent.Slot} pointerCount={inputEvent.PointerCount} device={inputEvent.DeviceId} " +
+                $"viewport={inputEvent.ViewportWidth}x{inputEvent.ViewportHeight} x={inputEvent.X:F2} y={inputEvent.Y:F2} " +
+                $"requestedMode={_requestedInputMode} mode={_inputMode} modeFrozen={_sessionModeFrozen} " +
+                $"modeReason={PcCompatDeepDebug.Sanitize(_sessionModeReason)} consumed={consumed} " +
+                $"consumer={_consumerQualification} identities=[{string.Join(',', _consumerIdentities.Select(identity =>
+                    $"{identity.Kind}:{identity.Value}->lane{identity.Lane}"))}] " +
+                $"held=0x{_heldMask:X} down=[{string.Join(',', _downOrdinals)}] " +
+                $"up=[{string.Join(',', _upOrdinals)}] transitionCount={_transitionCount} " +
+                $"unmapped={_unmappedEventCount} last={_lastTransition}");
+            return consumed;
+        }
+
+        public void BeginVirtualSession()
+        {
+            _preVirtualInputMode = _inputMode;
+            _preVirtualSessionModeFrozen = _sessionModeFrozen;
+            _preVirtualFrozenSessionGeneration = _frozenSessionGeneration;
+            _preVirtualSessionDeviceFlags = _sessionDeviceFlags;
+            _preVirtualSessionModeReason = _sessionModeReason;
+            ResetHeld();
+            Array.Clear(_downOrdinals);
+            Array.Clear(_upOrdinals);
+            _rainPulses.Clear();
+            _latestRainRawNs = 0;
+            _loggedUnmappedVirtualKeys.Clear();
+            _inputMode = PcCompatKeyViewerInputMode.Touch;
+            _sessionModeFrozen = true;
+            _frozenSessionGeneration = 0;
+            _sessionModeReason = "VirtualInput V2 exclusive playback";
+        }
+
+        public void EndVirtualSession()
+        {
+            ResetHeld();
+            Array.Clear(_downOrdinals);
+            Array.Clear(_upOrdinals);
+            _rainPulses.Clear();
+            _latestRainRawNs = 0;
+            _loggedUnmappedVirtualKeys.Clear();
+            _inputMode = _preVirtualInputMode;
+            _sessionModeFrozen = _preVirtualSessionModeFrozen;
+            _frozenSessionGeneration = _preVirtualFrozenSessionGeneration;
+            _sessionDeviceFlags = _preVirtualSessionDeviceFlags;
+            _sessionModeReason = _preVirtualSessionModeReason;
+        }
+
+        public bool ObserveVirtual(
+            VirtualInputEvent input,
+            bool snapshot,
+            long sessionGeneration)
+        {
+            var downOrdinals = snapshot ? (ulong[])_downOrdinals.Clone() : null;
+            var upOrdinals = snapshot ? (ulong[])_upOrdinals.Clone() : null;
+            var transitionCount = _transitionCount;
+            var lastTransition = _lastTransition;
+            var rainCount = _rainPulses.Count;
+            var latestRainRawNs = _latestRainRawNs;
+            var anyUnityDown = input.Device == VirtualInputDevice.Touch
+                ? ObserveVirtualTouch(input, sessionGeneration)
+                : ObserveVirtualKeyboard(input, sessionGeneration);
+            if (snapshot)
+            {
+                Array.Copy(downOrdinals!, _downOrdinals, _downOrdinals.Length);
+                Array.Copy(upOrdinals!, _upOrdinals, _upOrdinals.Length);
+                if (_rainPulses.Count > rainCount)
+                    _rainPulses.RemoveRange(rainCount, _rainPulses.Count - rainCount);
+                _latestRainRawNs = latestRainRawNs;
+                _transitionCount = transitionCount;
+                _lastTransition = lastTransition;
+                anyUnityDown = false;
+            }
+            return anyUnityDown;
+        }
+
+        private bool ObserveVirtualTouch(VirtualInputEvent input, long sessionGeneration)
+        {
+            if (input.Phase == VirtualInputPhase.Move)
                 return false;
-            return ObserveExternal(inputEvent);
+            var slot = ResolveVirtualPointerSlot(input);
+            if (slot < 0)
+                return false;
+            var raw = new PcCompatKeyViewerRawEvent(
+                input.Sequence,
+                ToRawNanoseconds(input.OffsetMicroseconds),
+                0,
+                unchecked((uint)Math.Clamp(sessionGeneration, 1, uint.MaxValue)),
+                0,
+                PcCompatKeyViewerInputOrigin.ReplayVirtual,
+                PcCompatKeyViewerRawSource.Touch,
+                ToRawPhase(input.Phase),
+                0,
+                slot,
+                Math.Max(1, _virtualPointerSlots.Count),
+                0,
+                0,
+                -1,
+                input.RepeatCount,
+                0,
+                0,
+                ToViewportDimension(input.ViewportWidth),
+                ToViewportDimension(input.ViewportHeight),
+                input.X,
+                input.Y,
+                0);
+            var result = ObserveTouch(raw);
+            if (input.Phase is VirtualInputPhase.Up or VirtualInputPhase.Cancel)
+                _virtualPointerSlots.Remove(input.PointerId);
+            return result;
+        }
+
+        private bool ObserveVirtualKeyboard(VirtualInputEvent input, long sessionGeneration)
+        {
+            var key = input.CanonicalKey?.Trim();
+            if (string.IsNullOrWhiteSpace(key))
+                return false;
+            if (input.Phase == VirtualInputPhase.Down)
+            {
+                if (_virtualKeyboardContacts.ContainsKey(key))
+                    return false;
+                var mappedIdentities = PcCompatVirtualInputIdentityMapper.Map(key);
+                uint matchedLanes = 0;
+                foreach (var identity in mappedIdentities)
+                {
+                    if (_consumerLaneMasks.TryGetValue(identity, out var lanes))
+                        matchedLanes |= lanes;
+                }
+                if (matchedLanes == 0)
+                {
+                    ++_unmappedEventCount;
+                    _lastTransition = CreateVirtualTransition(input, -1, key);
+                    LogUnmappedVirtualKey(key, mappedIdentities);
+                    return false;
+                }
+                _virtualKeyboardContacts[key] = matchedLanes;
+                var anyUnityDown = false;
+                for (var lane = 0; lane < _laneCount; ++lane)
+                {
+                    var bit = 1u << lane;
+                    if ((matchedLanes & bit) == 0)
+                        continue;
+                    var wasHeld = (_heldMask & bit) != 0;
+                    ++_externalLaneHeldCounts[lane];
+                    _heldMask |= bit;
+                    if (!wasHeld)
+                    {
+                        ++_downOrdinals[lane];
+                        RecordRainDown(lane, ToRawNanoseconds(input.OffsetMicroseconds));
+                        anyUnityDown |= (_unityConsumerLaneMask & bit) != 0;
+                    }
+                }
+                ++_transitionCount;
+                _lastTransition = CreateVirtualTransition(input, FirstLane(matchedLanes), key);
+                return anyUnityDown;
+            }
+
+            if (input.Phase is not (VirtualInputPhase.Up or VirtualInputPhase.Cancel) ||
+                !_virtualKeyboardContacts.Remove(key, out var releasedLanes))
+                return false;
+            for (var lane = 0; lane < _laneCount; ++lane)
+            {
+                var bit = 1u << lane;
+                if ((releasedLanes & bit) == 0)
+                    continue;
+                if (_externalLaneHeldCounts[lane] > 0)
+                    --_externalLaneHeldCounts[lane];
+                if (_externalLaneHeldCounts[lane] == 0 && !IsLaneHeldByTouch(lane))
+                {
+                    _heldMask &= ~bit;
+                    ++_upOrdinals[lane];
+                    RecordRainUp(lane, ToRawNanoseconds(input.OffsetMicroseconds));
+                }
+            }
+            ++_transitionCount;
+            _lastTransition = CreateVirtualTransition(input, FirstLane(releasedLanes), key);
+            return false;
+        }
+
+        private void LogUnmappedVirtualKey(
+            string key,
+            IReadOnlyList<PcCompatCanonicalInputIdentity> mappedIdentities)
+        {
+            if (!_loggedUnmappedVirtualKeys.Add(key))
+                return;
+            var mapped = mappedIdentities.Count == 0
+                ? "none"
+                : string.Join(',', mappedIdentities.Select(value => $"{value.Kind}:{value.Value}"));
+            var consumer = _consumerIdentities.Length == 0
+                ? "none"
+                : string.Join(',', _consumerIdentities.Select(value =>
+                    $"lane{value.Lane}/{value.Kind}:{value.Value}"));
+            try
+            {
+                StArray.ModManager.Manager.Logger.Warn(
+                    nameof(PcCompatKeyViewerPreviewRuntime),
+                    $"mod={_modId} feature={_featureId} virtual key rejected " +
+                    $"key='{key}' mapped=[{mapped}] consumer=[{consumer}]");
+            }
+            catch
+            {
+            }
         }
 
         public void ResetHeld(bool publishRelease = false, long rawNs = 0)
@@ -1098,6 +1582,8 @@ public static class PcCompatKeyViewerPreviewRuntime
             _ignoredTouchUpSlots = 0;
             Array.Clear(_externalLaneHeldCounts);
             _externalContacts.Clear();
+            _virtualKeyboardContacts.Clear();
+            _virtualPointerSlots.Clear();
         }
 
         public bool SetTouchLaneMappingMode(
@@ -1551,8 +2037,71 @@ public static class PcCompatKeyViewerPreviewRuntime
             return delayNs > 0 &&
                 lastUpRawNs > 0 &&
                 rawNs >= lastUpRawNs &&
-                rawNs - lastUpRawNs < delayNs;
+                   rawNs - lastUpRawNs < delayNs;
         }
+
+        private int ResolveVirtualPointerSlot(VirtualInputEvent input)
+        {
+            if (input.PointerId < 0)
+                return -1;
+            if (_virtualPointerSlots.TryGetValue(input.PointerId, out var existing))
+                return existing;
+            if (input.Phase != VirtualInputPhase.Down)
+                return -1;
+            for (var slot = 0; slot < MaxTouchSlots; ++slot)
+            {
+                if (_virtualPointerSlots.ContainsValue(slot))
+                    continue;
+                _virtualPointerSlots[input.PointerId] = slot;
+                return slot;
+            }
+            ++_unmappedEventCount;
+            return -1;
+        }
+
+        private PcCompatKeyViewerPreviewTransition CreateVirtualTransition(
+            VirtualInputEvent input,
+            int lane,
+            string identity)
+            => new(
+                input.Sequence,
+                ToRawNanoseconds(input.OffsetMicroseconds),
+                _featureId,
+                PcCompatKeyViewerInputOrigin.ReplayVirtual,
+                input.Device == VirtualInputDevice.Touch
+                    ? PcCompatKeyViewerRawSource.Touch
+                    : PcCompatKeyViewerRawSource.Keyboard,
+                ToRawPhase(input.Phase),
+                PcCompatVirtualInputIdentityMapper.TryMapToAndroidKeyCode(
+                    input.CanonicalKey,
+                    out var keyCode)
+                    ? keyCode
+                    : 0,
+                lane,
+                identity);
+
+        private static PcCompatKeyViewerRawPhase ToRawPhase(VirtualInputPhase phase)
+            => phase switch
+            {
+                VirtualInputPhase.Down => PcCompatKeyViewerRawPhase.Down,
+                VirtualInputPhase.Up => PcCompatKeyViewerRawPhase.Up,
+                VirtualInputPhase.Cancel => PcCompatKeyViewerRawPhase.Cancel,
+                _ => PcCompatKeyViewerRawPhase.Reset
+            };
+
+        private static long ToRawNanoseconds(long offsetMicroseconds)
+            => offsetMicroseconds <= 0
+                ? 1
+                : offsetMicroseconds >= long.MaxValue / 1_000L
+                    ? long.MaxValue
+                    : offsetMicroseconds * 1_000L;
+
+        private static int ToViewportDimension(float value)
+            => !float.IsFinite(value) || value <= 0
+                ? 0
+                : value >= int.MaxValue
+                    ? int.MaxValue
+                    : (int)MathF.Round(value);
 
         private readonly record struct ExternalContact(
             PcCompatKeyViewerRawSource Source,

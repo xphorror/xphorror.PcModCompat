@@ -78,7 +78,8 @@ public sealed class PcCompatCapabilityRegistryContractTests
             root,
             "StArray.ModManager.Android",
             "PcCompat",
-            "PcCompatGeneratedUnityBundleApi.cs"));
+            "PcCompatGeneratedUnityBundleApi.cs"),
+            System.Text.Encoding.UTF8);
 
         Assert.Multiple(() =>
         {
@@ -88,6 +89,51 @@ public sealed class PcCompatCapabilityRegistryContractTests
             Assert.That(registry, Does.Contain("RemainingAssets.Enqueue(stale.Descriptor)"));
             Assert.That(registry, Does.Contain(
                 "s_status = PcCompatCapabilityRegistryStatus.LoadingAssets"));
+        });
+    }
+
+    [Test]
+    public void AsyncUnityResultsHaveOwnerScopedNativeRootsBeforeRequestRelease()
+    {
+        var root = FindModManagerRoot();
+        var bundleApi = File.ReadAllText(Path.Combine(
+            root,
+            "StArray.ModManager.Android",
+            "PcCompat",
+            "PcCompatGeneratedUnityBundleApi.cs"));
+        var loader = File.ReadAllText(Path.Combine(
+            root,
+            "StArray.ModManager.Android",
+            "PcCompat",
+            "PcCompatResourceBundleLoader.cs"),
+            System.Text.Encoding.UTF8);
+        var capability = File.ReadAllText(Path.Combine(
+            root,
+            "StArray.ModManager.Android",
+            "PcCompat",
+            "PcCompatCapabilityBundleRegistry.cs"),
+            System.Text.Encoding.UTF8);
+        var rootCreationIndex = loader.IndexOf(
+            "bundleRoot = api.CreateNativeRoot(bundleObject)",
+            StringComparison.Ordinal);
+        var requestReleaseAfterRootIndex = loader.IndexOf(
+            "ReleaseBundleRequestHandle(operation)",
+            rootCreationIndex,
+            StringComparison.Ordinal);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(bundleApi, Does.Contain("public object CreateNativeRoot(nint pointer)"));
+            Assert.That(loader, Does.Contain("BundleRoot = bundleRoot"));
+            Assert.That(loader, Does.Contain("entry.AssetRoot = assetRoot"));
+            Assert.That(loader, Does.Contain("bundle.BundleRoot = null!"));
+            Assert.That(loader, Does.Contain("managedProxy = EnsureApi().WrapAssetBundle(bundle.Bundle)"));
+            Assert.That(loader, Does.Contain("bundle.ManagedProxy = null"));
+            Assert.That(rootCreationIndex, Is.GreaterThanOrEqualTo(0));
+            Assert.That(requestReleaseAfterRootIndex, Is.GreaterThan(rootCreationIndex));
+            Assert.That(capability, Does.Contain("s_bundleRoot = bundleRoot"));
+            Assert.That(capability, Does.Contain("s_manifestRoot = manifestRoot"));
+            Assert.That(capability, Does.Contain("new LoadedCapabilityAsset(pending.Descriptor, assetProxy, pointer, assetRoot)"));
         });
     }
 
@@ -198,7 +244,7 @@ public sealed class PcCompatCapabilityRegistryContractTests
         var directory = new DirectoryInfo(TestContext.CurrentContext.TestDirectory);
         while (directory != null)
         {
-            if (File.Exists(Path.Combine(directory.FullName, "build.ps1")) &&
+            if (File.Exists(Path.Combine(directory.FullName, "build_android_single.ps1")) &&
                 Directory.Exists(Path.Combine(directory.FullName, "xphorror.PcModCompat")))
             {
                 return directory.FullName;

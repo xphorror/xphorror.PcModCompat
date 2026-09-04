@@ -29,7 +29,7 @@ public static unsafe class ImGuiRender
 
     /// <summary>每帧渲染事件</summary>
     public static event Action OnRender = () => { };
-
+    
     /// <summary>eglSwapBuffers Hook 回调</summary>
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
     public static int OnSwapBuffers(IntPtr display, IntPtr surface)
@@ -42,11 +42,16 @@ public static unsafe class ImGuiRender
             if (!_initialized)
                 InitImGui(display, surface);
 
+            AndroidImGuiFontLoader.EnsureLoaded(
+                ImGui.GetIO(),
+                ImGuiImplOpenGL3.RecreateFontsTexture);
             ImGuiImplOpenGL3.NewFrame();
             UpdatePlatformFrame(width, height);
 
             ImGui.NewFrame();
+            ImGuiInputHandler.BeginImeFrame();
             BuildUI();
+            ImGuiInputHandler.UpdateIme();
             ImGui.Render();
             ImGuiImplOpenGL3.RenderDrawData((IntPtr)ImGui.GetDrawData().NativePtr);
 
@@ -76,7 +81,7 @@ public static unsafe class ImGuiRender
                 Logger.Error(nameof(ImGuiRender), "libEGL/libGLESv3 not loaded");
                 return false;
             }
-
+        
             var glSwapBuffersPtr = NativeLibrary.GetExport(eglLib, "eglSwapBuffers");
             int swapHook = Dobby.Hook(glSwapBuffersPtr, typeof(ImGuiRender).GetMethod(nameof(OnSwapBuffers))!.MethodHandle.GetFunctionPointer(), out var prevSwapBuffers);
             if (swapHook != 0 || prevSwapBuffers == IntPtr.Zero)
@@ -85,7 +90,7 @@ public static unsafe class ImGuiRender
                 return false;
             }
             _prevSwapBuffersDelegate = Marshal.GetDelegateForFunctionPointer<SwapBuffersDelegate>(prevSwapBuffers);
-
+        
             string consumerSymbol = "_ZN7android13InputConsumer21initializeMotionEventEPNS_11MotionEventEPKNS_12InputMessageE";
             IntPtr consumerAddr = Dobby.SymbolResolver("libinput.so", consumerSymbol);
             if (consumerAddr != IntPtr.Zero)
@@ -101,7 +106,7 @@ public static unsafe class ImGuiRender
             {
                 Logger.Warn(nameof(ImGuiRender), "libinput initializeMotionEvent symbol not found");
             }
-
+        
             /*// Hook 按键事件
             string keySymbol = "_ZN7android13InputConsumer18initializeKeyEventEPNS_8KeyEventEPKNS_12InputMessageE";
             IntPtr keyAddr = Dobby.SymbolResolver("libinput.so", keySymbol);
@@ -109,7 +114,7 @@ public static unsafe class ImGuiRender
                 out var keyOrigin);
             _initializeKeyEvent = Marshal.GetDelegateForFunctionPointer<InitializeKeyEventDelegate>(keyOrigin);
             */
-
+        
             Logger.Error(nameof(ImGuiRender), $"eglSwapBuffers hooked at 0x{glSwapBuffersPtr:X}");
             return true;
         }
@@ -137,7 +142,9 @@ public static unsafe class ImGuiRender
 
         try
         {
-            ImGuiImplAndroid.HandleInputEvent(self);
+            if (motionEvent != IntPtr.Zero && InputEvents.HasSubscribers)
+                InputEvents.RaiseFrom(motionEvent);
+            ImGuiImplAndroid.HandleInputEvent(motionEvent);
         }
         catch (Exception ex)
         {
@@ -186,27 +193,27 @@ public static unsafe class ImGuiRender
             return 0;
         }
     }
-
+    
     private static void InitImGui(IntPtr display, IntPtr surface)
     {
         if (_initialized) return;
         GL.LoadBindings(new GLESBindingsContext());
         Logger.Error(nameof(ImGuiRender), "Initializing ImGui with official backends...");
-
+        
         if (TryGetViewportSize(out var width, out var height))
             Logger.Error(nameof(ImGuiRender), $"Viewport size: {width}x{height}");
-
+        
         // 创建 ImGui 上下文
         ImGui.CreateContext();
-
+        
         var io = ImGui.GetIO();
         io.ConfigFlags |= ImGuiConfigFlags.NavEnableKeyboard;
-
+        
         // 设置缩放
         io.FontGlobalScale = 3.0f;
-
+        
         AndroidImGuiFontLoader.EnsureLoaded(io);
-
+        
         // 设置样式
         var style = ImGui.GetStyle();
         style.ScaleAllSizes(2.0f);

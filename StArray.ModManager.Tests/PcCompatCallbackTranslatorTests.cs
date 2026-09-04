@@ -14,7 +14,7 @@ public class PcCompatCallbackTranslatorTests
 
         Assert.That(
             translation.FormatVersion,
-            Is.EqualTo("callback-translation-v8-editor-rabbit-writeback"));
+            Is.EqualTo("callback-translation-v9-managed-only-catalog"));
         Assert.That(translation.Items, Has.Count.EqualTo(49));
         Assert.That(translation.Rules, Has.Count.EqualTo(32));
         Assert.That(translation.TranslatedCount, Is.EqualTo(31));
@@ -165,7 +165,7 @@ public class PcCompatCallbackTranslatorTests
             Assert.That(File.Exists(auditPath), Is.True);
             Assert.That(
                 File.ReadAllText(auditPath),
-                Does.Contain("\"formatVersion\": \"callback-translation-v8-editor-rabbit-writeback\""));
+                Does.Contain("\"formatVersion\": \"callback-translation-v9-managed-only-catalog\""));
             Assert.That(File.ReadAllText(bundle!.RulesPath), Does.Contain("translator:fixed-op-v2:JipperResourcePack.Main.OnGameStop"));
         }
         finally

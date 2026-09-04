@@ -122,7 +122,11 @@ public sealed unsafe class ImGuiEGLRenderer : IImGuiRenderer
         ImGuiInputHandler.RegisterImeCallbacks();
         try
         {
-            EglHooks.InstallHooks();
+            if (!EglHooks.InstallHooks())
+            {
+                Logger.Error(nameof(ImGuiEGLRenderer), "EGL hook install returned false");
+                return false;
+            }
         }
         catch (Exception ex)
         {
@@ -207,12 +211,16 @@ public sealed unsafe class ImGuiEGLRenderer : IImGuiRenderer
             if (!self.TryGetViewportSize(out var width, out var height))
                 return EglHooks.CallOriginal(display, surface);
 
+            AndroidImGuiFontLoader.EnsureLoaded(
+                ImGui.GetIO(),
+                ImGuiImplOpenGL3.RecreateFontsTexture);
             ImGuiImplOpenGL3.NewFrame();
             self.UpdatePlatformFrame(width, height);
             ImGuiImplAndroid.DrainForwardedMotionEvents();
 
             ImGui.NewFrame();
             frameOpen = true;
+            ImGuiInputHandler.BeginImeFrame();
 
             // 构建 UI
             self.BuildUI();

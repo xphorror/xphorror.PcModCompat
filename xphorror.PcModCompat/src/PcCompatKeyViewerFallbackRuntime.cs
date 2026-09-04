@@ -7,6 +7,7 @@ public sealed class PcCompatKeyViewerFallbackFrame
 {
     public required string ModId { get; init; }
     public required string FeatureId { get; init; }
+    public long SessionGeneration { get; internal set; }
     public bool Visible { get; internal set; }
     public int LaneCount { get; internal set; }
     public uint HeldMask { get; internal set; }
@@ -80,11 +81,14 @@ public static class PcCompatKeyViewerFallbackRuntime
         string modId,
         PcCompatKeyViewerAdapterDocument adapter,
         PcCompatKeyViewerOverrideDocument overrides,
-        IReadOnlyList<PcCompatKeyViewerLoweredConsumerPlan>? presentationPlans = null)
+        IReadOnlyList<PcCompatKeyViewerLoweredConsumerPlan>? presentationPlans = null,
+        long sessionGeneration = 0)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(modId);
         ArgumentNullException.ThrowIfNull(adapter);
         ArgumentNullException.ThrowIfNull(overrides);
+        if (sessionGeneration < 0)
+            throw new ArgumentOutOfRangeException(nameof(sessionGeneration));
         var features = new List<FeatureConfig>();
         foreach (var featureOverride in overrides.Features)
         {
@@ -120,9 +124,11 @@ public static class PcCompatKeyViewerFallbackRuntime
             return;
         }
         var featureArray = features.ToArray();
-        var added = Registrations.TryAdd(modId, new Registration(modId, featureArray));
+        var added = Registrations.TryAdd(
+            modId,
+            new Registration(modId, sessionGeneration, featureArray));
         if (!added)
-            Registrations[modId] = new Registration(modId, featureArray);
+            Registrations[modId] = new Registration(modId, sessionGeneration, featureArray);
         PublishRegistrations();
         NotifyDemandChanged();
     }
@@ -186,10 +192,12 @@ public static class PcCompatKeyViewerFallbackRuntime
         private readonly FeatureRuntime[] _features;
         private readonly PcCompatKeyViewerFallbackFeatureBuffer[] _featureBuffers;
 
-        public Registration(string modId, FeatureConfig[] features)
+        public Registration(string modId, long sessionGeneration, FeatureConfig[] features)
         {
             ModId = modId;
-            _features = features.Select(feature => new FeatureRuntime(modId, feature)).ToArray();
+            _features = features
+                .Select(feature => new FeatureRuntime(modId, sessionGeneration, feature))
+                .ToArray();
             _featureBuffers = _features.Select(feature => feature.Buffer).ToArray();
         }
 
@@ -246,7 +254,7 @@ public static class PcCompatKeyViewerFallbackRuntime
         private readonly string[] _externalLabels;
         private PcCompatKeyViewerInputMode _inputMode = PcCompatKeyViewerInputMode.Auto;
 
-        public FeatureRuntime(string modId, FeatureConfig config)
+        public FeatureRuntime(string modId, long sessionGeneration, FeatureConfig config)
         {
             _configuredLaneCount = config.LaneCount;
             _touchLabels = config.TouchLabels;
@@ -258,6 +266,7 @@ public static class PcCompatKeyViewerFallbackRuntime
             {
                 ModId = modId,
                 FeatureId = config.FeatureId,
+                SessionGeneration = sessionGeneration,
                 Visible = true,
                 LaneCount = config.LaneCount,
                 Labels = new string[config.LaneCount],

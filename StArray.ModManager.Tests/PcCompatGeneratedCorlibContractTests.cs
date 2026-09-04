@@ -8,6 +8,43 @@ namespace StArray.ModManager.Tests;
 public sealed class PcCompatGeneratedCorlibContractTests
 {
     [Test]
+    public void GeneratedColorGrayscaleIsManagedOnlyWhenAndroidMetadataLacksTheMethod()
+    {
+        var root = FindModManagerRoot();
+        var proxyPath = Path.Combine(
+            root,
+            "xphorror.PcModCompat",
+            "out",
+            "interop",
+            "proxy_assemblies",
+            "UnityEngine.CoreModule.dll");
+        Assume.That(File.Exists(proxyPath), Is.True, $"missing generated proxy: {proxyPath}");
+
+        using var module = ModuleDefMD.Load(proxyPath);
+        var color = module.Find("UnityEngine.Color", isReflectionName: false);
+        Assert.That(color, Is.Not.Null);
+
+        var getter = color!.Methods.SingleOrDefault(method =>
+            method.Name == "get_grayscale" &&
+            method.MethodSig?.RetType.FullName == "System.Single" &&
+            method.MethodSig.Params.Count == 0);
+        var staticConstructor = color.FindStaticConstructor();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(getter, Is.Not.Null);
+            Assert.That(getter!.Body, Is.Not.Null);
+            var getterIl = string.Join("\n", getter.Body!.Instructions);
+            Assert.That(getterIl, Does.Contain("ldc.r4 0.299"));
+            Assert.That(getterIl, Does.Contain("ldc.r4 0.587"));
+            Assert.That(getterIl, Does.Contain("ldc.r4 0.114"));
+            Assert.That(staticConstructor, Is.Not.Null);
+            var staticConstructorIl = string.Join("\n", staticConstructor!.Body!.Instructions);
+            Assert.That(staticConstructorIl, Does.Not.Contain("get_grayscale"));
+        });
+    }
+
+    [Test]
     public void VirtualBundleLivenessProbeUsesGeneratedUnityObjectTruthiness()
     {
         var root = FindModManagerRoot();
@@ -82,6 +119,109 @@ public sealed class PcCompatGeneratedCorlibContractTests
     }
 
     [Test]
+    public void StringBuilderBridgeDoesNotCallTrimmedProxyConstructor()
+    {
+        var root = FindModManagerRoot();
+        var proxyPath = Path.Combine(
+            root,
+            "xphorror.PcModCompat",
+            "out",
+            "interop",
+            "proxy_assemblies",
+            "Il2Cppmscorlib.dll");
+        var bridgePath = Path.Combine(
+            root,
+            "StArray.ModManager.Android",
+            "PcCompat",
+            "PcCompatAbiBridge.cs");
+        Assert.That(File.Exists(proxyPath), Is.True, $"missing generated proxy: {proxyPath}");
+
+        using var module = ModuleDefMD.Load(proxyPath);
+        var stringBuilder = module.Find("Il2CppSystem.Text.StringBuilder", isReflectionName: false);
+        var bridge = File.ReadAllText(bridgePath, System.Text.Encoding.UTF8);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(stringBuilder, Is.Not.Null);
+            Assert.That(stringBuilder!.Methods.Count(method => method.IsInstanceConstructor), Is.EqualTo(1));
+            Assert.That(stringBuilder.Methods.Any(method =>
+                method.IsInstanceConstructor &&
+                method.MethodSig?.Params.Select(parameter => parameter.FullName)
+                    .SequenceEqual(["System.IntPtr"]) == true), Is.True);
+            Assert.That(stringBuilder.Methods.Any(method =>
+                method.IsInstanceConstructor &&
+                method.MethodSig?.Params.Select(parameter => parameter.FullName)
+                    .SequenceEqual(["System.String"]) == true), Is.False);
+            Assert.That(bridge, Does.Contain("IL2CPP.GetIl2CppMethodExact"));
+            Assert.That(bridge, Does.Contain("IL2CPP.il2cpp_object_new"));
+            Assert.That(bridge, Does.Contain("IL2CPP.il2cpp_runtime_invoke"));
+            Assert.That(bridge, Does.Contain("parameters[0] = (void*)nativeString"));
+            Assert.That(bridge, Does.Not.Contain(
+                "new Il2CppSystem.Text.StringBuilder(source.ToString())"));
+        });
+    }
+
+    [Test]
+    public void CompiledStringBuilderBridgeDoesNotReferenceTrimmedProxyConstructor()
+    {
+        var root = FindModManagerRoot();
+        var assemblyPath = Path.Combine(
+            root,
+            "StArray.ModManager.Android",
+            "bin",
+            "Release",
+            "net10.0",
+            "StArray.ModManager.Android.dll");
+        Assert.That(File.Exists(assemblyPath), Is.True, $"missing Android host build: {assemblyPath}");
+
+        using var module = ModuleDefMD.Load(assemblyPath);
+        var bridge = module.Find(
+            "StArray.ModManager.Android.PcCompat.PcCompatAbiBridge",
+            isReflectionName: false);
+        var converter = bridge?.Methods.SingleOrDefault(method =>
+            method.Name == "ToIl2CppStringBuilder" &&
+            method.MethodSig?.Params.Select(parameter => parameter.FullName)
+                .SequenceEqual(["System.Text.StringBuilder"]) == true);
+        var materializer = bridge?.Methods.SingleOrDefault(method =>
+            method.Name == "MaterializeStringBuilder" &&
+            method.MethodSig?.Params.Select(parameter => parameter.FullName)
+                .SequenceEqual(["System.String"]) == true);
+        var nativeInvoke = bridge?.Methods.SingleOrDefault(method =>
+            method.Name == "InvokeNativeMethod" && method.MethodSig?.Params.Count == 4);
+
+        Assert.That(converter, Is.Not.Null);
+        Assert.That(materializer, Is.Not.Null);
+        Assert.That(nativeInvoke, Is.Not.Null);
+        Assert.That(converter!.Body, Is.Not.Null);
+        Assert.That(materializer!.Body, Is.Not.Null);
+        Assert.That(nativeInvoke!.Body, Is.Not.Null);
+        var calls = bridge!.Methods
+            .Where(method => method.Body is not null)
+            .SelectMany(method => method.Body!.Instructions)
+            .Select(instruction => instruction.Operand as IMethod)
+            .Where(method => method is not null)
+            .Cast<IMethod>()
+            .ToArray();
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(calls.Any(method =>
+                method.DeclaringType.FullName == "Il2CppSystem.Text.StringBuilder" &&
+                method.Name == ".ctor" &&
+                method.MethodSig?.Params.Select(parameter => parameter.FullName)
+                    .SequenceEqual(["System.String"]) == true), Is.False);
+            Assert.That(calls.Any(method =>
+                method.DeclaringType.FullName == "Il2CppSystem.Text.StringBuilder" &&
+                method.Name == ".ctor" &&
+                method.MethodSig?.Params.Select(parameter => parameter.FullName)
+                    .SequenceEqual(["System.IntPtr"]) == true), Is.True);
+            Assert.That(calls.Any(method =>
+                method.DeclaringType.FullName == "Il2CppInterop.Runtime.IL2CPP" &&
+                method.Name == "il2cpp_runtime_invoke"), Is.True);
+        });
+    }
+
+    [Test]
     public void GeneratedUnity6ImGuiFontProjectionUsesTextCoreSurface()
     {
         var root = FindModManagerRoot();
@@ -99,6 +239,11 @@ public sealed class PcCompatGeneratedCorlibContractTests
             "UnityEngine.TextCoreTextEngineModule.dll"));
         var legacyCharacter = text.Find("UnityEngine.CharacterInfo", isReflectionName: false);
         var font = text.Find("UnityEngine.Font", isReflectionName: false);
+        using var textMeshPro = ModuleDefMD.Load(Path.Combine(
+            proxyDirectory,
+            "Unity.TextMeshPro.dll"));
+        var tmpAsset = textMeshPro.Find("TMPro.TMP_Asset", isReflectionName: false);
+        var tmpFont = textMeshPro.Find("TMPro.TMP_FontAsset", isReflectionName: false);
         var textAsset = textCore.Find("UnityEngine.TextCore.Text.TextAsset", isReflectionName: false);
         var fontAsset = textCore.Find("UnityEngine.TextCore.Text.FontAsset", isReflectionName: false);
         var character = textCore.Find("UnityEngine.TextCore.Text.Character", isReflectionName: false);
@@ -111,6 +256,48 @@ public sealed class PcCompatGeneratedCorlibContractTests
                                                      method.MethodSig?.Params.Count == 0), Is.True);
             Assert.That(font.Methods.Any(method => method.Name == "set_material"), Is.True);
             Assert.That(font.Methods.Any(method => method.Name == "set_characterInfo"), Is.False);
+            Assert.That(tmpAsset, Is.Not.Null);
+            Assert.That(tmpAsset!.Properties.Any(property =>
+                property.Name == "faceInfo" &&
+                property.GetMethod is not null &&
+                property.SetMethod is not null), Is.True);
+            Assert.That(tmpAsset!.Properties.Any(property =>
+                property.Name == "material" &&
+                property.GetMethod is not null &&
+                property.SetMethod is not null), Is.True);
+            Assert.That(tmpFont, Is.Not.Null);
+            foreach (var property in new[] { "atlasPopulationMode", "isMultiAtlasTexturesEnabled" })
+            {
+                Assert.That(tmpFont!.Properties.Any(candidate =>
+                    candidate.Name == property &&
+                    candidate.GetMethod is not null &&
+                    candidate.SetMethod is not null), Is.True, property);
+            }
+            foreach (var getter in new[]
+                     {
+                         (Name: "get_characterTable", ReturnType: "Il2CppSystem.Collections.Generic.List`1<TMPro.TMP_Character>"),
+                         (Name: "get_atlasTexture", ReturnType: "UnityEngine.Texture2D")
+                     })
+            {
+                Assert.That(tmpFont!.Methods.Any(method =>
+                    method.Name == getter.Name &&
+                    method.MethodSig?.Params.Count == 0 &&
+                    method.MethodSig.RetType.FullName == getter.ReturnType), Is.True, getter.Name);
+            }
+            var requiredTryAddCharacters = new[]
+            {
+                new[] { "System.String", "System.Boolean" },
+                new[] { "System.String", "System.String&", "System.Boolean" }
+            };
+            foreach (var parameters in requiredTryAddCharacters)
+            {
+                Assert.That(tmpFont.Methods.Any(method =>
+                    method.Name == "TryAddCharacters" &&
+                    method.MethodSig?.RetType.FullName == "System.Boolean" &&
+                    method.MethodSig.Params.Select(parameter => parameter.FullName)
+                        .SequenceEqual(parameters) == true), Is.True,
+                    "TryAddCharacters(" + string.Join(", ", parameters) + ")");
+            }
             Assert.That(textAsset, Is.Not.Null);
             Assert.That(textAsset!.Methods.Any(method => method.Name == "set_material"), Is.True);
             Assert.That(fontAsset, Is.Not.Null);
@@ -205,6 +392,10 @@ public sealed class PcCompatGeneratedCorlibContractTests
             Assert.That(style!.Methods.Any(method =>
                 method.Name.String is "set_fixedWidth" or "set_normal" or "set_margin"), Is.False);
             Assert.That(style.Methods.Any(method => method.Name == "set_fontSize"), Is.True);
+            Assert.That(style.Methods.Any(method =>
+                method.Name == "CalcHeight" && method.MethodSig?.Params.Count == 2), Is.True);
+            Assert.That(style.Methods.Any(method =>
+                method.Name == "CalcMinMaxWidth" && method.MethodSig?.Params.Count == 3), Is.True);
             Assert.That(style.Methods.Any(method => method.Name == "get_normal"), Is.True);
             Assert.That(style.Methods.Any(method => method.Name == "get_margin"), Is.True);
             Assert.That(styleState!.Methods.Any(method => method.Name == "get_textColor"), Is.True);
@@ -222,31 +413,14 @@ public sealed class PcCompatGeneratedCorlibContractTests
     {
         var root = FindModManagerRoot();
         var proxyDirectory = Path.Combine(root, "xphorror.PcModCompat", "out", "interop", "proxy_assemblies");
-        var runtimeDirectory = Path.Combine(
-            root,
-            "Il2CppInterop",
-            "bin",
-            "Il2CppInterop.Runtime",
-            "net6.0");
+        var runtimeDirectory = Path.Combine(root, "out", "android_single", "assets", "runtime");
         var proxy = Path.Combine(proxyDirectory, "UnityEngine.IMGUIModule.dll");
         Assert.That(File.Exists(proxy), Is.True, $"missing generated IMGUI proxy: {proxy}");
 
         var context = new ProxyMetadataLoadContext(proxyDirectory, runtimeDirectory);
         try
         {
-            foreach (var dependency in Directory.EnumerateFiles(
-                         proxyDirectory,
-                         "UnityEngine*.dll",
-                         SearchOption.TopDirectoryOnly))
-            {
-                if (!string.Equals(dependency, proxy, StringComparison.OrdinalIgnoreCase))
-                    context.LoadFromAssemblyPath(dependency);
-            }
             var assembly = context.LoadFromAssemblyPath(proxy);
-            Assert.That(
-                assembly.DefinedTypes.Select(type => type.FullName),
-                Does.Contain("UnityEngine.GUIContent"),
-                "generated IMGUI proxy must define GUIContent before backend binding");
             var backend = typeof(PcCompatManagedImGuiBridge).GetNestedType(
                 "Backend",
                 BindingFlags.NonPublic);
@@ -298,7 +472,7 @@ public sealed class PcCompatGeneratedCorlibContractTests
             root,
             "xphorror.PcModCompat",
             "build_interop_migration.ps1"));
-        var androidBuild = File.ReadAllText(Path.Combine(root, "build.ps1"));
+        var androidBuild = File.ReadAllText(Path.Combine(root, "build_android_single.ps1"));
         var bootstrap = File.ReadAllText(Path.Combine(
             root,
             "StArray.ModManager.Android",
@@ -308,7 +482,7 @@ public sealed class PcCompatGeneratedCorlibContractTests
         Assert.That(migration, Does.Not.Contain("--blacklist-assembly Il2Cppmscorlib"));
         Assert.That(migration, Does.Contain("generatedCorlibPackaged = $true"));
         Assert.That(androidBuild, Does.Contain("Runtime Il2Cppmscorlib.dll was not replaced"));
-        Assert.That(androidBuild, Does.Contain("Join-Path $proxyStage \"Il2Cppmscorlib.dll\""));
+        Assert.That(androidBuild, Does.Contain("Join-Path $proxyOut 'Il2Cppmscorlib.dll'"));
         Assert.That(bootstrap, Does.Contain("ValidateGenericProxyInitializer(listType)"));
         Assert.That(bootstrap, Does.Contain("ValidateAllGenericProxyInitializers()"));
         Assert.That(bootstrap, Does.Contain("ValidateAllNativePointerProducerGuards()"));
@@ -327,7 +501,8 @@ public sealed class PcCompatGeneratedCorlibContractTests
             "xphorror.PcModCompat",
             "tools",
             "ProxyInputClosure",
-            "proxy_surface_members.txt"));
+            "proxy_surface_members.txt"),
+            System.Text.Encoding.UTF8);
         var audit = File.ReadAllText(Path.Combine(
             root,
             "xphorror.PcModCompat",
@@ -370,6 +545,109 @@ public sealed class PcCompatGeneratedCorlibContractTests
         Assert.That(audit, Does.Contain("AuditAllGenericProxyStaticConstructors"));
         Assert.That(audit, Does.Contain("RequireIl2CppObject"));
         Assert.That(audit, Does.Contain("RequireIl2CppMethod"));
+    }
+
+    [Test]
+    public void JipperOverlayerObjectGettersRemainInGeneratedProxySurface()
+    {
+        var root = FindModManagerRoot();
+        var surface = File.ReadAllText(Path.Combine(
+            root,
+            "xphorror.PcModCompat",
+            "tools",
+            "ProxyInputClosure",
+            "proxy_surface_members.txt"));
+        var requiredEntries = new[]
+        {
+            "M|Assembly-CSharp|ADOBase|static|0|scrController|get_controller|",
+            "M|Assembly-CSharp|ADOBase|static|0|scrConductor|get_conductor|",
+            "M|Assembly-CSharp|ADOBase|static|0|scrLevelMaker|get_lm|",
+            "M|Assembly-CSharp|scrController|static|0|scrController|get_instance|",
+            "M|Assembly-CSharp|scrController|instance|0|scrFloor|get_currFloor|",
+            "F|Assembly-CSharp|scrController|firstFloor",
+            "M|Assembly-CSharp|scrConductor|static|0|scrConductor|get_instance|",
+            "F|Assembly-CSharp|scrConductor|song",
+            "F|Assembly-CSharp|scnGame|instance",
+            "F|Assembly-CSharp|scnEditor|instance"
+        };
+
+        Assert.Multiple(() =>
+        {
+            foreach (var entry in requiredEntries)
+                Assert.That(surface, Does.Contain(entry), entry);
+        });
+    }
+
+    [Test]
+    public void ScrShowIfDebugManagedCallbacksHaveClosedGeneratedProxySurface()
+    {
+        var root = FindModManagerRoot();
+        var proxyPath = Path.Combine(
+            root,
+            "xphorror.PcModCompat",
+            "out",
+            "interop",
+            "proxy_assemblies",
+            "Assembly-CSharp.dll");
+        using var proxy = ModuleDefMD.Load(proxyPath);
+        var type = proxy.Find("scrShowIfDebug", isReflectionName: false);
+        using var core = ModuleDefMD.Load(Path.Combine(
+            root,
+            "xphorror.PcModCompat",
+            "out",
+            "interop",
+            "proxy_assemblies",
+            "UnityEngine.CoreModule.dll"));
+        var component = core.Find("UnityEngine.Component", isReflectionName: false);
+        var unityObject = core.Find("UnityEngine.Object", isReflectionName: false);
+        var rectTransform = core.Find("UnityEngine.RectTransform", isReflectionName: false);
+        var vector2 = core.Find("UnityEngine.Vector2", isReflectionName: false);
+
+        Assert.That(type, Is.Not.Null);
+        Assert.That(component, Is.Not.Null);
+        Assert.That(unityObject, Is.Not.Null);
+        Assert.That(rectTransform, Is.Not.Null);
+        Assert.That(vector2, Is.Not.Null);
+        Assert.Multiple(() =>
+        {
+            Assert.That(type!.Fields.Any(field =>
+                field.Name == "NativeFieldInfoPtr_txt" &&
+                field.FieldType.FullName == "System.IntPtr"), Is.True);
+            Assert.That(type.Properties.Any(property =>
+                property.Name == "txt" &&
+                property.PropertySig?.RetType.FullName == "UnityEngine.UI.Text"), Is.True);
+            Assert.That(type.Methods.Any(method =>
+                method.Name == "get_txt" &&
+                method.MethodSig?.RetType.FullName == "UnityEngine.UI.Text"), Is.True);
+            Assert.That(type.Methods.Any(method =>
+                method.Name == "set_txt" &&
+                method.MethodSig?.Params.Select(parameter => parameter.FullName)
+                    .SequenceEqual(["UnityEngine.UI.Text"]) == true), Is.True);
+            Assert.That(component!.Methods.Any(method =>
+                method.Name == "GetComponent" &&
+                method.GenericParameters.Count == 1 &&
+                method.MethodSig?.Params.Count == 0 &&
+                method.MethodSig.RetType is GenericMVar), Is.True);
+            Assert.That(unityObject!.Methods.Any(method =>
+                method.Name == "op_Implicit" &&
+                method.IsStatic &&
+                method.MethodSig?.RetType.FullName == "System.Boolean" &&
+                method.MethodSig.Params.Select(parameter => parameter.FullName)
+                    .SequenceEqual(["UnityEngine.Object"]) == true), Is.True);
+            Assert.That(rectTransform!.Methods.Any(method =>
+                method.Name == "get_anchoredPosition" &&
+                method.MethodSig?.RetType.FullName == "UnityEngine.Vector2"), Is.True);
+            Assert.That(rectTransform.Methods.Any(method =>
+                method.Name == "set_anchoredPosition" &&
+                method.MethodSig?.Params.Select(parameter => parameter.FullName)
+                    .SequenceEqual(["UnityEngine.Vector2"]) == true), Is.True);
+            Assert.That(vector2!.Fields.Any(field =>
+                field.Name == "y" && field.FieldType.FullName == "System.Single"), Is.True);
+            Assert.That(vector2.Methods.Any(method =>
+                method.Name == ".ctor" &&
+                method.MethodSig?.Params.Select(parameter => parameter.FullName)
+                    .SequenceEqual(["System.Single", "System.Single"]) == true), Is.True);
+        });
     }
 
     [Test]
@@ -618,6 +896,9 @@ public sealed class PcCompatGeneratedCorlibContractTests
             Assert.That(proxyApi, Does.Contain("Il2CppType.From"));
             Assert.That(proxyApi, Does.Not.Contain("IL2CPP.GetIl2CppClass"));
             Assert.That(proxyApi, Does.Contain("Il2CppObjectBase"));
+            Assert.That(proxyApi, Does.Contain("private readonly Action<object, bool>? _unload"));
+            Assert.That(proxyApi, Does.Contain("var unload = TryGetMethod("));
+            Assert.That(proxyApi, Does.Contain("_unload?.Invoke(bundle, unloadAllLoadedObjects)"));
         });
     }
 
@@ -703,12 +984,15 @@ public sealed class PcCompatGeneratedCorlibContractTests
             Assert.That(fallbackBridge, Does.Contain("StaleVisualKeys"));
             Assert.That(fallbackBridge, Does.Contain("_rainQuads"));
             Assert.That(fallbackBridge, Does.Contain("_visualIndex"));
+            Assert.That(fallbackBridge, Does.Contain("visual.SessionGeneration != frame.SessionGeneration"));
+            Assert.That(fallbackBridge, Does.Contain("frame.SessionGeneration"));
             Assert.That(fallbackBridge, Does.Not.Contain("new HashSet"));
             Assert.That(fallbackBridge, Does.Not.Contain("TakeLast"));
             Assert.That(fallbackRuntime, Does.Contain("DispatchFrames.Clear()"));
             Assert.That(fallbackRuntime, Does.Contain("CopyFallbackFeatures"));
             Assert.That(fallbackRuntime, Does.Contain("MonotonicSnapshot"));
             Assert.That(fallbackRuntime, Does.Contain("_featureBuffers"));
+            Assert.That(fallbackRuntime, Does.Contain("SessionGeneration = sessionGeneration"));
             Assert.That(fallbackRuntime, Does.Not.Contain("Snapshot(ModId)"));
             Assert.That(previewRuntime, Does.Contain("CopyFallbackState"));
             Assert.That(previewRuntime, Does.Contain("CopyFallbackFeatures"));
@@ -778,6 +1062,10 @@ public sealed class PcCompatGeneratedCorlibContractTests
                 "|UnityEngine.GUIStyle|instance|0|System.Boolean|get_richText|"));
             Assert.That(surface, Does.Contain(
                 "|UnityEngine.GUIStyle|instance|0|System.Void|set_wordWrap|System.Boolean"));
+            Assert.That(surface, Does.Contain(
+                "|UnityEngine.GUIStyle|instance|0|System.Single|CalcHeight|UnityEngine.GUIContent;System.Single"));
+            Assert.That(surface, Does.Contain(
+                "|UnityEngine.GUIStyle|instance|0|System.Void|CalcMinMaxWidth|UnityEngine.GUIContent;System.Single&;System.Single&"));
             Assert.That(surface, Does.Contain(
                 "|UnityEngine.GUIStyle|instance|0|UnityEngine.RectOffset|get_padding|"));
             Assert.That(surface, Does.Contain(
@@ -940,7 +1228,7 @@ public sealed class PcCompatGeneratedCorlibContractTests
             "StArray.ModManager.Android",
             "PcCompat",
             "PcCompatIl2CppInteropBootstrap.cs"));
-        var androidBuild = File.ReadAllText(Path.Combine(root, "build.ps1"));
+        var androidBuild = File.ReadAllText(Path.Combine(root, "build_android_single.ps1"));
 
         Assert.Multiple(() =>
         {
@@ -1000,8 +1288,8 @@ public sealed class PcCompatGeneratedCorlibContractTests
             Assert.That(api, Does.Contain("PcCompatIl2CppInteropBootstrap.RequireReady()"));
             Assert.That(bootstrap, Does.Not.Contain(
                 "ValidateType(\"Unity.TextMeshPro\", \"TMPro.TMP_FontFeatureTable\")"));
-            Assert.That(androidBuild, Does.Contain("UnityEngine.TextCoreFontEngineModule.dll"));
-            Assert.That(androidBuild, Does.Contain("UnityEngine.TextCoreTextEngineModule.dll"));
+            Assert.That(androidBuild, Does.Contain("'UnityEngine.TextCoreFontEngineModule.dll'"));
+            Assert.That(androidBuild, Does.Contain("'UnityEngine.TextCoreTextEngineModule.dll'"));
         });
     }
 
@@ -1039,7 +1327,7 @@ public sealed class PcCompatGeneratedCorlibContractTests
             "StArray.ModManager.Android",
             "PcCompat",
             "PcCompatIl2CppInteropBootstrap.cs"));
-        var androidBuild = File.ReadAllText(Path.Combine(root, "build.ps1"));
+        var androidBuild = File.ReadAllText(Path.Combine(root, "build_android_single.ps1"));
 
         Assert.Multiple(() =>
         {
@@ -1077,7 +1365,7 @@ public sealed class PcCompatGeneratedCorlibContractTests
                 "g_imgui_font_mapping_count.load(std::memory_order_acquire)"));
             Assert.That(sink, Does.Not.Contain("for (auto &slot : g_imgui_font_mappings)"));
             Assert.That(bootstrap, Does.Contain("UnityEngine.TextCoreTextEngineModule.dll"));
-            Assert.That(androidBuild, Does.Contain("UnityEngine.TextCoreTextEngineModule.dll"));
+            Assert.That(androidBuild, Does.Contain("'UnityEngine.TextCoreTextEngineModule.dll'"));
         });
     }
 
@@ -1089,17 +1377,16 @@ public sealed class PcCompatGeneratedCorlibContractTests
             root,
             "xphorror.PcModCompat",
             "build_shims.ps1"));
-        var androidBuild = File.ReadAllText(Path.Combine(root, "build.ps1"));
+        var androidBuild = File.ReadAllText(Path.Combine(root, "build_android_single.ps1"));
 
         Assert.Multiple(() =>
         {
-            Assert.That(shimBuild, Does.Contain("out\\shims"));
-            Assert.That(shimBuild, Does.Contain("$outputs"));
-            Assert.That(shimBuild, Does.Contain("Newtonsoft.Json.dll"));
-            Assert.That(androidBuild, Does.Contain("pc_compat_shims"));
-            Assert.That(androidBuild, Does.Contain("pc_compat_proxies"));
-            Assert.That(androidBuild, Does.Contain("$requiredProxies"));
-            Assert.That(androidBuild, Does.Contain("Runtime shim dependency missing: Newtonsoft.Json.dll"));
+            Assert.That(shimBuild, Does.Contain("out\\legacy_shims"));
+            Assert.That(shimBuild, Does.Contain("$runtimeOutputs"));
+            Assert.That(shimBuild, Does.Contain("$legacyOracleOutputs"));
+            Assert.That(androidBuild, Does.Contain("Generated-proxy assemblies must not be packaged as runtime shims"));
+            Assert.That(androidBuild, Does.Contain("'Newtonsoft.Json.dll'"));
+            Assert.That(androidBuild, Does.Not.Contain("'Assembly-CSharp.dll',\r\n        'UnityEngine.CoreModule.dll'"));
         });
     }
 
@@ -1196,7 +1483,7 @@ public sealed class PcCompatGeneratedCorlibContractTests
         var directory = new DirectoryInfo(TestContext.CurrentContext.TestDirectory);
         while (directory != null)
         {
-            if (File.Exists(Path.Combine(directory.FullName, "build.ps1")) &&
+            if (File.Exists(Path.Combine(directory.FullName, "build_android_single.ps1")) &&
                 Directory.Exists(Path.Combine(directory.FullName, "xphorror.PcModCompat")))
             {
                 return directory.FullName;

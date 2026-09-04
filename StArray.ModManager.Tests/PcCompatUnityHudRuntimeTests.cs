@@ -16,6 +16,15 @@ public sealed class PcCompatUnityHudRuntimeTests
         }
     }
 
+    private sealed class ThrowingSource : IPcCompatUnityHudSource
+    {
+        public bool TryGetUnityHudFrame(out PcCompatUnityHudFrame frame)
+        {
+            frame = null!;
+            throw new InvalidOperationException("source failed");
+        }
+    }
+
     [TearDown]
     public void TearDown()
     {
@@ -89,7 +98,7 @@ public sealed class PcCompatUnityHudRuntimeTests
     }
 
     [Test]
-    public void MostRecentlyRegisteredVisibleSourceWinsWithoutIdentityRules()
+    public void LegacyFrameSelectionKeepsMostRecentlyRegisteredVisibleSource()
     {
         var hidden = new Source(new PcCompatUnityHudFrame { Visible = false, PlainText = "hidden" });
         var first = new Source(new PcCompatUnityHudFrame { Visible = true, PlainText = "first" });
@@ -106,5 +115,137 @@ public sealed class PcCompatUnityHudRuntimeTests
         PcCompatUnityHudRuntime.UnregisterSource(second);
         Assert.That(PcCompatUnityHudRuntime.TryGetFrame(out frame), Is.True);
         Assert.That(frame.PlainText, Is.EqualTo("first"));
+    }
+
+    [Test]
+    public void ExplicitOwnersPublishIndependentSnapshots()
+    {
+        var first = new Source(new PcCompatUnityHudFrame
+        {
+            ModId = "first",
+            Visible = true,
+            PlainText = "A"
+        });
+        var second = new Source(new PcCompatUnityHudFrame
+        {
+            ModId = "second",
+            Visible = true,
+            PlainText = "B"
+        });
+        _sources.AddRange(new[] { first, second });
+
+        PcCompatUnityHudRuntime.RegisterSource("owner-a", first);
+        PcCompatUnityHudRuntime.RegisterSource("owner-b", second);
+
+        var snapshots = PcCompatUnityHudRuntime.SnapshotSources();
+        Assert.Multiple(() =>
+        {
+            Assert.That(snapshots.Select(snapshot => snapshot.OwnerId),
+                Is.EqualTo(new[] { "owner-a", "owner-b" }));
+            Assert.That(snapshots[0].Frame?.PlainText, Is.EqualTo("A"));
+            Assert.That(snapshots[1].Frame?.PlainText, Is.EqualTo("B"));
+            Assert.That(snapshots.All(snapshot => snapshot.Error == null), Is.True);
+        });
+    }
+
+    [Test]
+    public void ExplicitOwnerSnapshotCarriesSessionGeneration()
+    {
+        var source = new Source(new PcCompatUnityHudFrame
+        {
+            ModId = "owner-a",
+            Visible = true
+        });
+        _sources.Add(source);
+
+        PcCompatUnityHudRuntime.RegisterSource("owner-a", 37, source);
+
+        var snapshot = PcCompatUnityHudRuntime.SnapshotSources().Single();
+        Assert.Multiple(() =>
+        {
+            Assert.That(snapshot.OwnerId, Is.EqualTo("owner-a"));
+            Assert.That(snapshot.SessionGeneration, Is.EqualTo(37));
+        });
+    }
+
+    [Test]
+    public void SourceFailureDoesNotBlockAnotherOwner()
+    {
+        var failed = new ThrowingSource();
+        var healthy = new Source(new PcCompatUnityHudFrame
+        {
+            Visible = true,
+            PlainText = "healthy"
+        });
+        _sources.AddRange(new IPcCompatUnityHudSource[] { failed, healthy });
+
+        PcCompatUnityHudRuntime.RegisterSource("failed", failed);
+        PcCompatUnityHudRuntime.RegisterSource("healthy", healthy);
+
+        var snapshots = PcCompatUnityHudRuntime.SnapshotSources();
+        Assert.Multiple(() =>
+        {
+            Assert.That(snapshots[0].OwnerId, Is.EqualTo("failed"));
+            Assert.That(snapshots[0].Error, Is.TypeOf<InvalidOperationException>());
+            Assert.That(snapshots[1].OwnerId, Is.EqualTo("healthy"));
+            Assert.That(snapshots[1].Frame?.PlainText, Is.EqualTo("healthy"));
+        });
+    }
+
+    [Test]
+    public void DuplicateOwnerRegistrationIsRejected()
+    {
+        var first = new Source(new PcCompatUnityHudFrame());
+        var second = new Source(new PcCompatUnityHudFrame());
+        _sources.AddRange(new[] { first, second });
+
+        PcCompatUnityHudRuntime.RegisterSource("same-owner", first);
+
+        Assert.That(
+            () => PcCompatUnityHudRuntime.RegisterSource("SAME-OWNER", second),
+            Throws.TypeOf<InvalidOperationException>());
+        Assert.That(PcCompatUnityHudRuntime.SnapshotSources(), Has.Count.EqualTo(1));
+    }
+
+    [Test]
+    public void RendererFailureIsQuarantinedPerOwner()
+    {
+        var first = new Source(new PcCompatUnityHudFrame());
+        var second = new Source(new PcCompatUnityHudFrame());
+        _sources.AddRange(new[] { first, second });
+        PcCompatUnityHudRuntime.RegisterSource("owner-a", first);
+        PcCompatUnityHudRuntime.RegisterSource("owner-b", second);
+        PcCompatUnityHudRuntime.RegisterRenderer();
+
+        PcCompatUnityHudRuntime.MarkSourceRendererFailed("owner-a");
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(PcCompatUnityHudRuntime.RendererAvailableFor("owner-a"), Is.False);
+            Assert.That(PcCompatUnityHudRuntime.RendererAvailableFor("owner-b"), Is.True);
+        });
+
+        PcCompatUnityHudRuntime.ClearSourceRendererFailure("owner-a");
+        Assert.That(PcCompatUnityHudRuntime.RendererAvailableFor("owner-a"), Is.True);
+    }
+
+    [Test]
+    public void UnregisterRemovesOnlyMatchingOwner()
+    {
+        var first = new Source(new PcCompatUnityHudFrame { PlainText = "A" });
+        var second = new Source(new PcCompatUnityHudFrame { PlainText = "B" });
+        _sources.AddRange(new[] { first, second });
+        PcCompatUnityHudRuntime.RegisterSource("owner-a", first);
+        PcCompatUnityHudRuntime.RegisterSource("owner-b", second);
+
+        PcCompatUnityHudRuntime.UnregisterSource(first);
+
+        var remaining = PcCompatUnityHudRuntime.SnapshotSources();
+        Assert.Multiple(() =>
+        {
+            Assert.That(remaining, Has.Count.EqualTo(1));
+            Assert.That(remaining[0].OwnerId, Is.EqualTo("owner-b"));
+            Assert.That(remaining[0].Frame?.PlainText, Is.EqualTo("B"));
+        });
     }
 }

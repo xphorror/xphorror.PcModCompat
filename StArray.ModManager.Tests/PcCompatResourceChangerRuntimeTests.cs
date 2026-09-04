@@ -10,6 +10,7 @@ public sealed class PcCompatResourceChangerRuntimeTests
     {
         PcCompatResourceChangerRuntime.ClearSettingsSink();
         PcCompatResourceChangerRuntime.Remove("JipperResourcePack");
+        PcCompatResourceChangerRuntime.Remove("SecondResourcePack");
     }
 
     [Test]
@@ -82,5 +83,44 @@ public sealed class PcCompatResourceChangerRuntimeTests
             PcCompatResourceChangerRuntime.TryRepublish("JipperResourcePack"),
             Is.True);
         Assert.That(published, Has.Count.EqualTo(2));
+    }
+
+    [Test]
+    public void DisablingOneOwnerDoesNotRemoveAnotherOwnersState()
+    {
+        var published = new List<PcCompatResourceChangerState>();
+        PcCompatResourceChangerRuntime.RegisterSettingsSink(published.Add);
+
+        Assert.That(PcCompatResourceChangerRuntime.TryApply(
+            "JipperResourcePack",
+            new PcCompatMobileSettings
+            {
+                ResourceChangerChangeRabbit = true,
+                ResourceChangerChangeBallColor = true
+            }), Is.True);
+        Assert.That(PcCompatResourceChangerRuntime.TryApply(
+            "SecondResourcePack",
+            new PcCompatMobileSettings
+            {
+                ResourceChangerChangeTileColor = true
+            }), Is.True);
+
+        Assert.That(PcCompatResourceChangerRuntime.TryDisable("SecondResourcePack"), Is.True);
+
+        Assert.Multiple(() =>
+        {
+            Assert.That(published, Has.Count.EqualTo(3));
+            Assert.That(published[^1].ModId, Is.EqualTo("SecondResourcePack"));
+            Assert.That(published[^1].ChangeRabbit, Is.False);
+            Assert.That(published[^1].ChangeBallColor, Is.False);
+            Assert.That(published[^1].ChangeTileColor, Is.False);
+            Assert.That(
+                PcCompatResourceChangerRuntime.TryGetState(
+                    "JipperResourcePack",
+                    out var jipper),
+                Is.True);
+            Assert.That(jipper.ChangeRabbit, Is.True);
+            Assert.That(jipper.ChangeBallColor, Is.True);
+        });
     }
 }

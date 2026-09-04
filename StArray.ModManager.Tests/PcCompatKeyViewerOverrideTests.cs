@@ -72,6 +72,60 @@ public sealed class PcCompatKeyViewerOverrideTests
     }
 
     [Test]
+    public void StaleFingerprintRebasePreservesSafeSettingsAndDropsUnknownRoles()
+    {
+        var previousAdapter = CreateAdapter(
+            packageSha256: new string('a', 64),
+            autoConfigurable: true);
+        var stale = PcCompatKeyViewerOverrideStore.CreateFor(previousAdapter);
+        var staleFeature = stale.Features.Single();
+        staleFeature.Enabled = true;
+        staleFeature.InputMode = PcCompatKeyViewerInputMode.Hybrid;
+        staleFeature.TouchLaneCount = 4;
+        staleFeature.CompatibleFallbackEnabled = true;
+        var retainedRole = previousAdapter.Features.Single().Roles.Single(role =>
+            role.Role == "BindingProvider");
+        staleFeature.Roles.Add(ToOverride(retainedRole));
+        staleFeature.Roles.Add(new PcCompatKeyViewerRoleOverride
+        {
+            Role = "InputListenerMethod",
+            AssemblyName = "Mod",
+            TypeName = "Removed.Listener",
+            MemberName = "Update",
+            MemberKind = "Method"
+        });
+
+        var currentAdapter = CreateAdapter(
+            packageSha256: new string('b', 64),
+            autoConfigurable: true);
+        var rebased = PcCompatKeyViewerOverrideStore.TryRebase(
+            stale,
+            currentAdapter,
+            out var current,
+            out var summary);
+
+        Assert.That(rebased, Is.True, summary);
+        Assert.That(current, Is.Not.Null);
+        var validation = PcCompatKeyViewerOverrideStore.Validate(current!, currentAdapter);
+        var currentFeature = current!.Features.Single();
+        Assert.Multiple(() =>
+        {
+            Assert.That(validation.IsValid, Is.True,
+                string.Join(Environment.NewLine, validation.Errors));
+            Assert.That(current.PackageSha256, Is.EqualTo(currentAdapter.PackageSha256));
+            Assert.That(currentFeature.Enabled, Is.True);
+            Assert.That(currentFeature.InputMode, Is.EqualTo(PcCompatKeyViewerInputMode.Hybrid));
+            Assert.That(currentFeature.TouchLaneCount, Is.EqualTo(4));
+            Assert.That(currentFeature.CompatibleFallbackEnabled, Is.True);
+            Assert.That(currentFeature.Roles, Has.Count.EqualTo(1));
+            Assert.That(currentFeature.Roles.Single().CandidateKey,
+                Is.EqualTo(ToOverride(retainedRole).CandidateKey));
+            Assert.That(summary, Does.Contain("retainedRoles=1"));
+            Assert.That(summary, Does.Contain("droppedRoles=1"));
+        });
+    }
+
+    [Test]
     public void TouchProjectionPreservesTouchIdentityAndSourceOrdering()
     {
         var adapter = CreateAdapter();

@@ -5,6 +5,15 @@ namespace UnityEngine.UI;
 public class Graphic : Behaviour
 {
     public Color color { get; set; } = Color.white;
+
+    /// <summary>
+    /// Declared so a MOD's mesh-generating subclass can <c>override</c> it, as the real one does. Kept
+    /// <c>protected virtual</c> to match the generated proxy: a subclass override is not publicly
+    /// callable, which is precisely the constraint the component bridge has to bind through.
+    /// </summary>
+    protected virtual void OnPopulateMesh(VertexHelper vh)
+    {
+    }
 }
 
 public class MaskableGraphic : Graphic;
@@ -26,6 +35,29 @@ public class Image : MaskableGraphic
 public class RawImage : MaskableGraphic
 {
     public Texture? texture { get; set; }
+}
+
+/// <summary>
+/// Compile-time stand-in for the generated <c>VertexHelper</c> proxy, so a MOD's
+/// <c>OnPopulateMesh(VertexHelper)</c> override has a type to name in the shim build.
+/// </summary>
+/// <remarks>
+/// Vertex submission is deliberately not modelled. <c>AddVert</c> takes a <c>UIVertex</c>, which the
+/// real proxy carries as a value type forwarded straight to IL2CPP; there is no way to observe the
+/// result of submitting one outside a device, so a shim overload would only invite tests that assert
+/// against the shim's own bookkeeping rather than Unity's.
+/// </remarks>
+public class VertexHelper
+{
+    public int currentVertCount => 0;
+
+    public void Clear()
+    {
+    }
+
+    public void AddTriangle(int index0, int index1, int index2)
+    {
+    }
 }
 
 public class CanvasScaler : Behaviour

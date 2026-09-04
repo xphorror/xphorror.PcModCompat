@@ -1,3 +1,6 @@
+using System.Runtime.InteropServices;
+using StArray.ModManager.RuntimeAbstractions;
+
 namespace StArray.ModManager.Runtime;
 
 /// <summary>
@@ -22,4 +25,122 @@ public interface IHook
     {
         return nint.Zero;
     }
+}
+
+/// <summary>
+/// Optional lifecycle control for platforms whose physical detours remain installed
+/// for the process lifetime. Operations apply only to layers owned by one MOD.
+/// </summary>
+public interface IOwnerScopedHook : IHook
+{
+    /// <summary>Whether the provider can bypass and retire owner layers independently.</summary>
+    bool SupportsOwnerControl { get; }
+
+    /// <summary>Temporarily enables or disables every non-retired layer for an owner.</summary>
+    bool SetOwnerEnabled(string owner, bool enabled);
+
+    /// <summary>Permanently retires the owner's layer(s) for one target.</summary>
+    bool RetireOwnerTarget(string owner, nint target);
+
+    /// <summary>Permanently retires every layer belonging to an owner.</summary>
+    int RetireOwner(string owner);
+
+    /// <summary>Returns the number of non-retired process-lifetime layers.</summary>
+    int GetRetainedLayerCount(string owner);
+}
+
+/// <summary>
+/// Optional lifecycle control that binds permanent native hook layers to one load generation.
+/// Owner-only methods remain available for host and legacy callers.
+/// </summary>
+public interface IGenerationScopedHook : IOwnerScopedHook
+{
+    bool SetOwnerGenerationEnabled(string owner, long generation, bool enabled);
+    bool RetireOwnerGenerationTarget(string owner, long generation, nint target);
+    int RetireOwnerGeneration(string owner, long generation);
+    int GetRetainedLayerCount(string owner, long generation);
+}
+
+/// <summary>Optional provider for explicit legacy-to-current native ABI adapters.</summary>
+public interface IRuntimeMethodCompatibilityHook
+{
+    bool SupportsCompatibility(RuntimeMethodCompatibilityKind kind);
+
+    nint HookCompatible(
+        nint target,
+        nint detour,
+        RuntimeMethodCompatibilityKind kind);
+}
+
+/// <summary>
+/// Optional provider contract for detours whose managed wrapper already participates in
+/// <see cref="ModRuntimeSession"/> callback quiescence. Providers use this marker to avoid
+/// treating source-generated hooks as untracked arbitrary-ABI callbacks.
+/// </summary>
+public interface IManagedCallbackGateAwareHook
+{
+    nint HookWithManagedCallbackGate(nint target, nint detour);
+
+    nint HookCompatibleWithManagedCallbackGate(
+        nint target,
+        nint detour,
+        RuntimeMethodCompatibilityKind kind);
+
+    int GetUntrackedCallbackLayerCount(string owner, long generation);
+}
+
+/// <summary>
+/// Opaque token shared with a private native worker. The cookie prevents a stale operation
+/// from completing a slot reused by another MOD generation.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct ModNativeOperationToken
+{
+    public uint AbiVersion;
+    public uint Slot;
+    public ulong OperationId;
+    public ulong Cookie;
+
+    public ModNativeOperationToken(
+        uint abiVersion,
+        uint slot,
+        ulong operationId,
+        ulong cookie)
+    {
+        AbiVersion = abiVersion;
+        Slot = slot;
+        OperationId = operationId;
+        Cookie = cookie;
+    }
+
+    public readonly bool IsValid => AbiVersion == 1 && OperationId != 0 && Cookie != 0;
+}
+
+/// <summary>
+/// Optional platform bridge for cooperative native worker retirement. Host lifecycle methods
+/// are cold-path operations; cancellation polling is implemented by the native registry.
+/// </summary>
+public interface INativeModOperationProvider
+{
+    bool OpenGeneration(string owner, long generation);
+
+    bool TryBeginOperation(
+        string owner,
+        long generation,
+        string name,
+        out ModNativeOperationToken token);
+
+    /// <returns>0 while active, 1 when cancelled, and -1 for a stale token.</returns>
+    int GetCancellationState(in ModNativeOperationToken token);
+
+    bool EndOperation(in ModNativeOperationToken token);
+
+    bool CancelGenerationAndWait(
+        string owner,
+        long generation,
+        uint timeoutMilliseconds);
+
+    bool ResumeGeneration(string owner, long generation);
+    bool RetireGeneration(string owner, long generation);
+    int GetActiveOperationCount(string owner, long generation);
 }
